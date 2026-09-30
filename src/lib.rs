@@ -19,19 +19,40 @@
 //! byte format, LSN sequencing, group-commit durability, the data-directory
 //! layout, crash-recovery replay (§6.3, §9), and a [`Db`] entry point that
 //! reconstructs a [`StorageEngine`] from disk.
+//!
+//! Phase 3 adds TCP networking: `protocol` is the std-only binary wire codec
+//! (Technical-Design §4.1); `server` is the threaded TCP server with the §5
+//! mutation-sequencer/group-commit architecture wired to [`Db`]; and `client`
+//! is the matching typed TCP client. See the `server` module docs for the §5
+//! concurrency mapping and the §4.2 disconnect/retry limitation.
 
 pub mod checksum;
+pub mod client;
 pub mod command;
 pub mod fileio;
+pub mod protocol;
+pub mod server;
 pub mod storage;
 pub mod wal;
 
 // Re-export the primary types for ergonomic use by the CLI and tests.
 pub use checksum::{crc32c, crc64_ecma, Crc32c, Crc64Ecma};
+pub use client::{Client, ClientError, ClientResult};
 pub use command::{parse, Command, ParseError};
 pub use fileio::{
     FileSystem, FsError, FsResult, LockGuard, RealFs, SimConfig, SimFs, SplitMix64, SIM_PAGE_SIZE,
 };
+pub use protocol::{
+    decode_request_body, decode_response_body, read_frame, write_frame, ProtocolError, Request,
+    RequestKind, Response, Status, PROTOCOL_VERSION,
+};
+pub use server::{Server, ServerConfig, ShutdownHandle};
 pub use storage::{GetResult, Mutation, StorageEngine};
 pub use wal::format::{GroupFooter, MutationRecord, RecordType, SegmentHeader};
-pub use wal::{Db, DurabilityMode, Identity, Wal, WalError, WalResult};
+pub use wal::snapshot::{
+    decode as decode_snapshot, encode as encode_snapshot, DecodedSnapshot, SnapshotError,
+    SnapshotHeader,
+};
+pub use wal::{
+    Db, DurabilityMode, Identity, Wal, WalError, WalResult, DEFAULT_RETENTION_BUDGET_BYTES,
+};

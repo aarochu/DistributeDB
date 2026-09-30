@@ -45,6 +45,7 @@
 //! closed.
 
 pub mod format;
+pub mod snapshot;
 
 use crate::fileio::{FileSystem, FsError};
 use crate::storage::{Mutation, StorageEngine};
@@ -65,6 +66,15 @@ pub const MAX_GROUP_BYTES: usize = 8 * 1024 * 1024;
 pub const SEGMENT_ROTATE_BYTES: u64 = 64 * 1024 * 1024;
 /// IDENTITY file format version.
 pub const IDENTITY_VERSION: u32 = 1;
+/// Default bounded disk budget for retained recovery data (snapshots plus the
+/// WAL segments still needed for recovery), in bytes (Technical-Design §7).
+///
+/// When a publish/retain would push retained recovery bytes over this budget,
+/// new writes are paused with [`WalError::ResourceExhausted`] rather than
+/// deleting data still needed for recovery. The default is generous (1 GiB) so
+/// ordinary operation never trips it; tests configure a small budget via
+/// [`Db::open_with_budget`] to exercise the pause.
+pub const DEFAULT_RETENTION_BUDGET_BYTES: u64 = 1024 * 1024 * 1024;
 
 /// Durability mode for the WAL writer (Technical-Design §6.2).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -96,6 +106,16 @@ pub enum WalError {
         /// The encoded length that was rejected.
         encoded_len: usize,
     },
+    /// Retained recovery data (snapshots + WAL needed for recovery) would
+    /// exceed the configured disk budget (Technical-Design §7). New writes are
+    /// paused instead of deleting data still needed for recovery; the server
+    /// maps this to `RESOURCE_EXHAUSTED`.
+    ResourceExhausted {
+        /// The configured retention budget in bytes.
+        budget_bytes: u64,
+        /// The retained recovery bytes that would exceed it.
+        needed_bytes: u64,
+    },
 }
 
 impl std::fmt::Display for WalError {
@@ -109,6 +129,13 @@ impl std::fmt::Display for WalError {
             WalError::MutationTooLarge { encoded_len } => {
                 write!(f, "mutation encoded length {encoded_len} exceeds limit")
             }
+            WalError::ResourceExhausted {
+                budget_bytes,
+                needed_bytes,
+            } => write!(
+                f,
+                "retained recovery data {needed_bytes} bytes exceeds disk budget {budget_bytes} bytes"
+            ),
         }
     }
 }
@@ -179,6 +206,21 @@ impl DataPaths {
     /// (zero-padded to 20 digits so lexical order matches numeric order).
     fn segment(&self, first_lsn: u64) -> PathBuf {
         self.wal_dir().join(format!("{first_lsn:020}.wal"))
+    }
+
+    /// Immutable snapshot file path for a snapshot taken at LSN `lsn`
+    /// (zero-padded to 20 digits like segments, so lexical order matches
+    /// numeric order). Snapshots live in the active generation's `snapshots/`
+    /// directory (Technical-Design §6, §7).
+    fn snapshot(&self, lsn: u64) -> PathBuf {
+        self.snapshots_dir().join(format!("{lsn:020}.snap"))
+    }
+
+    /// Temporary path for an in-progress snapshot at LSN `lsn`, under `tmp/`
+    /// on the same filesystem as the final snapshot so publication can use a
+    /// sync + atomic rename (Technical-Design §7, ADR-001).
+    fn snapshot_tmp(&self, lsn: u64) -> PathBuf {
+        self.tmp().join(format!("{lsn:020}.snap.tmp"))
     }
 }
 
@@ -284,9 +326,15 @@ fn generate_id(salt: u64) -> [u8; 16] {
 /// Outcome of scanning and replaying the WAL during recovery.
 #[derive(Debug, Clone)]
 struct RecoveryOutcome {
-    /// Verified, footer-closed mutations in LSN order.
+    /// The snapshot base LSN the map starts from (0 when no snapshot was
+    /// used and the map was rebuilt from LSN 1) (Technical-Design §7).
+    snapshot_lsn: u64,
+    /// Key/value pairs loaded from the chosen snapshot (empty when none).
+    snapshot_pairs: Vec<(Vec<u8>, Vec<u8>)>,
+    /// Verified, footer-closed mutations with lsn > `snapshot_lsn`, in order.
     records: Vec<MutationRecord>,
-    /// The `record_hash` of the last replayed record (0 if none).
+    /// The `record_hash` of the last replayed record (or the snapshot's
+    /// boundary hash when no post-snapshot records were replayed).
     last_record_hash: u64,
     /// Whether a final unclosed/torn group was discarded.
     tail_truncated: bool,
@@ -295,6 +343,39 @@ struct RecoveryOutcome {
     /// The byte offset in the active segment after the last valid footer
     /// (where the next group append should begin).
     active_segment_valid_len: u64,
+}
+
+/// The result of scanning the contiguous WAL tail after a recovery base
+/// (a snapshot boundary or LSN 0). See [`Db::scan_wal_tail`].
+#[derive(Debug, Clone)]
+struct WalTail {
+    /// Verified, footer-closed records with lsn > base, in LSN order.
+    records: Vec<MutationRecord>,
+    /// The `record_hash` of the last replayed record (base hash if none).
+    last_record_hash: u64,
+    /// Whether a final unclosed/torn group was discarded.
+    tail_truncated: bool,
+    /// The active (newest) segment's first LSN.
+    active_segment_first_lsn: u64,
+    /// Byte offset in the active segment after the last valid footer.
+    active_segment_valid_len: u64,
+}
+
+/// A computed reclamation plan for a freshly verified snapshot: the WAL
+/// segments and previous snapshot to delete, plus the retained recovery bytes
+/// that would remain after executing it (Technical-Design §7). Planning is
+/// separated from execution so the disk-budget check runs before any in-memory
+/// recovery base advances.
+#[derive(Debug, Clone)]
+struct ReclamationPlan {
+    /// First-LSNs of WAL segments wholly covered by the new snapshot.
+    deletable_segments: Vec<u64>,
+    /// The previous snapshot LSN whose recovery chain is now reclaimable
+    /// (`None` when there was no previous snapshot).
+    deletable_previous_snapshot: Option<u64>,
+    /// Retained recovery bytes remaining after the plan is executed (the new
+    /// snapshot plus retained WAL; excludes everything being reclaimed).
+    retained_bytes: u64,
 }
 
 // ---------------------------------------------------------------------------
@@ -678,6 +759,24 @@ fn mutation_to_record(m: &Mutation, lsn: u64, prev_hash: u64) -> MutationRecord 
     }
 }
 
+/// Whether two key/value pair lists are equal as sets (order-independent).
+///
+/// Snapshot v1 stores pairs in map iteration order, which is unspecified, so a
+/// full reference-map comparison during publish verification (§7) compares by
+/// content, not order. Keys are unique in both (the snapshot decoder rejects
+/// duplicates), so equal length plus a key/value lookup match is sufficient.
+fn pairs_equal_as_set(a: &[(Vec<u8>, Vec<u8>)], b: &[(Vec<u8>, Vec<u8>)]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let map: std::collections::HashMap<&[u8], &[u8]> = a
+        .iter()
+        .map(|(k, v)| (k.as_slice(), v.as_slice()))
+        .collect();
+    b.iter()
+        .all(|(k, v)| map.get(k.as_slice()) == Some(&v.as_slice()))
+}
+
 /// Convert a decoded [`MutationRecord`] back to a [`Mutation`] for replay.
 fn record_to_mutation(rec: &MutationRecord) -> Mutation {
     match rec.rtype {
@@ -708,6 +807,19 @@ pub struct Db<F: FileSystem> {
     wal: Wal<F>,
     last_applied_lsn: u64,
     tail_truncated: bool,
+    /// The LSN of the snapshot currently used as the recovery base (0 if the
+    /// map was rebuilt from LSN 1 with no snapshot) (Technical-Design §7).
+    snapshot_lsn: u64,
+    /// The number of WAL records replayed after the recovery base during the
+    /// last [`Db::open`] (records with `lsn > snapshot_lsn`). This is the work
+    /// recovery had to do beyond loading the snapshot map, and is bounded by
+    /// `last_applied_lsn - snapshot_lsn` (Technical-Design §7 claim boundary;
+    /// SOW §22 recovery-work-reduction acceptance goal).
+    records_replayed: u64,
+    /// Bounded disk budget for retained recovery data (snapshots + retained
+    /// WAL). Reaching it pauses new snapshots' reclamation with
+    /// [`WalError::ResourceExhausted`] (Technical-Design §7).
+    retention_budget_bytes: u64,
     _lock: Box<dyn crate::fileio::LockGuard>,
 }
 
@@ -721,6 +833,18 @@ impl<F: FileSystem + Clone> Db<F> {
     /// directory it acquires the LOCK, validates IDENTITY, then scans and
     /// replays the WAL.
     pub fn open(fs: F, root: &Path, mode: DurabilityMode) -> WalResult<Self> {
+        Self::open_with_budget(fs, root, mode, DEFAULT_RETENTION_BUDGET_BYTES)
+    }
+
+    /// Like [`Db::open`] but with an explicit retention disk budget in bytes
+    /// (Technical-Design §7). Used by tests to exercise the
+    /// [`WalError::ResourceExhausted`] pause with a small budget.
+    pub fn open_with_budget(
+        fs: F,
+        root: &Path,
+        mode: DurabilityMode,
+        retention_budget_bytes: u64,
+    ) -> WalResult<Self> {
         let paths = DataPaths::new(root);
         // Acquire the exclusive data-directory lock before recovery (§3, §9).
         // The parent directory must exist to create the LOCK file.
@@ -741,11 +865,20 @@ impl<F: FileSystem + Clone> Db<F> {
             Self::init_fresh(&fs, &paths, mode)?
         };
 
-        // Recover by scanning the WAL and replaying footer-closed groups.
+        // Recover by loading the chosen snapshot (if any) and replaying the
+        // contiguous footer-closed WAL tail after the snapshot boundary.
         let outcome = Self::recover(&fs, &paths, &identity, mode)?;
 
+        // Start from the snapshot map (empty when no snapshot qualified), then
+        // replay post-snapshot records in order.
         let mut engine = StorageEngine::new();
-        let mut last_applied_lsn = 0u64;
+        for (key, value) in &outcome.snapshot_pairs {
+            engine.apply(Mutation::Set {
+                key: key.clone(),
+                value: value.clone(),
+            });
+        }
+        let mut last_applied_lsn = outcome.snapshot_lsn;
         for rec in &outcome.records {
             engine.apply(record_to_mutation(rec));
             last_applied_lsn = rec.lsn;
@@ -776,6 +909,9 @@ impl<F: FileSystem + Clone> Db<F> {
             wal,
             last_applied_lsn,
             tail_truncated: outcome.tail_truncated,
+            snapshot_lsn: outcome.snapshot_lsn,
+            records_replayed: outcome.records.len() as u64,
+            retention_budget_bytes,
             _lock: lock,
         })
     }
@@ -845,30 +981,240 @@ impl<F: FileSystem + Clone> Db<F> {
         }
         segment_lsns.sort_unstable();
 
-        // A brand-new data directory always has segment 1 created at init.
-        if segment_lsns.is_empty() {
-            return Ok(RecoveryOutcome {
-                records: Vec::new(),
-                last_record_hash: 0,
-                tail_truncated: false,
-                active_segment_first_lsn: 1,
-                active_segment_valid_len: SEGMENT_HEADER_LEN as u64,
-            });
+        // Enumerate verified-candidate snapshots, ordered by LSN descending so
+        // we prefer the newest recoverable state (Technical-Design §7, §9.3).
+        let mut snapshot_lsns: Vec<u64> = Vec::new();
+        for name in fs.list_dir(&paths.snapshots_dir())? {
+            if let Some(stem) = name.strip_suffix(".snap") {
+                if let Ok(lsn) = stem.parse::<u64>() {
+                    snapshot_lsns.push(lsn);
+                }
+            }
+        }
+        snapshot_lsns.sort_unstable();
+        snapshot_lsns.reverse();
+
+        // Whether the newest snapshot on disk failed verification. This gates
+        // the fail-closed rule: a corrupt LATEST snapshot must never silently
+        // fall back to an older/empty state if no complete chain remains
+        // (Technical-Design §7).
+        let mut latest_snapshot_corrupt = false;
+
+        // Try each snapshot, newest first: it must decode+verify AND its
+        // post-snapshot WAL tail must be a contiguous, chaining, footer-closed
+        // log from snapshot_lsn+1 to the end.
+        for (idx, &snap_lsn) in snapshot_lsns.iter().enumerate() {
+            match Self::load_verified_snapshot(fs, paths, identity, snap_lsn) {
+                Ok(decoded) => {
+                    match Self::scan_wal_tail(
+                        fs,
+                        paths,
+                        identity,
+                        &segment_lsns,
+                        mode,
+                        snap_lsn,
+                        decoded.header.record_hash_at_lsn,
+                    )? {
+                        Some(tail) => {
+                            let last_record_hash = if tail.records.is_empty() {
+                                decoded.header.record_hash_at_lsn
+                            } else {
+                                tail.last_record_hash
+                            };
+                            return Ok(RecoveryOutcome {
+                                snapshot_lsn: snap_lsn,
+                                snapshot_pairs: decoded.pairs,
+                                records: tail.records,
+                                last_record_hash,
+                                tail_truncated: tail.tail_truncated,
+                                active_segment_first_lsn: tail.active_segment_first_lsn,
+                                active_segment_valid_len: tail.active_segment_valid_len,
+                            });
+                        }
+                        None => {
+                            // Verified snapshot but no contiguous WAL tail; try
+                            // the next-lower snapshot.
+                            continue;
+                        }
+                    }
+                }
+                Err(_) => {
+                    if idx == 0 {
+                        latest_snapshot_corrupt = true;
+                    }
+                    // Try the next-lower snapshot.
+                    continue;
+                }
+            }
         }
 
+        // No snapshot yielded a complete chain. Fall back to a full log from
+        // LSN 1 ONLY when a complete contiguous log from LSN 1 exists.
+        match Self::scan_wal_tail(fs, paths, identity, &segment_lsns, mode, 0, 0)? {
+            Some(tail) => {
+                let last_record_hash = if tail.records.is_empty() {
+                    0
+                } else {
+                    tail.last_record_hash
+                };
+                Ok(RecoveryOutcome {
+                    snapshot_lsn: 0,
+                    snapshot_pairs: Vec::new(),
+                    records: tail.records,
+                    last_record_hash,
+                    tail_truncated: tail.tail_truncated,
+                    active_segment_first_lsn: tail.active_segment_first_lsn,
+                    active_segment_valid_len: tail.active_segment_valid_len,
+                })
+            }
+            None => {
+                // No complete recovery chain remains. If the latest snapshot
+                // was corrupt (and we already deleted older WAL), we must fail
+                // closed rather than silently start empty (Technical-Design
+                // §7).
+                if latest_snapshot_corrupt {
+                    Err(WalError::Corruption(
+                        "latest snapshot is corrupt and no complete recovery chain remains".into(),
+                    ))
+                } else {
+                    Err(WalError::Corruption(
+                        "no complete WAL chain from LSN 1 and no usable snapshot".into(),
+                    ))
+                }
+            }
+        }
+    }
+
+    /// Load and fully verify the snapshot at `snap_lsn` from disk against its
+    /// header, cluster id, checksums, `entry_count`, and `payload_len`
+    /// (Technical-Design §7). Returns the decoded snapshot on success.
+    fn load_verified_snapshot(
+        fs: &F,
+        paths: &DataPaths,
+        identity: &Identity,
+        snap_lsn: u64,
+    ) -> WalResult<crate::wal::snapshot::DecodedSnapshot> {
+        let bytes = fs.read(&paths.snapshot(snap_lsn))?;
+        let decoded = snapshot::decode(&bytes, Some(identity.cluster_id))
+            .map_err(|e| WalError::Corruption(format!("snapshot {snap_lsn} invalid: {e}")))?;
+        // The filename LSN must match the header's snapshot_lsn: names are
+        // data, not authority (Technical-Design §6).
+        if decoded.header.snapshot_lsn != snap_lsn {
+            return Err(WalError::Corruption(format!(
+                "snapshot header lsn {} does not match filename {snap_lsn}",
+                decoded.header.snapshot_lsn
+            )));
+        }
+        Ok(decoded)
+    }
+
+    /// Scan the WAL segments for the contiguous, footer-closed log that begins
+    /// at `base_lsn + 1` and chains from `base_hash`, replaying every verified
+    /// record with `lsn > base_lsn` (Technical-Design §6.3, §7, §9).
+    ///
+    /// `base_lsn == 0` / `base_hash == 0` means "from LSN 1 with no snapshot".
+    /// The chain must be contiguous: the first relevant segment must begin at
+    /// `base_lsn + 1`, later segments must begin exactly where the previous one
+    /// ended, and the `prev_hash` chain must continue from `base_hash`. Sealed
+    /// segments must be entirely footer-closed (interior corruption fails
+    /// closed); the newest segment may discard a torn final group and is
+    /// truncated at the last valid footer.
+    ///
+    /// Returns `Ok(Some(tail))` when a complete contiguous chain exists,
+    /// `Ok(None)` when the WAL does not form such a chain from this base (so
+    /// the caller can try a lower snapshot or fail closed), and `Err(...)` for
+    /// interior/sealed corruption that must fail closed regardless of base.
+    fn scan_wal_tail(
+        fs: &F,
+        paths: &DataPaths,
+        identity: &Identity,
+        segment_lsns: &[u64],
+        mode: DurabilityMode,
+        base_lsn: u64,
+        base_hash: u64,
+    ) -> WalResult<Option<WalTail>> {
+        // A brand-new data directory (no snapshot, base 0) always has segment 1
+        // created at init; an empty enumeration only happens on a fresh dir.
+        if segment_lsns.is_empty() {
+            if base_lsn == 0 {
+                return Ok(Some(WalTail {
+                    records: Vec::new(),
+                    last_record_hash: 0,
+                    tail_truncated: false,
+                    active_segment_first_lsn: 1,
+                    active_segment_valid_len: SEGMENT_HEADER_LEN as u64,
+                }));
+            }
+            return Ok(None);
+        }
+
+        // The relevant segments are those whose records can carry lsn >
+        // base_lsn. A segment with first_lsn <= base_lsn holds only records at
+        // or below the snapshot boundary (already captured by the snapshot) or
+        // straddles the boundary. For a clean chain the segment beginning at
+        // exactly base_lsn+1 must exist; segments strictly below that are
+        // reclaimable/covered and are skipped only if a segment at base_lsn+1
+        // is present.
+        let expected_first = base_lsn + 1;
+        // Find the index of the segment that begins at expected_first.
+        let start_idx = match segment_lsns.iter().position(|&s| s == expected_first) {
+            Some(i) => i,
+            None => {
+                // No segment starts exactly at base_lsn+1: the contiguous chain
+                // from this base is not present.
+                return Ok(None);
+            }
+        };
+
+        let relevant = &segment_lsns[start_idx..];
+
         let mut records: Vec<MutationRecord> = Vec::new();
-        let mut last_record_hash = 0u64;
-        let mut prev_hash = 0u64;
+        let mut last_record_hash = base_hash;
+        let mut prev_hash = base_hash;
+        let mut next_expected_first = expected_first;
         let mut tail_truncated = false;
 
-        let mut active_segment_first_lsn = segment_lsns[0];
+        let mut active_segment_first_lsn = relevant[0];
         let mut active_segment_valid_len = SEGMENT_HEADER_LEN as u64;
 
-        let last_index = segment_lsns.len() - 1;
-        for (i, &segment_first_lsn) in segment_lsns.iter().enumerate() {
+        let last_index = relevant.len() - 1;
+        for (i, &segment_first_lsn) in relevant.iter().enumerate() {
+            // Segment continuity: this segment must begin exactly where the
+            // previous one ended.
+            if segment_first_lsn != next_expected_first {
+                return Ok(None);
+            }
             let seg_path = paths.segment(segment_first_lsn);
             let bytes = fs.read(&seg_path)?;
             let is_active = i == last_index;
+
+            // An ACTIVE (newest) segment too short to even hold a header is an
+            // incomplete/torn segment creation: a crash interrupted a rotate
+            // (e.g. snapshot-publication step 2) after the file appeared but
+            // before its header was durably synced. This is the active-segment
+            // analogue of a torn tail (§6.3): the earlier SEALED segments hold
+            // all committed records, so we repair the empty segment by writing
+            // a fresh header and treat it as an empty active segment. A SEALED
+            // segment (not the newest) that is this short is genuine
+            // corruption and still fails closed. (Technical-Design §6.3, §7.)
+            if is_active && bytes.len() < SEGMENT_HEADER_LEN {
+                let header = SegmentHeader {
+                    cluster_id: identity.cluster_id,
+                    node_id: identity.node_id,
+                    first_lsn: segment_first_lsn,
+                };
+                fs.truncate(&seg_path, 0)?;
+                fs.append(&seg_path, &header.encode())?;
+                if mode == DurabilityMode::Fsync {
+                    fs.sync_file(&seg_path)?;
+                    fs.sync_dir(&paths.wal_dir())?;
+                }
+                tail_truncated = true;
+                active_segment_first_lsn = segment_first_lsn;
+                active_segment_valid_len = SEGMENT_HEADER_LEN as u64;
+                // No records in this segment; the chain ends here.
+                break;
+            }
 
             let scan = scan_as(&bytes, segment_first_lsn, prev_hash, is_active)?;
 
@@ -877,13 +1223,18 @@ impl<F: FileSystem + Clone> Db<F> {
                 last_record_hash = scan.last_record_hash;
             }
             prev_hash = scan.last_record_hash;
+            // The next segment must begin one past the last committed record
+            // in this segment.
+            next_expected_first = records
+                .last()
+                .map(|r| r.lsn + 1)
+                .unwrap_or(segment_first_lsn);
 
             if is_active {
                 active_segment_first_lsn = segment_first_lsn;
                 active_segment_valid_len = scan.valid_len;
                 if scan.truncated {
                     tail_truncated = true;
-                    // Truncate the segment at the last valid footer and sync.
                     fs.truncate(&seg_path, scan.valid_len)?;
                     if mode == DurabilityMode::Fsync {
                         fs.sync_file(&seg_path)?;
@@ -892,17 +1243,13 @@ impl<F: FileSystem + Clone> Db<F> {
             }
         }
 
-        // `identity` is available for stricter cluster/node checks in a later
-        // phase; the header first_lsn/filename agreement is already enforced.
-        let _ = identity;
-
-        Ok(RecoveryOutcome {
+        Ok(Some(WalTail {
             records,
             last_record_hash,
             tail_truncated,
             active_segment_first_lsn,
             active_segment_valid_len,
-        })
+        }))
     }
 
     /// Durable `SET`: append + group-commit + apply, then return
@@ -924,6 +1271,38 @@ impl<F: FileSystem + Clone> Db<F> {
         self.engine.apply(m);
         self.last_applied_lsn = lsn;
         Ok(lsn)
+    }
+
+    /// Durably apply a group of up to [`MAX_GROUP_RECORDS`] mutations in a
+    /// single group commit (one `fsync` in `fsync` mode), then apply them to
+    /// the engine in order and return the assigned LSNs (Technical-Design §3,
+    /// §5, §6.2).
+    ///
+    /// This is the group-commit entry point used by the Phase 3 networking
+    /// sequencer (Technical-Design §5): a batch of client `SET`/`DELETE`
+    /// mutations is appended, footer-closed, and synced once, so the fixed
+    /// `fsync` cost is amortized across the whole batch. Write-ahead order is
+    /// preserved: the mutations are applied to the map only after the durable
+    /// append succeeds. On any WAL error the engine is left untouched and the
+    /// error is returned; the caller (sequencer) surfaces it to each waiting
+    /// request. An empty slice is a no-op returning an empty `Vec`.
+    ///
+    /// The batching bounds (`<= MAX_GROUP_RECORDS` records and
+    /// `<= MAX_GROUP_BYTES` encoded) are enforced by
+    /// [`Wal::append_group`]; callers should pre-drain within those limits.
+    pub fn apply_group(&mut self, muts: &[Mutation]) -> WalResult<Vec<u64>> {
+        if muts.is_empty() {
+            return Ok(Vec::new());
+        }
+        let assigned = self.wal.append_group(muts)?;
+        // Write-ahead order: apply to the map only after the durable append.
+        for m in muts {
+            self.engine.apply(m.clone());
+        }
+        if let Some(&last) = assigned.last() {
+            self.last_applied_lsn = last;
+        }
+        Ok(assigned)
     }
 
     /// Look up `key` in the reconstructed engine.
@@ -963,6 +1342,260 @@ impl<F: FileSystem + Clone> Db<F> {
     /// `sync_through`); returns the highest durable LSN.
     pub fn sync_through(&mut self, lsn: u64) -> WalResult<u64> {
         self.wal.sync_through(lsn)
+    }
+
+    /// The LSN of the snapshot currently used as the recovery base, or 0 when
+    /// the map was rebuilt from LSN 1 with no snapshot (Technical-Design §7,
+    /// §17).
+    pub fn snapshot_lsn(&self) -> u64 {
+        self.snapshot_lsn
+    }
+
+    /// The number of WAL records replayed after the recovery base during the
+    /// most recent [`Db::open`] (records with `lsn > snapshot_lsn`)
+    /// (Technical-Design §7; SOW §22).
+    ///
+    /// After a snapshot at LSN *S* this is bounded by
+    /// `last_applied_lsn - snapshot_lsn`: recovery loads the snapshot map and
+    /// replays only the post-snapshot WAL tail, so its work no longer scales
+    /// with the entire command history. Segments wholly covered by *S* are
+    /// reclaimed and never read during recovery.
+    pub fn records_replayed(&self) -> u64 {
+        self.records_replayed
+    }
+
+    /// The configured bounded disk budget for retained recovery data in bytes
+    /// (Technical-Design §7).
+    pub fn retention_budget_bytes(&self) -> u64 {
+        self.retention_budget_bytes
+    }
+
+    /// Publish a snapshot at the current completed-group boundary, following
+    /// the exact §7 publication sequence, and return the snapshot's LSN *S*
+    /// (Technical-Design §7).
+    ///
+    /// The 8 steps, in order:
+    ///
+    /// 1. At the completed-group boundary *S* = [`last_applied_lsn`], clone the
+    ///    map pairs and capture the boundary `record_hash`.
+    /// 2. Rotate the WAL so subsequent mutations begin a segment at *S+1*.
+    /// 3. Encode and write the snapshot bytes to a temp file in `tmp/` on the
+    ///    same filesystem.
+    /// 4. Fully write and `sync_file` the temp snapshot.
+    /// 5. Rename it to its immutable final `{S:020}.snap` name in `snapshots/`.
+    /// 6. `sync_dir` the `snapshots/` directory.
+    /// 7. Reload and VERIFY the new snapshot from disk (decode + header /
+    ///    cluster / `entry_count` / `payload_len` / checksums, plus a full
+    ///    reference-map comparison) BEFORE trusting it.
+    /// 8. Only then mark *S* eligible and delete WAL segments wholly covered by
+    ///    *S* (subject to the previous-chain retention rule and the disk
+    ///    budget), then `sync_dir` the `wal/` directory.
+    ///
+    /// On failure at ANY step the old snapshot and old WAL are left untouched
+    /// and an error is returned (fail-closed, never a gap). If retaining the
+    /// new snapshot plus the WAL still needed for recovery would exceed the
+    /// configured disk budget, no recovery data is deleted and
+    /// [`WalError::ResourceExhausted`] is returned so the server pauses writes.
+    ///
+    /// [`last_applied_lsn`]: Db::last_applied_lsn
+    pub fn publish_snapshot(&mut self) -> WalResult<u64> {
+        if self.wal.is_failed() {
+            return Err(WalError::FailClosed);
+        }
+
+        // (1) Clone the map pairs and capture the boundary hash at S.
+        let s = self.last_applied_lsn;
+        let record_hash_at_lsn = self.wal.last_record_hash;
+        let pairs = self.engine.snapshot_pairs();
+        let cluster_id = self.wal.identity.cluster_id;
+        let mode = self.wal.mode;
+
+        // The previous verified snapshot (if any) is retained until the new one
+        // passes reload verification (previous-chain rule, §7).
+        let previous_snapshot_lsn = self.snapshot_lsn;
+
+        // (2) Rotate the WAL so later mutations begin a segment at S+1.
+        // Rotation happens between groups only; this is a completed-group
+        // boundary. If a segment beginning at S+1 already exists (no writes
+        // since the last rotate), skip the rotate to avoid a duplicate.
+        if self.wal.next_lsn != self.wal.active_first_lsn {
+            self.wal.rotate_after(s)?;
+        }
+
+        // (3)+(4) Encode and durably write the snapshot to a temp file.
+        let bytes = snapshot::encode(cluster_id, s, record_hash_at_lsn, &pairs);
+        let tmp = self.wal.paths.snapshot_tmp(s);
+        let final_path = self.wal.paths.snapshot(s);
+        // Start from a clean temp file (a stale temp from a prior aborted
+        // publish must not corrupt this one).
+        if self.wal.fs.exists(&tmp) {
+            self.wal.fs.remove_file(&tmp)?;
+            if mode == DurabilityMode::Fsync {
+                self.wal.fs.sync_dir(&self.wal.paths.tmp())?;
+            }
+        }
+        self.wal.fs.create_file(&tmp)?;
+        self.wal.fs.append(&tmp, &bytes)?;
+        if mode == DurabilityMode::Fsync {
+            self.wal.fs.sync_file(&tmp)?;
+        }
+
+        // (5)+(6) Atomic rename into snapshots/ then sync the directory.
+        self.wal.fs.rename(&tmp, &final_path)?;
+        if mode == DurabilityMode::Fsync {
+            self.wal.fs.sync_dir(&self.wal.paths.snapshots_dir())?;
+        }
+
+        // (7) Reload and verify the new snapshot from disk before trusting it.
+        let reloaded = self.wal.fs.read(&final_path)?;
+        let decoded = snapshot::decode(&reloaded, Some(cluster_id)).map_err(|e| {
+            WalError::Corruption(format!("snapshot reload verification failed: {e}"))
+        })?;
+        if decoded.header.snapshot_lsn != s
+            || decoded.header.record_hash_at_lsn != record_hash_at_lsn
+            || decoded.header.entry_count != pairs.len() as u64
+        {
+            return Err(WalError::Corruption(
+                "snapshot reload verification: header does not match published boundary".into(),
+            ));
+        }
+        // Full reference-map comparison (§7): the reloaded pairs must equal the
+        // cloned pairs as a set (iteration order is unspecified).
+        if !pairs_equal_as_set(&decoded.pairs, &pairs) {
+            return Err(WalError::Corruption(
+                "snapshot reload verification: reloaded pairs differ from reference map".into(),
+            ));
+        }
+
+        // (8) Plan reclamation of the WAL segments wholly covered by S and of
+        // the previous snapshot's now-reclaimable recovery chain, then enforce
+        // the disk budget. The budget check happens BEFORE the in-memory base
+        // moves so a `ResourceExhausted` return leaves `snapshot_lsn` unchanged
+        // (the return value and observable state agree, §7).
+        let plan = self.plan_reclamation(s, previous_snapshot_lsn)?;
+        if plan.retained_bytes > self.retention_budget_bytes {
+            return Err(WalError::ResourceExhausted {
+                budget_bytes: self.retention_budget_bytes,
+                needed_bytes: plan.retained_bytes,
+            });
+        }
+
+        // The budget allows the new snapshot: it is now the verified recovery
+        // base. Advance the in-memory base only after the check passes.
+        self.snapshot_lsn = s;
+
+        // Execute reclamation: delete the covered WAL and the previous
+        // snapshot, then sync the affected directories (delete-then-sync keeps
+        // it crash-safe; a crash before the dir sync restores the files and the
+        // next publish re-derives the same set, so no recovery gap opens, §7).
+        self.execute_reclamation(&plan)?;
+
+        Ok(s)
+    }
+
+    /// Plan the reclamation for a freshly verified snapshot at `s`: which WAL
+    /// segments are wholly covered by `s`, whether the previous snapshot's
+    /// recovery chain is now reclaimable, and the retained recovery bytes that
+    /// would remain AFTER executing the plan (Technical-Design §7).
+    ///
+    /// A segment is "wholly covered" when the next segment's `first_lsn` is
+    /// `<= s+1` (so every record in it is `<= s`). The current chain begins at
+    /// the segment starting at `s+1`; it and all later segments are never
+    /// touched.
+    ///
+    /// The previous snapshot at `previous_snapshot_lsn` (if any) was the prior
+    /// recovery base; §7 permits reclaiming the older recovery chain once the
+    /// new snapshot has passed reload verification, which has happened by the
+    /// time this runs. It is therefore scheduled for deletion and is NOT
+    /// counted in the retained-bytes total.
+    fn plan_reclamation(&self, s: u64, previous_snapshot_lsn: u64) -> WalResult<ReclamationPlan> {
+        // Enumerate current segments by first LSN.
+        let mut segment_lsns: Vec<u64> = Vec::new();
+        for name in self.wal.fs.list_dir(&self.wal.paths.wal_dir())? {
+            if let Some(stem) = name.strip_suffix(".wal") {
+                if let Ok(first_lsn) = stem.parse::<u64>() {
+                    segment_lsns.push(first_lsn);
+                }
+            }
+        }
+        segment_lsns.sort_unstable();
+
+        // A segment at index i is wholly covered by S when the NEXT segment
+        // begins at or before S+1 (so this segment's records are all <= S).
+        let mut deletable_segments: Vec<u64> = Vec::new();
+        for i in 0..segment_lsns.len() {
+            let first = segment_lsns[i];
+            if let Some(next_first) = segment_lsns.get(i + 1).copied() {
+                if next_first <= s + 1 {
+                    deletable_segments.push(first);
+                }
+            }
+        }
+
+        // The previous snapshot's file is reclaimable now (the new snapshot
+        // verified). Guard against reclaiming the current snapshot (S) or a
+        // zero "no previous snapshot" sentinel.
+        let deletable_previous_snapshot =
+            if previous_snapshot_lsn != 0 && previous_snapshot_lsn != s {
+                Some(previous_snapshot_lsn)
+            } else {
+                None
+            };
+
+        // Retained recovery bytes AFTER executing the plan: the new snapshot
+        // file plus every WAL segment we keep. The previous snapshot and the
+        // covered WAL segments are being reclaimed, so they are excluded.
+        let mut retained_bytes: u64 = 0;
+        if let Ok(bytes) = self.wal.fs.read(&self.wal.paths.snapshot(s)) {
+            retained_bytes += bytes.len() as u64;
+        }
+        for &first in &segment_lsns {
+            if deletable_segments.contains(&first) {
+                continue;
+            }
+            if let Ok(bytes) = self.wal.fs.read(&self.wal.paths.segment(first)) {
+                retained_bytes += bytes.len() as u64;
+            }
+        }
+
+        Ok(ReclamationPlan {
+            deletable_segments,
+            deletable_previous_snapshot,
+            retained_bytes,
+        })
+    }
+
+    /// Execute a [`ReclamationPlan`]: delete the covered WAL segments and the
+    /// previous snapshot file, then `sync_dir` each affected directory in
+    /// `fsync` mode (Technical-Design §7).
+    ///
+    /// Delete-then-sync keeps reclamation crash-safe: a crash after the deletes
+    /// but before the directory sync leaves the removals volatile (see the
+    /// `SimFs` delete-durability model), so recovery restores the files and the
+    /// next publish re-derives the same reclaimable set. Deleting never opens a
+    /// recovery gap because the retained chain from `s+1` is untouched, and the
+    /// previous snapshot is removed only after the new snapshot has both
+    /// verified and been recorded as the recovery base.
+    fn execute_reclamation(&mut self, plan: &ReclamationPlan) -> WalResult<()> {
+        let mode = self.wal.mode;
+
+        for first in &plan.deletable_segments {
+            self.wal.fs.remove_file(&self.wal.paths.segment(*first))?;
+        }
+        if mode == DurabilityMode::Fsync && !plan.deletable_segments.is_empty() {
+            self.wal.fs.sync_dir(&self.wal.paths.wal_dir())?;
+        }
+
+        if let Some(prev) = plan.deletable_previous_snapshot {
+            let prev_path = self.wal.paths.snapshot(prev);
+            if self.wal.fs.exists(&prev_path) {
+                self.wal.fs.remove_file(&prev_path)?;
+                if mode == DurabilityMode::Fsync {
+                    self.wal.fs.sync_dir(&self.wal.paths.snapshots_dir())?;
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Number of keys currently stored.
@@ -1307,5 +1940,292 @@ mod tests {
         assert_eq!(db.get(b"k"), GetResult::Found(b"v".to_vec()));
         // os mode makes no durability promise; durable_lsn stays 0.
         assert_eq!(db.last_durable_lsn(), 0);
+    }
+
+    // ---- Snapshot publication + snapshot-aware recovery (§7) -------------
+
+    #[test]
+    fn publish_snapshot_rotates_wal_to_s_plus_one() {
+        let fs = sim();
+        let mut db = Db::open(fs, &root(), DurabilityMode::Fsync).unwrap();
+        db.set(b"a".to_vec(), b"1".to_vec()).unwrap();
+        db.set(b"b".to_vec(), b"2".to_vec()).unwrap();
+        // Snapshot at S = 2.
+        let s = db.publish_snapshot().unwrap();
+        assert_eq!(s, 2);
+        assert_eq!(db.snapshot_lsn(), 2);
+        // A new segment beginning at S+1 = 3 exists; later writes land there.
+        assert!(db.wal.fs.exists(&db.wal.paths.segment(3)));
+        assert_eq!(db.set(b"c".to_vec(), b"3".to_vec()).unwrap(), 3);
+    }
+
+    #[test]
+    fn reopen_reconstructs_from_snapshot_plus_post_snapshot_wal() {
+        let fs = sim();
+        {
+            let mut db = Db::open(fs.clone(), &root(), DurabilityMode::Fsync).unwrap();
+            db.set(b"A".to_vec(), b"1".to_vec()).unwrap();
+            db.set(b"B".to_vec(), b"2".to_vec()).unwrap();
+            db.publish_snapshot().unwrap(); // S = 2
+                                            // Post-snapshot mutations continue at LSN 3+.
+            db.set(b"C".to_vec(), b"3".to_vec()).unwrap();
+            db.delete(b"A".to_vec()).unwrap();
+        }
+        fs.crash();
+        let db = Db::open(fs, &root(), DurabilityMode::Fsync).unwrap();
+        // Recovery base is the snapshot at S = 2; only lsn > 2 was replayed.
+        assert_eq!(db.snapshot_lsn(), 2);
+        assert_eq!(db.get(b"A"), GetResult::NotFound); // deleted post-snapshot
+        assert_eq!(db.get(b"B"), GetResult::Found(b"2".to_vec()));
+        assert_eq!(db.get(b"C"), GetResult::Found(b"3".to_vec()));
+        assert_eq!(db.last_applied_lsn(), 4);
+        // Writing continues from LSN 5, chaining from the recovered hash.
+        let mut db = db;
+        assert_eq!(db.set(b"D".to_vec(), b"4".to_vec()).unwrap(), 5);
+    }
+
+    #[test]
+    fn snapshot_with_no_post_snapshot_writes_reopens_identically() {
+        let fs = sim();
+        {
+            let mut db = Db::open(fs.clone(), &root(), DurabilityMode::Fsync).unwrap();
+            db.set(b"x".to_vec(), b"1".to_vec()).unwrap();
+            db.set(b"y".to_vec(), b"2".to_vec()).unwrap();
+            db.publish_snapshot().unwrap(); // S = 2, no writes after
+        }
+        fs.crash();
+        let db = Db::open(fs, &root(), DurabilityMode::Fsync).unwrap();
+        assert_eq!(db.snapshot_lsn(), 2);
+        assert_eq!(db.last_applied_lsn(), 2);
+        assert_eq!(db.get(b"x"), GetResult::Found(b"1".to_vec()));
+        assert_eq!(db.get(b"y"), GetResult::Found(b"2".to_vec()));
+    }
+
+    #[test]
+    fn second_snapshot_reclaims_wal_covered_by_first() {
+        let fs = sim();
+        let mut db = Db::open(fs.clone(), &root(), DurabilityMode::Fsync).unwrap();
+        db.set(b"a".to_vec(), b"1".to_vec()).unwrap();
+        db.set(b"b".to_vec(), b"2".to_vec()).unwrap();
+        db.publish_snapshot().unwrap(); // S1 = 2; segments 1 (<=2) and 3 (active)
+        let seg1 = db.wal.paths.segment(1);
+        // Segment 1 is wholly covered by S1 but retained (it is the base's
+        // covered log); reclamation only happens when a newer snapshot's chain
+        // no longer needs it. After S1, the current chain begins at seg 3.
+        db.set(b"c".to_vec(), b"3".to_vec()).unwrap(); // lsn 3 in seg 3
+        let snap1 = db.wal.paths.snapshot(2);
+        db.publish_snapshot().unwrap(); // S2 = 3; rotates to seg 4
+        let seg3 = db.wal.paths.segment(3);
+        // After S2, segments wholly covered by S2 (segs 1 and 3) are deleted;
+        // the current chain begins at seg 4.
+        assert!(!db.wal.fs.exists(&seg1), "seg1 should be reclaimed");
+        assert!(!db.wal.fs.exists(&seg3), "seg3 should be reclaimed");
+        assert!(db.wal.fs.exists(&db.wal.paths.segment(4)));
+        // The previous snapshot's recovery chain is reclaimed once the newer
+        // snapshot has verified (§7 previous-chain rule): S1's file is gone,
+        // only S2's remains.
+        assert!(
+            !db.wal.fs.exists(&snap1),
+            "previous snapshot S1 should be reclaimed after S2 verifies"
+        );
+        assert!(db.wal.fs.exists(&db.wal.paths.snapshot(3)));
+        // The snapshot at S2 remains, and recovery still works after a crash.
+        drop(db);
+        fs.crash();
+        let db = Db::open(fs, &root(), DurabilityMode::Fsync).unwrap();
+        assert_eq!(db.snapshot_lsn(), 3);
+        assert_eq!(db.get(b"a"), GetResult::Found(b"1".to_vec()));
+        assert_eq!(db.get(b"b"), GetResult::Found(b"2".to_vec()));
+        assert_eq!(db.get(b"c"), GetResult::Found(b"3".to_vec()));
+        assert_eq!(db.last_applied_lsn(), 3);
+    }
+
+    #[test]
+    fn disk_budget_exhaustion_returns_resource_exhausted_and_keeps_data() {
+        // A tiny budget: publishing would require retaining more than the
+        // budget, so publication must NOT delete recovery data and must return
+        // the RESOURCE_EXHAUSTED-mapped error.
+        let fs = sim();
+        let mut db = Db::open_with_budget(fs.clone(), &root(), DurabilityMode::Fsync, 8).unwrap();
+        db.set(b"a".to_vec(), b"1".to_vec()).unwrap();
+        db.set(b"b".to_vec(), b"2".to_vec()).unwrap();
+        let seg1 = db.wal.paths.segment(1);
+        let err = db.publish_snapshot();
+        assert!(
+            matches!(err, Err(WalError::ResourceExhausted { .. })),
+            "expected ResourceExhausted, got {err:?}"
+        );
+        // Recovery data was NOT deleted: segment 1 still present.
+        assert!(db.wal.fs.exists(&seg1));
+        // The snapshot file itself was written and verified before reclamation
+        // (the snapshot is durable; only the reclamation step paused).
+        assert!(db.wal.fs.exists(&db.wal.paths.snapshot(2)));
+        // The in-memory recovery base did NOT advance on the ResourceExhausted
+        // path: the return value and observable state agree (§7). snapshot_lsn
+        // stays 0 because nothing was reclaimed.
+        assert_eq!(db.snapshot_lsn(), 0);
+    }
+
+    #[test]
+    fn previous_snapshot_reclamation_frees_budget_accounting() {
+        // After a second verified snapshot the previous snapshot file is gone
+        // and the retained-bytes accounting reflects it: the retained total is
+        // the new snapshot plus the retained WAL only, not the old snapshot.
+        let fs = sim();
+        let mut db = Db::open(fs.clone(), &root(), DurabilityMode::Fsync).unwrap();
+        db.set(b"a".to_vec(), b"1".to_vec()).unwrap();
+        db.set(b"b".to_vec(), b"2".to_vec()).unwrap();
+        db.publish_snapshot().unwrap(); // S1 = 2
+        db.set(b"c".to_vec(), b"3".to_vec()).unwrap();
+        db.publish_snapshot().unwrap(); // S2 = 3; reclaims S1's chain
+
+        // The old snapshot file is gone.
+        assert!(!db.wal.fs.exists(&db.wal.paths.snapshot(2)));
+
+        // Recompute the reclamation plan from the current on-disk state (a
+        // no-op replan against S2 with no previous snapshot): its retained
+        // bytes must exclude the reclaimed old snapshot and equal the sum of
+        // the new snapshot plus the retained WAL segments actually on disk.
+        let plan = db.plan_reclamation(db.snapshot_lsn(), 0).unwrap();
+        let snap_bytes = db.wal.fs.read(&db.wal.paths.snapshot(3)).unwrap().len() as u64;
+        let mut expected = snap_bytes;
+        for name in db.wal.fs.list_dir(&db.wal.paths.wal_dir()).unwrap() {
+            if let Some(stem) = name.strip_suffix(".wal") {
+                if let Ok(first) = stem.parse::<u64>() {
+                    if !plan.deletable_segments.contains(&first) {
+                        expected +=
+                            db.wal.fs.read(&db.wal.paths.segment(first)).unwrap().len() as u64;
+                    }
+                }
+            }
+        }
+        assert_eq!(plan.retained_bytes, expected);
+    }
+
+    #[test]
+    fn corrupt_latest_snapshot_without_chain_fails_closed() {
+        let fs = sim();
+        let snap_path = {
+            let mut db = Db::open(fs.clone(), &root(), DurabilityMode::Fsync).unwrap();
+            db.set(b"a".to_vec(), b"1".to_vec()).unwrap();
+            db.set(b"b".to_vec(), b"2".to_vec()).unwrap();
+            db.publish_snapshot().unwrap(); // S = 2; seg 1 (<=2) retained, seg 3 active
+                                            // Reclaim seg 1 by a second snapshot so no LSN-1 chain remains.
+            db.set(b"c".to_vec(), b"3".to_vec()).unwrap();
+            db.publish_snapshot().unwrap(); // S = 3; deletes segs 1 and 3
+            db.wal.paths.snapshot(3)
+        };
+        // Corrupt the LATEST snapshot's stable bytes (post-sync corruption,
+        // the deliberately-violating §6.3-style test).
+        let mut bytes = fs.read(&snap_path).unwrap();
+        bytes[70] ^= 0xFF; // flip a payload byte
+        fs.truncate(&snap_path, 0).unwrap();
+        fs.append(&snap_path, &bytes).unwrap();
+        fs.sync_file(&snap_path).unwrap();
+        fs.crash();
+        // The latest snapshot is corrupt and older WAL was deleted, so no
+        // complete chain remains: recovery must fail closed, not start empty.
+        let err = Db::open(fs, &root(), DurabilityMode::Fsync);
+        assert!(
+            matches!(err, Err(WalError::Corruption(_))),
+            "expected Corruption on corrupt latest snapshot with no chain"
+        );
+    }
+
+    #[test]
+    fn corrupt_higher_snapshot_falls_back_to_lower_verified_chain() {
+        // Recovery selects the HIGHEST verified snapshot with a contiguous WAL
+        // tail. If a higher snapshot exists on disk but is corrupt, and a lower
+        // verified snapshot plus its contiguous WAL tail still forms a complete
+        // chain, recovery uses the lower snapshot (§7, §9.3). Here S1 is a real
+        // verified snapshot whose WAL tail (seg 2, LSN 2) is intact; a corrupt
+        // higher snapshot file at LSN 3 is placed on disk and must be skipped.
+        let fs = sim();
+        let (snap1_bytes, cluster) = {
+            let mut db = Db::open(fs.clone(), &root(), DurabilityMode::Fsync).unwrap();
+            db.set(b"a".to_vec(), b"1".to_vec()).unwrap();
+            db.publish_snapshot().unwrap(); // S1 = 1; reclaims seg 1, seg 2 active
+            db.set(b"b".to_vec(), b"2".to_vec()).unwrap(); // lsn 2 in seg 2
+            let snap1 = db.wal.paths.snapshot(1);
+            (fs.read(&snap1).unwrap(), db.wal.identity.cluster_id)
+        };
+        assert!(!snap1_bytes.is_empty());
+        // Fabricate a corrupt HIGHER snapshot at LSN 3 (valid header framing so
+        // it is enumerated, but a flipped payload/crc byte so decode fails).
+        let mut higher =
+            crate::wal::snapshot::encode(cluster, 3, 12345, &[(b"z".to_vec(), b"9".to_vec())]);
+        let last = higher.len() - 1;
+        higher[last] ^= 0xFF; // break the trailing snapshot_crc64
+        let snap3 = DataPaths::new(&root()).snapshot(3);
+        fs.create_file(&snap3).unwrap();
+        fs.append(&snap3, &higher).unwrap();
+        fs.sync_file(&snap3).unwrap();
+        fs.sync_dir(&DataPaths::new(&root()).snapshots_dir())
+            .unwrap();
+        fs.crash();
+
+        let db = Db::open(fs, &root(), DurabilityMode::Fsync).unwrap();
+        // The corrupt LSN-3 snapshot is skipped; recovery falls back to the
+        // verified S1 = 1 plus its contiguous WAL tail (seg 2, LSN 2).
+        assert_eq!(db.snapshot_lsn(), 1);
+        assert_eq!(db.get(b"a"), GetResult::Found(b"1".to_vec()));
+        assert_eq!(db.get(b"b"), GetResult::Found(b"2".to_vec()));
+        assert_eq!(db.last_applied_lsn(), 2);
+    }
+
+    #[test]
+    fn recovery_repairs_empty_trailing_segment_from_failed_rotate() {
+        // A crash during a rotate (e.g. snapshot-publication step 2) can leave
+        // the NEW segment file present but empty on the stable image because
+        // its header sync failed. The earlier SEALED segment holds all
+        // committed records. Recovery must treat the empty trailing segment as
+        // a torn active segment (§6.3), repair its header, and recover the
+        // acknowledged writes rather than failing closed. (Regression guard for
+        // the FEAT-004 crash-safety suite.)
+        let fs = sim();
+        let seg2;
+        {
+            let mut db = Db::open(fs.clone(), &root(), DurabilityMode::Fsync).unwrap();
+            db.set(b"a".to_vec(), b"1".to_vec()).unwrap(); // lsn 1, seg 1
+            db.set(b"b".to_vec(), b"2".to_vec()).unwrap(); // lsn 2, seg 1
+            db.rotate().unwrap(); // seal seg 1, open seg 3 (first_lsn = 3)
+            seg2 = db.wal.paths.segment(3);
+        }
+        // Simulate the failed-rotate remnant: the trailing segment exists but
+        // its header never became durable (a 0-byte file on the stable image).
+        fs.truncate(&seg2, 0).unwrap();
+        fs.sync_file(&seg2).unwrap();
+        fs.crash();
+
+        let db = Db::open(fs, &root(), DurabilityMode::Fsync).unwrap();
+        // All acknowledged writes are recovered from the sealed segment 1.
+        assert_eq!(db.get(b"a"), GetResult::Found(b"1".to_vec()));
+        assert_eq!(db.get(b"b"), GetResult::Found(b"2".to_vec()));
+        assert_eq!(db.last_applied_lsn(), 2);
+        assert!(db.tail_truncated());
+        // The repaired active segment accepts a new write that continues the
+        // LSN sequence.
+        let mut db = db;
+        let lsn = db.set(b"c".to_vec(), b"3".to_vec()).unwrap();
+        assert_eq!(lsn, 3);
+        assert_eq!(db.get(b"c"), GetResult::Found(b"3".to_vec()));
+    }
+
+    #[test]
+    fn publish_snapshot_failure_leaves_old_state_intact() {
+        // Arm sync failures so the temp-snapshot sync (step 4) fails; the old
+        // WAL and (absent) snapshot must be left intact and an error returned.
+        let fs = sim();
+        let mut db = Db::open(fs.clone(), &root(), DurabilityMode::Fsync).unwrap();
+        db.set(b"a".to_vec(), b"1".to_vec()).unwrap();
+        db.set(b"b".to_vec(), b"2".to_vec()).unwrap();
+        fs.arm_sync_failures(1000);
+        let err = db.publish_snapshot();
+        assert!(err.is_err(), "publish should fail when a sync fails");
+        fs.arm_sync_failures(0);
+        // No snapshot was published; snapshot_lsn stays 0 and segment 1 (the
+        // pre-publish WAL) is intact.
+        assert_eq!(db.snapshot_lsn(), 0);
+        assert!(db.wal.fs.exists(&db.wal.paths.segment(1)));
     }
 }

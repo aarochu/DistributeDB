@@ -91,7 +91,11 @@ pub type FsResult<T> = Result<T, FsError>;
 /// The lock is released when this value is dropped. For [`RealFs`] the OS
 /// releases the file lock when its handle closes (including after a crash);
 /// for [`SimFs`] the in-memory lock flag is cleared.
-pub trait LockGuard: std::fmt::Debug {}
+///
+/// The guard is `Send + Sync` so that a [`Db`](crate::wal::Db) holding one can
+/// be shared across threads behind a lock (the Phase 3 server shares the `Db`
+/// between its reader threads and the single-writer sequencer).
+pub trait LockGuard: std::fmt::Debug + Send + Sync {}
 
 /// File-I/O abstraction required by the WAL and recovery layers (§6.4).
 ///
@@ -119,6 +123,15 @@ pub trait FileSystem {
 
     /// Rename `from` to `to` on the same filesystem (atomic replace).
     fn rename(&self, from: &Path, to: &Path) -> FsResult<()>;
+
+    /// Remove the regular file at `path`.
+    ///
+    /// Like [`rename`](FileSystem::rename), this is a namespace change: it is
+    /// only durable after a subsequent [`sync_dir`](FileSystem::sync_dir) of
+    /// the containing directory. Used by snapshot publication to reclaim WAL
+    /// segments wholly covered by a verified snapshot (Technical-Design §7).
+    /// A missing file is an error ([`FsError::NotFound`]).
+    fn remove_file(&self, path: &Path) -> FsResult<()>;
 
     /// Truncate (or extend) `path` to exactly `len` bytes.
     fn truncate(&self, path: &Path, len: u64) -> FsResult<()>;
@@ -263,6 +276,11 @@ impl FileSystem for RealFs {
         Ok(())
     }
 
+    fn remove_file(&self, path: &Path) -> FsResult<()> {
+        std::fs::remove_file(path)?;
+        Ok(())
+    }
+
     fn truncate(&self, path: &Path, len: u64) -> FsResult<()> {
         use std::fs::OpenOptions;
         let f = OpenOptions::new().write(true).open(path)?;
@@ -330,6 +348,11 @@ struct SimFile {
     volatile: Vec<u8>,
     /// Bytes known to survive a crash (only updated by a successful sync).
     stable: Vec<u8>,
+    /// Whether the file has been removed in the volatile namespace but the
+    /// removal is not yet durable. A removal becomes stable only after a
+    /// `sync_dir` of its directory; a crash before that dir sync restores the
+    /// file (its stable bytes survive), mirroring `rename` durability (§6.4).
+    removed_volatile: bool,
 }
 
 /// Fault-injection configuration for [`SimFs`], driven by a seed.
@@ -454,6 +477,9 @@ impl SimFs {
         let mut g = self.inner.lock().expect("sim lock");
         for f in g.files.values_mut() {
             f.volatile = f.stable.clone();
+            // A removal that was not made durable by a dir sync is reverted:
+            // the file reappears with its stable bytes (§6.4, §7).
+            f.removed_volatile = false;
         }
         g.dirs_volatile = g.dirs_stable.clone();
         // A crash also drops any process lock.
@@ -471,6 +497,21 @@ impl SimFs {
     pub fn volatile_bytes(&self, path: &Path) -> Option<Vec<u8>> {
         let g = self.inner.lock().expect("sim lock");
         g.files.get(path).map(|f| f.volatile.clone())
+    }
+
+    /// Arm (or disarm) sync failures at runtime by overriding the sync-failure
+    /// probability (per 1000) on the live config.
+    ///
+    /// This is a test hook for scenarios that need a clean setup phase (e.g.
+    /// opening a [`Db`](crate::wal::Db) without faults) followed by a
+    /// deterministic durability failure once writes begin. Passing `1000` makes
+    /// **every** subsequent `sync_file`/`sync_dir` fail with an
+    /// [`FsError::InjectedFault`], which is exactly what the WAL treats as a
+    /// durability failure that fails the writer closed (Technical-Design §6.2).
+    /// Passing `0` disables injected sync failures again.
+    pub fn arm_sync_failures(&self, permille: u64) {
+        let mut g = self.inner.lock().expect("sim lock");
+        g.config.sync_fail_permille = permille;
     }
 }
 
@@ -499,7 +540,10 @@ impl FileSystem for SimFs {
 
     fn create_file(&self, path: &Path) -> FsResult<()> {
         let mut g = self.inner.lock().expect("sim lock");
-        g.files.entry(path.to_path_buf()).or_default();
+        let f = g.files.entry(path.to_path_buf()).or_default();
+        // Recreating a file that was removed (but not yet durably) resurrects
+        // it as a present, empty-content-preserving entry in the volatile view.
+        f.removed_volatile = false;
         Ok(())
     }
 
@@ -519,6 +563,8 @@ impl FileSystem for SimFs {
         };
 
         let f = g.files.entry(path.to_path_buf()).or_default();
+        // Appending to a removed path recreates it (a present file again).
+        f.removed_volatile = false;
         f.volatile.extend_from_slice(&data[..write_len]);
 
         if short && write_len < data.len() {
@@ -626,7 +672,10 @@ impl FileSystem for SimFs {
                 path.display()
             )));
         }
-        // A successful directory sync makes namespace changes stable.
+        // A successful directory sync makes namespace changes stable. Files
+        // removed in the volatile namespace are now durably gone: drop their
+        // entries entirely so a later crash cannot resurrect them.
+        g.files.retain(|_, f| !f.removed_volatile);
         g.dirs_stable = g.dirs_volatile.clone();
         Ok(())
     }
@@ -634,8 +683,9 @@ impl FileSystem for SimFs {
     fn rename(&self, from: &Path, to: &Path) -> FsResult<()> {
         let mut g = self.inner.lock().expect("sim lock");
         let from_key = from.to_path_buf();
-        if !g.files.contains_key(&from_key) {
-            return Err(FsError::NotFound(from_key));
+        match g.files.get(&from_key) {
+            Some(f) if !f.removed_volatile => {}
+            _ => return Err(FsError::NotFound(from_key)),
         }
         // Move the file's images to the new name in the volatile view. The
         // name change is only durable after a directory sync.
@@ -643,6 +693,22 @@ impl FileSystem for SimFs {
         g.files.insert(to.to_path_buf(), file);
         g.dirs_volatile.insert(to.to_path_buf());
         g.dirs_volatile.remove(&from_key);
+        Ok(())
+    }
+
+    fn remove_file(&self, path: &Path) -> FsResult<()> {
+        let mut g = self.inner.lock().expect("sim lock");
+        let key = path.to_path_buf();
+        match g.files.get_mut(&key) {
+            Some(f) if !f.removed_volatile => {
+                // Mark removed in the volatile namespace only; the entry (and
+                // its stable bytes) is retained until a `sync_dir` makes the
+                // removal durable, so a crash before that dir sync restores it.
+                f.removed_volatile = true;
+            }
+            _ => return Err(FsError::NotFound(key)),
+        }
+        g.dirs_volatile.remove(&key);
         Ok(())
     }
 
@@ -662,21 +728,30 @@ impl FileSystem for SimFs {
     fn read(&self, path: &Path) -> FsResult<Vec<u8>> {
         let g = self.inner.lock().expect("sim lock");
         // Reads return the volatile (current) view, as a real read would.
-        g.files
-            .get(path)
-            .map(|f| f.volatile.clone())
-            .ok_or_else(|| FsError::NotFound(path.to_path_buf()))
+        // A file removed in the volatile namespace reads as absent.
+        match g.files.get(path) {
+            Some(f) if !f.removed_volatile => Ok(f.volatile.clone()),
+            _ => Err(FsError::NotFound(path.to_path_buf())),
+        }
     }
 
     fn exists(&self, path: &Path) -> bool {
         let g = self.inner.lock().expect("sim lock");
-        g.files.contains_key(path) || g.dirs_volatile.contains(path)
+        let file_present = g
+            .files
+            .get(path)
+            .map(|f| !f.removed_volatile)
+            .unwrap_or(false);
+        file_present || g.dirs_volatile.contains(path)
     }
 
     fn list_dir(&self, path: &Path) -> FsResult<Vec<String>> {
         let g = self.inner.lock().expect("sim lock");
         let mut names = Vec::new();
-        for file_path in g.files.keys() {
+        for (file_path, f) in g.files.iter() {
+            if f.removed_volatile {
+                continue;
+            }
             if file_path.parent() == Some(path) {
                 if let Some(name) = file_path.file_name().and_then(|n| n.to_str()) {
                     names.push(name.to_string());
@@ -791,6 +866,43 @@ mod tests {
         // Directory entries are now stable.
         let g = fs2.inner.lock().unwrap();
         assert!(g.dirs_stable.contains(&p("/data/wal/0001")));
+    }
+
+    #[test]
+    fn remove_file_is_only_durable_after_dir_sync() {
+        let fs = SimFs::new(SimConfig::new(13));
+        fs.create_dir_all(&p("/data/wal")).unwrap();
+        fs.create_file(&p("/data/wal/0001.wal")).unwrap();
+        fs.append(&p("/data/wal/0001.wal"), b"seg").unwrap();
+        fs.sync_file(&p("/data/wal/0001.wal")).unwrap();
+        fs.sync_dir(&p("/data/wal")).unwrap();
+
+        // Remove it, but do NOT sync the directory yet.
+        fs.remove_file(&p("/data/wal/0001.wal")).unwrap();
+        assert!(!fs.exists(&p("/data/wal/0001.wal")));
+        assert!(fs.read(&p("/data/wal/0001.wal")).is_err());
+        assert!(fs.list_dir(&p("/data/wal")).unwrap().is_empty());
+
+        // A crash before the dir sync restores the file (removal not durable).
+        fs.crash();
+        assert!(fs.exists(&p("/data/wal/0001.wal")));
+        assert_eq!(fs.read(&p("/data/wal/0001.wal")).unwrap(), b"seg");
+
+        // Remove again and sync the directory: now the removal is durable.
+        fs.remove_file(&p("/data/wal/0001.wal")).unwrap();
+        fs.sync_dir(&p("/data/wal")).unwrap();
+        fs.crash();
+        assert!(!fs.exists(&p("/data/wal/0001.wal")));
+        assert!(fs.read(&p("/data/wal/0001.wal")).is_err());
+    }
+
+    #[test]
+    fn remove_file_missing_is_error() {
+        let fs = SimFs::new(SimConfig::new(1));
+        assert!(matches!(
+            fs.remove_file(&p("/nope")),
+            Err(FsError::NotFound(_))
+        ));
     }
 
     #[test]

@@ -14,18 +14,169 @@
 //! * A parse error prints a `BAD_REQUEST` message to stderr and the loop
 //!   continues (it never panics).
 //!
-//! The REPL exits cleanly on end-of-input (EOF). This is still local and
-//! in-memory only; there is no networking yet (that is Phase 3).
+//! The REPL exits cleanly on end-of-input (EOF).
+//!
+//! Phase 3 adds two additive subcommands (argv-parsed, std-only, no clap) while
+//! leaving the default no-argument behavior exactly as the local in-memory
+//! REPL above:
+//!
+//! * `serve [--addr 127.0.0.1:PORT] [--data DIR]` opens a durable
+//!   [`Db`](distributedb::Db) via `RealFs` at `--data` (default under the OS
+//!   temp dir, which `.gitignore` keeps out of the repo) and runs the Phase 3
+//!   TCP [`Server`](distributedb::Server), bound to loopback, until Ctrl-C /
+//!   EOF on stdin.
+//! * `client --addr HOST:PORT` runs a REPL that parses the same text syntax
+//!   with [`distributedb::parse`], sends each command over the binary protocol
+//!   with a [`Client`](distributedb::Client), and prints responses in the same
+//!   human-readable format as the local REPL.
+//!
+//! With no subcommand the original local in-memory stdin REPL runs unchanged.
 
 use std::io::{self, BufRead, Write};
 
-use distributedb::{parse, Command, GetResult, StorageEngine};
+use distributedb::{
+    parse, Client, Command, GetResult, Server, ServerConfig, Status, StorageEngine,
+};
 
 fn main() {
+    let args: Vec<String> = std::env::args().collect();
+    match args.get(1).map(String::as_str) {
+        Some("serve") => {
+            if let Err(err) = serve_command(&args[2..]) {
+                eprintln!("serve error: {err}");
+                std::process::exit(1);
+            }
+        }
+        Some("client") => {
+            if let Err(err) = client_command(&args[2..]) {
+                eprintln!("client error: {err}");
+                std::process::exit(1);
+            }
+        }
+        // No subcommand (or an unknown first token): preserve the original
+        // local in-memory stdin REPL exactly.
+        _ => {
+            let stdin = io::stdin();
+            let stdout = io::stdout();
+            let stderr = io::stderr();
+            run(&mut stdin.lock(), &mut stdout.lock(), &mut stderr.lock());
+        }
+    }
+}
+
+/// Parse a `--flag value` option out of `args`, returning its value if present.
+fn flag_value(args: &[String], flag: &str) -> Option<String> {
+    let mut it = args.iter();
+    while let Some(arg) = it.next() {
+        if arg == flag {
+            return it.next().cloned();
+        }
+    }
+    None
+}
+
+/// Run the `serve` subcommand: open a durable `Db` and start the TCP server.
+fn serve_command(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    use distributedb::{Db, DurabilityMode, RealFs};
+
+    let addr = flag_value(args, "--addr").unwrap_or_else(|| "127.0.0.1:5555".to_string());
+    let data_dir = flag_value(args, "--data").unwrap_or_else(|| {
+        // Default under the OS temp dir so runtime data never lands in the repo
+        // (.gitignore also excludes /data/, /run/, /tmp/, /target/).
+        std::env::temp_dir()
+            .join("distributedb-data")
+            .to_string_lossy()
+            .into_owned()
+    });
+
+    let db = Db::open(
+        RealFs,
+        std::path::Path::new(&data_dir),
+        DurabilityMode::Fsync,
+    )?;
+    let server = Server::start(addr.as_str(), db, ServerConfig::default())?;
+    println!("DistributeDB listening on {}", server.local_addr());
+    println!("data directory: {data_dir}");
+    println!("press Ctrl-D (EOF) on stdin to shut down");
+
+    // Block until stdin closes (EOF) or a line is read, then shut down cleanly.
+    let handle = server.shutdown_handle();
+    let stdin = io::stdin();
+    let mut line = String::new();
+    loop {
+        line.clear();
+        match stdin.lock().read_line(&mut line) {
+            Ok(0) => break, // EOF: shut down.
+            Ok(_) if line.trim() == "shutdown" => break,
+            Ok(_) => {}
+            Err(_) => break,
+        }
+    }
+    handle.shutdown();
+    drop(server); // joins acceptor + sequencer threads.
+    println!("shut down");
+    Ok(())
+}
+
+/// Run the `client` subcommand: a REPL over a TCP [`Client`].
+fn client_command(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    let addr = flag_value(args, "--addr").ok_or("client requires --addr HOST:PORT")?;
+    let mut client = Client::connect(addr.as_str())?;
+
     let stdin = io::stdin();
     let stdout = io::stdout();
-    let stderr = io::stderr();
-    run(&mut stdin.lock(), &mut stdout.lock(), &mut stderr.lock());
+    let mut out = stdout.lock();
+    let mut line = String::new();
+    loop {
+        line.clear();
+        match stdin.lock().read_line(&mut line) {
+            Ok(0) => break, // EOF.
+            Ok(_) => {
+                let rendered = match parse(&line) {
+                    Ok(command) => client_execute(&mut client, command),
+                    Err(err) => Some(format!("BAD_REQUEST: {err}")),
+                };
+                if let Some(text) = rendered {
+                    let _ = writeln!(out, "{text}");
+                    let _ = out.flush();
+                }
+            }
+            Err(err) => {
+                eprintln!("read error: {err}");
+                break;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Execute one parsed command over the network client and render the response
+/// in the same human-readable form as the local REPL. Returns `None` when
+/// nothing should be printed (never, currently) so the caller stays uniform.
+fn client_execute(client: &mut Client, command: Command) -> Option<String> {
+    let rendered = match command {
+        Command::Set { key, value } => match client.set(key, value) {
+            Ok(Status::Ok) | Ok(Status::OkVolatile) => OK.to_string(),
+            Ok(status) => format!("ERROR: {status:?}"),
+            Err(err) => format!("ERROR: {err}"),
+        },
+        Command::Delete { key } => match client.delete(key) {
+            Ok(Status::Ok) | Ok(Status::OkVolatile) => OK.to_string(),
+            Ok(status) => format!("ERROR: {status:?}"),
+            Err(err) => format!("ERROR: {err}"),
+        },
+        Command::Get { key } => match client.get(key) {
+            Ok(Some(value)) => String::from_utf8_lossy(&value).into_owned(),
+            Ok(None) => NOT_FOUND.to_string(),
+            Err(err) => format!("ERROR: {err}"),
+        },
+        Command::Exists { key } => match client.exists(key) {
+            Ok(true) => TRUE.to_string(),
+            Ok(false) => FALSE.to_string(),
+            Err(err) => format!("ERROR: {err}"),
+        },
+    };
+    Some(rendered)
 }
 
 /// Run the REPL loop over generic reader/writer handles.
