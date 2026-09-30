@@ -88,8 +88,8 @@ fn serve_command(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     use distributedb::{Db, DurabilityMode, RealFs};
 
     let addr = flag_value(args, "--addr").unwrap_or_else(|| "127.0.0.1:5555".to_string());
-    let replication_addr = flag_value(args, "--replication-addr")
-        .unwrap_or_else(|| "127.0.0.1:5556".to_string());
+    let replication_addr =
+        flag_value(args, "--replication-addr").unwrap_or_else(|| "127.0.0.1:5556".to_string());
     let data_dir = flag_value(args, "--data").unwrap_or_else(|| {
         // Default under the OS temp dir so runtime data never lands in the repo
         // (.gitignore also excludes /data/, /run/, /tmp/, /target/).
@@ -107,8 +107,15 @@ fn serve_command(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let cluster_id = distributedb::replication::format_id(&db.identity().cluster_id);
     let shared = Arc::new(RwLock::new(db));
     let stats = Arc::new(ReplicationStats::default());
-    let mut replication = PrimaryListener::start(replication_addr.as_str(), Arc::clone(&shared), Arc::clone(&stats))?;
-    let config = ServerConfig { replication_stats: Some(stats), ..ServerConfig::default() };
+    let mut replication = PrimaryListener::start(
+        replication_addr.as_str(),
+        Arc::clone(&shared),
+        Arc::clone(&stats),
+    )?;
+    let config = ServerConfig {
+        replication_stats: Some(stats),
+        ..ServerConfig::default()
+    };
     let server = Server::start_shared(addr.as_str(), shared, config)?;
     println!("DistributeDB listening on {}", server.local_addr());
     println!("replication listening on {}", replication.local_addr());
@@ -152,16 +159,22 @@ fn parse_cluster_id(hex: &str) -> Result<[u8; 16], Box<dyn std::error::Error>> {
 fn replica_command(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     use distributedb::{Db, DurabilityMode, RealFs};
 
-    let primary = flag_value(args, "--primary-addr").ok_or("replica requires --primary-addr HOST:PORT")?;
+    let primary =
+        flag_value(args, "--primary-addr").ok_or("replica requires --primary-addr HOST:PORT")?;
     let primary: std::net::SocketAddr = primary.parse()?;
     let data_dir = flag_value(args, "--data").ok_or("replica requires --data DIRECTORY")?;
-    let cluster_hex = flag_value(args, "--cluster-id").ok_or("replica requires --cluster-id HEX")?;
+    let cluster_hex =
+        flag_value(args, "--cluster-id").ok_or("replica requires --cluster-id HEX")?;
     let cluster_id = parse_cluster_id(&cluster_hex)?;
     let db = Db::open_configured(
         RealFs,
         std::path::Path::new(&data_dir),
         DurabilityMode::Fsync,
-        OpenConfig { role: NodeRole::Replica, cluster_id: Some(cluster_id), ..OpenConfig::default() },
+        OpenConfig {
+            role: NodeRole::Replica,
+            cluster_id: Some(cluster_id),
+            ..OpenConfig::default()
+        },
     )?;
     let shared = Arc::new(RwLock::new(db));
     let mut runner = ReplicaRunner::start(primary, shared)?;

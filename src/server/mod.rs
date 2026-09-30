@@ -714,9 +714,19 @@ where
 {
     let (keys, current_lsn, durable_lsn, snapshot_lsn) = {
         let db = shared.db.read().expect("db read lock poisoned");
-        (db.len(), db.last_applied_lsn(), db.last_durable_lsn(), db.snapshot_lsn())
+        (
+            db.len(),
+            db.last_applied_lsn(),
+            db.last_durable_lsn(),
+            db.snapshot_lsn(),
+        )
     };
-    let replicas = shared.config.replication_stats.as_ref().map(|stats| stats.snapshot()).unwrap_or_default();
+    let replicas = shared
+        .config
+        .replication_stats
+        .as_ref()
+        .map(|stats| stats.snapshot())
+        .unwrap_or_default();
     let snapshot = StatsSnapshot {
         uptime_seconds: shared.start.elapsed().as_secs(),
         keys,
@@ -770,7 +780,10 @@ fn render_stats_lines(s: &StatsSnapshot) -> String {
         let hex = crate::replication::format_id(id);
         out.push_str(&format!("replica_{hex}_applied_lsn={}\n", peer.applied_lsn));
         if peer.connected && peer.applied_lsn <= s.durable_lsn {
-            out.push_str(&format!("replica_{hex}_lag={}\n", s.durable_lsn - peer.applied_lsn));
+            out.push_str(&format!(
+                "replica_{hex}_lag={}\n",
+                s.durable_lsn - peer.applied_lsn
+            ));
         } else {
             out.push_str(&format!("replica_{hex}_lag=unknown\n"));
         }

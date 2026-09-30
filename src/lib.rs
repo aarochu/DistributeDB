@@ -47,6 +47,7 @@ pub use protocol::{
     decode_request_body, decode_response_body, read_frame, write_frame, ProtocolError, Request,
     RequestKind, Response, Status, PROTOCOL_VERSION,
 };
+pub use replication::{PrimaryListener, ReplicaRunner, ReplicationStats};
 pub use server::{Server, ServerConfig, ShutdownHandle};
 pub use storage::{GetResult, Mutation, StorageEngine};
 pub use wal::format::{GroupFooter, MutationRecord, RecordType, SegmentHeader};
@@ -58,4 +59,3 @@ pub use wal::{
     Db, DurabilityMode, Identity, NodeRole, OpenConfig, Wal, WalError, WalResult,
     DEFAULT_RETENTION_BUDGET_BYTES,
 };
-pub use replication::{PrimaryListener, ReplicaRunner, ReplicationStats};

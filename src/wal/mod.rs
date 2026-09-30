@@ -1500,7 +1500,9 @@ impl<F: FileSystem + Clone> Db<F> {
             return None;
         }
         let index = usize::try_from(lsn - self.snapshot_lsn - 1).ok()?;
-        self.retained_records.get(index).map(MutationRecord::record_hash)
+        self.retained_records
+            .get(index)
+            .map(MutationRecord::record_hash)
     }
 
     /// Copy at most `limit` durable records following a verified LSN. `None`
@@ -1547,7 +1549,9 @@ impl<F: FileSystem + Clone> Db<F> {
         let mutation = record_to_mutation(record);
         let expected = mutation_to_record(&mutation, self.wal.next_lsn, self.wal.last_record_hash);
         if expected.encode() != record.encode() {
-            return Err(WalError::Corruption("replicated record bytes differ".into()));
+            return Err(WalError::Corruption(
+                "replicated record bytes differ".into(),
+            ));
         }
         let assigned = self.wal.append_group(std::slice::from_ref(&mutation))?;
         self.engine.apply(mutation);
@@ -2122,7 +2126,10 @@ mod tests {
         assert_eq!(replica.apply_replicated_record(&records[0]).unwrap(), 1);
         assert_eq!(replica.apply_replicated_record(&records[0]).unwrap(), 1);
         assert_eq!(replica.apply_replicated_record(&records[1]).unwrap(), 2);
-        assert_eq!(replica.get(b"b"), crate::storage::GetResult::Found(b"2".to_vec()));
+        assert_eq!(
+            replica.get(b"b"),
+            crate::storage::GetResult::Found(b"2".to_vec())
+        );
         assert_eq!(replica.record_hash_at(2), primary.record_hash_at(2));
         drop(replica);
         drop(primary);
@@ -2135,7 +2142,10 @@ mod tests {
         )
         .unwrap();
         assert_eq!(replica.last_applied_lsn(), 2);
-        assert_eq!(replica.get(b"a"), crate::storage::GetResult::Found(b"1".to_vec()));
+        assert_eq!(
+            replica.get(b"a"),
+            crate::storage::GetResult::Found(b"1".to_vec())
+        );
     }
 
     #[test]

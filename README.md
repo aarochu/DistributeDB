@@ -4,7 +4,7 @@ DistributeDB is a single-primary key-value database project for studying durable
 
 ## Status
 
-Phases 1–4 of the [Statement of Work](docs/SOW.md) have implementations and automated tests: the local key-value engine, a checksummed write-ahead log (WAL), process-restart recovery, a TCP client/server, and local snapshots. The server accepts client writes on one node. **Replication, replica catch-up, cluster failure tests, and the benchmark harness are not implemented yet.**
+Phases 1–4 of the [Statement of Work](docs/SOW.md) have implementations and automated tests: the local key-value engine, a checksummed write-ahead log (WAL), process-restart recovery, a TCP client/server, and local snapshots. Phase 5 adds an asynchronous, ordered primary-to-replica stream with locally durable replica ACKs and reconnect from retained WAL. **Snapshot-based replica rebootstrap, the cluster failure harness, and the benchmark harness remain to be implemented.**
 
 The [technical design](docs/Technical-Design.md) describes the intended distributed behavior and marks choices added beyond the SOW. The [filesystem decision record](docs/ADR-001-Language-and-Filesystem.md) identifies the initial Linux/ext4 profile. Some design details are still provisional until their implementation tests pass.
 
@@ -22,14 +22,14 @@ flowchart LR
     P --> Q[Mutation sequencer]
     Q --> W[WAL and group sync]
     W --> M[In-memory map]
-    W -.->|planned ordered log| R[Replica WAL and map]
+    W -->|ordered durable records| R[Replica WAL and map]
     M --> S[Local snapshot]
-    R -.->|planned ACK and catch-up| P
+    R -->|durable ACK and WAL catch-up| P
 ```
 
 The server uses one mutation sequencer and a bounded write queue. In `fsync` mode, a write is appended with a group footer, synced, and applied before the server returns `OK`. Reads use the current applied map. The sequencer currently holds the database write lock during the sync, so read latency can include a WAL flush; this is a known performance trade-off to measure in Phase 7. The local in-memory REPL does not persist data.
 
-Asynchronous replication is planned. A future primary `OK` will mean **local** durability, not replica durability. A disconnected replica may lag; replica reads, if exposed, may be stale. If a connection drops before a client receives `OK`, the write outcome is unknown and the client must reconcile before retrying an operation whose repetition matters.
+Asynchronous replication sends only locally durable records. A primary `OK` means **local** durability, not replica durability. A disconnected replica may lag. If a connection drops before a client receives `OK`, the write outcome is unknown and the client must reconcile before retrying an operation whose repetition matters. A replica behind the retained WAL currently stops with `REBOOTSTRAP_REQUIRED`; snapshot transfer is Phase 6 work.
 
 ## Run the current server
 
@@ -38,7 +38,7 @@ Use Rust 1.92 or newer on the [supported filesystem profile](docs/ADR-001-Langua
 ```sh
 cargo build --offline
 cargo test --offline --all-targets
-cargo run -- serve --addr 127.0.0.1:5555 --data ./data/primary
+cargo run -- serve --addr 127.0.0.1:5555 --replication-addr 127.0.0.1:5556 --data ./data/primary
 ```
 
 In another terminal:
@@ -49,6 +49,14 @@ printf 'SET user:123 Aaron\nGET user:123\n' | cargo run -- client --addr 127.0.0
 
 The `serve` process exits after `shutdown` on stdin or EOF. Run `cargo run` without a subcommand for the original **in-memory** REPL. Snapshot publication and recovery are exercised through the library API and tests; an operator CLI for snapshot scheduling is still pending.
 
+For a local replica, copy the `cluster_id` printed by the primary at startup and start a separate process and data directory:
+
+```sh
+cargo run -- replica --primary-addr 127.0.0.1:5556 --cluster-id CLUSTER_ID --data ./data/replica-1
+```
+
+Use the same command with another directory for a second replica. The replication listener is bound to loopback and has no authentication. The replica process does not expose a client TCP listener yet.
+
 ## Roadmap and verification
 
 | Phase | State |
@@ -57,8 +65,8 @@ The `serve` process exits after `shutdown` on stdin or EOF. Run `cargo run` with
 | 2 — Persistent WAL | Implemented with group commit, checksums, simulated power-loss tests, and restart tests. |
 | 3 — Networking | TCP server/client and concurrent request tests implemented. |
 | 4 — Snapshots | Local publication, reload validation, WAL reclamation, and recovery tests implemented. |
-| 5 — Replication | In progress: static node identity and recovery-generation prerequisites. Ordered stream, ACKs, and lag remain. |
-| 6 — Failure recovery | Planned: reconnect, WAL and snapshot catch-up, kill/restart cluster tests. |
+| 5 — Replication | Static identity, ordered stream, durable ACKs, and connected replica lag implemented; integration tests cover two replicas. |
+| 6 — Failure recovery | WAL reconnect and catch-up implemented; snapshot catch-up and kill/restart cluster tests remain. |
 | 7 — Performance engineering | Planned: benchmark harness, workload mixes, resource and latency measurements. |
 | 8 — Advanced storage | Optional after core acceptance. |
 

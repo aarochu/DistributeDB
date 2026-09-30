@@ -52,7 +52,13 @@ impl ReplicationStats {
         if !peers.contains_key(&id) && peers.len() >= MAX_REPLICAS {
             return false;
         }
-        peers.insert(id, PeerProgress { applied_lsn, connected: true });
+        peers.insert(
+            id,
+            PeerProgress {
+                applied_lsn,
+                connected: true,
+            },
+        );
         true
     }
 
@@ -72,7 +78,10 @@ impl ReplicationStats {
 
     pub fn snapshot(&self) -> Vec<([u8; 16], PeerProgress)> {
         let peers = self.peers.lock().expect("replication stats poisoned");
-        let mut snapshot: Vec<_> = peers.iter().map(|(&id, &progress)| (id, progress)).collect();
+        let mut snapshot: Vec<_> = peers
+            .iter()
+            .map(|(&id, &progress)| (id, progress))
+            .collect();
         snapshot.sort_by_key(|(id, _)| *id);
         snapshot
     }
@@ -98,67 +107,103 @@ pub struct PrimaryListener {
 impl PrimaryListener {
     /// Bind a distinct replication port. The Phase 5 demo only accepts
     /// loopback peers; endpoint matching is not authentication.
-    pub fn start<A, F>(addr: A, db: Arc<RwLock<Db<F>>>, stats: Arc<ReplicationStats>) -> io::Result<Self>
+    pub fn start<A, F>(
+        addr: A,
+        db: Arc<RwLock<Db<F>>>,
+        stats: Arc<ReplicationStats>,
+    ) -> io::Result<Self>
     where
         A: ToSocketAddrs,
         F: FileSystem + Clone + Send + Sync + 'static,
     {
         {
             let guard = db.read().expect("db lock poisoned");
-            if guard.identity().role != "primary" || guard.durability_mode() != DurabilityMode::Fsync {
-                return Err(io::Error::new(io::ErrorKind::InvalidInput, "replication requires an fsync primary"));
+            if guard.identity().role != "primary"
+                || guard.durability_mode() != DurabilityMode::Fsync
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "replication requires an fsync primary",
+                ));
             }
         }
         let listener = TcpListener::bind(addr)?;
         let local_addr = listener.local_addr()?;
         if !local_addr.ip().is_loopback() {
-            return Err(io::Error::new(io::ErrorKind::InvalidInput, "Phase 5 replication must bind loopback"));
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "Phase 5 replication must bind loopback",
+            ));
         }
         listener.set_nonblocking(true)?;
         let shutdown = Arc::new(AtomicBool::new(false));
         let stop = Arc::clone(&shutdown);
-        let acceptor = thread::Builder::new().name("ddb-repl-accept".into()).spawn(move || {
-            let mut workers: Vec<JoinHandle<()>> = Vec::new();
-            while !stop.load(Ordering::SeqCst) {
-                match listener.accept() {
-                    Ok((stream, peer)) if peer.ip().is_loopback() => {
-                        let db = Arc::clone(&db);
-                        let stats = Arc::clone(&stats);
-                        let stop = Arc::clone(&stop);
-                        workers.push(thread::spawn(move || {
-                            let _ = handle_primary_connection(stream, db, stats, stop);
-                        }));
+        let acceptor = thread::Builder::new()
+            .name("ddb-repl-accept".into())
+            .spawn(move || {
+                let mut workers: Vec<JoinHandle<()>> = Vec::new();
+                while !stop.load(Ordering::SeqCst) {
+                    match listener.accept() {
+                        Ok((stream, peer)) if peer.ip().is_loopback() => {
+                            let db = Arc::clone(&db);
+                            let stats = Arc::clone(&stats);
+                            let stop = Arc::clone(&stop);
+                            workers.push(thread::spawn(move || {
+                                let _ = handle_primary_connection(stream, db, stats, stop);
+                            }));
+                        }
+                        Ok(_) => {}
+                        Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                            thread::sleep(POLL_INTERVAL)
+                        }
+                        Err(_) => thread::sleep(POLL_INTERVAL),
                     }
-                    Ok(_) => {}
-                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => thread::sleep(POLL_INTERVAL),
-                    Err(_) => thread::sleep(POLL_INTERVAL),
+                    let mut index = 0;
+                    while index < workers.len() {
+                        if workers[index].is_finished() {
+                            let _ = workers.swap_remove(index).join();
+                        } else {
+                            index += 1;
+                        }
+                    }
                 }
-                let mut index = 0;
-                while index < workers.len() {
-                    if workers[index].is_finished() {
-                        let _ = workers.swap_remove(index).join();
-                    } else { index += 1; }
+                for worker in workers {
+                    let _ = worker.join();
                 }
-            }
-            for worker in workers { let _ = worker.join(); }
-        })?;
-        Ok(Self { local_addr, shutdown, acceptor: Some(acceptor) })
+            })?;
+        Ok(Self {
+            local_addr,
+            shutdown,
+            acceptor: Some(acceptor),
+        })
     }
 
-    pub fn local_addr(&self) -> SocketAddr { self.local_addr }
+    pub fn local_addr(&self) -> SocketAddr {
+        self.local_addr
+    }
 
     pub fn shutdown(&mut self) {
         self.shutdown.store(true, Ordering::SeqCst);
-        if let Some(acceptor) = self.acceptor.take() { let _ = acceptor.join(); }
+        if let Some(acceptor) = self.acceptor.take() {
+            let _ = acceptor.join();
+        }
     }
 }
 
 impl Drop for PrimaryListener {
-    fn drop(&mut self) { self.shutdown(); }
+    fn drop(&mut self) {
+        self.shutdown();
+    }
 }
 
 fn send_error(stream: &mut TcpStream, code: u16, diagnostic: &str) {
-    let _ = write_message(stream, &Message::Error { code, diagnostic: diagnostic.into() });
+    let _ = write_message(
+        stream,
+        &Message::Error {
+            code,
+            diagnostic: diagnostic.into(),
+        },
+    );
 }
 
 fn handle_primary_connection<F>(
@@ -167,50 +212,97 @@ fn handle_primary_connection<F>(
     stats: Arc<ReplicationStats>,
     shutdown: Arc<AtomicBool>,
 ) -> protocol::Result<()>
-where F: FileSystem + Clone,
+where
+    F: FileSystem + Clone,
 {
     stream.set_read_timeout(Some(IO_TIMEOUT))?;
     stream.set_write_timeout(Some(IO_TIMEOUT))?;
     stream.set_nodelay(true)?;
     let (cluster_id, replica_id, mut cursor, hash, wal_version, snapshot_version) =
         match read_message(&mut stream)? {
-            Some(Message::Hello { cluster_id, replica_id, durable_lsn, record_hash, wal_version, snapshot_version }) =>
-                (cluster_id, replica_id, durable_lsn, record_hash, wal_version, snapshot_version),
-            _ => { send_error(&mut stream, protocol::ERROR_BAD_FRAME, "expected HELLO"); return Err(protocol::Error::Invalid("expected HELLO")); }
+            Some(Message::Hello {
+                cluster_id,
+                replica_id,
+                durable_lsn,
+                record_hash,
+                wal_version,
+                snapshot_version,
+            }) => (
+                cluster_id,
+                replica_id,
+                durable_lsn,
+                record_hash,
+                wal_version,
+                snapshot_version,
+            ),
+            _ => {
+                send_error(&mut stream, protocol::ERROR_BAD_FRAME, "expected HELLO");
+                return Err(protocol::Error::Invalid("expected HELLO"));
+            }
         };
     if wal_version != 1 || snapshot_version != 1 {
-        send_error(&mut stream, protocol::ERROR_BAD_FRAME, "unsupported format version");
+        send_error(
+            &mut stream,
+            protocol::ERROR_BAD_FRAME,
+            "unsupported format version",
+        );
         return Err(protocol::Error::Invalid("unsupported format version"));
     }
-    let (primary_id, latest_lsn, latest_hash, earliest) = {
+    let history = {
         let guard = db.read().expect("db lock poisoned");
         if cluster_id != guard.identity().cluster_id || replica_id == guard.identity().node_id {
-            send_error(&mut stream, protocol::ERROR_CLUSTER_MISMATCH, "cluster or node ID mismatch");
-            return Err(protocol::Error::Invalid("cluster or node ID mismatch"));
-        }
-        if cursor > guard.last_durable_lsn() {
-            send_error(&mut stream, protocol::ERROR_DIVERGED, "replica is ahead of primary");
-            return Err(protocol::Error::Invalid("replica ahead of primary"));
-        }
-        match guard.record_hash_at(cursor) {
-            Some(known) if known != hash => {
-                send_error(&mut stream, protocol::ERROR_DIVERGED, "history hash mismatch");
-                return Err(protocol::Error::Invalid("history hash mismatch"));
+            Err((protocol::ERROR_CLUSTER_MISMATCH, "cluster or node ID mismatch"))
+        } else if cursor > guard.last_durable_lsn() {
+            Err((protocol::ERROR_DIVERGED, "replica is ahead of primary"))
+        } else {
+            match guard.record_hash_at(cursor) {
+                Some(known) if known != hash => {
+                    Err((protocol::ERROR_DIVERGED, "history hash mismatch"))
+                }
+                None => Err((
+                    protocol::ERROR_REBOOTSTRAP_REQUIRED,
+                    "history prefix is no longer retained",
+                )),
+                Some(_) => Ok((
+                    guard.identity().node_id,
+                    guard.last_durable_lsn(),
+                    guard.record_hash_at(guard.last_durable_lsn()).unwrap_or(0),
+                    guard.snapshot_lsn() + 1,
+                )),
             }
-            None => {
-                send_error(&mut stream, protocol::ERROR_REBOOTSTRAP_REQUIRED, "history prefix is no longer retained");
-                return Err(protocol::Error::Invalid("history prefix unavailable"));
-            }
-            Some(_) => {}
         }
-        (guard.identity().node_id, guard.last_durable_lsn(), guard.record_hash_at(guard.last_durable_lsn()).unwrap_or(0), guard.snapshot_lsn() + 1)
+    };
+    let (primary_id, latest_lsn, latest_hash, earliest) = match history {
+        Ok(history) => history,
+        Err((code, diagnostic)) => {
+            send_error(&mut stream, code, diagnostic);
+            return Err(protocol::Error::Invalid(diagnostic));
+        }
     };
     if !stats.connect(replica_id, cursor) {
-        send_error(&mut stream, protocol::ERROR_UNAVAILABLE, "duplicate or excessive replica connection");
+        send_error(
+            &mut stream,
+            protocol::ERROR_UNAVAILABLE,
+            "duplicate or excessive replica connection",
+        );
         return Err(protocol::Error::Invalid("replica connection rejected"));
     }
-    let _peer = PeerGuard { id: replica_id, stats: Arc::clone(&stats) };
-    write_message(&mut stream, &Message::HelloAck { cluster_id, primary_id, durable_lsn: latest_lsn, record_hash: latest_hash, earliest_retained_lsn: earliest, wal_version: 1, snapshot_version: 1 })?;
+    let _peer = PeerGuard {
+        id: replica_id,
+        stats: Arc::clone(&stats),
+    };
+    write_message(
+        &mut stream,
+        &Message::HelloAck {
+            cluster_id,
+            primary_id,
+            durable_lsn: latest_lsn,
+            record_hash: latest_hash,
+            earliest_retained_lsn: earliest,
+            wal_version: 1,
+            snapshot_version: 1,
+        },
+    )?;
     let started = Instant::now();
     let mut last_heartbeat = Instant::now();
     while !shutdown.load(Ordering::SeqCst) {
@@ -219,20 +311,40 @@ where F: FileSystem + Clone,
             guard.durable_records_after(cursor, 1)
         };
         let Some(records) = next else {
-            send_error(&mut stream, protocol::ERROR_REBOOTSTRAP_REQUIRED, "required WAL was reclaimed");
+            send_error(
+                &mut stream,
+                protocol::ERROR_REBOOTSTRAP_REQUIRED,
+                "required WAL was reclaimed",
+            );
             return Err(protocol::Error::Invalid("required WAL was reclaimed"));
         };
         if let Some(record) = records.into_iter().next() {
             let expected_hash = record.record_hash();
-            write_message(&mut stream, &Message::Record { record: record.clone(), record_hash: expected_hash })?;
+            write_message(
+                &mut stream,
+                &Message::Record {
+                    record: record.clone(),
+                    record_hash: expected_hash,
+                },
+            )?;
             match read_message(&mut stream)? {
-                Some(Message::Ack { durable_lsn, applied_lsn, record_hash })
-                    if durable_lsn == record.lsn && applied_lsn == record.lsn && record_hash == expected_hash => {
-                        cursor = record.lsn;
-                        stats.ack(replica_id, cursor);
-                    }
+                Some(Message::Ack {
+                    durable_lsn,
+                    applied_lsn,
+                    record_hash,
+                }) if durable_lsn == record.lsn
+                    && applied_lsn == record.lsn
+                    && record_hash == expected_hash =>
+                {
+                    cursor = record.lsn;
+                    stats.ack(replica_id, cursor);
+                }
                 _ => {
-                    send_error(&mut stream, protocol::ERROR_DIVERGED, "ACK does not match sent record");
+                    send_error(
+                        &mut stream,
+                        protocol::ERROR_DIVERGED,
+                        "ACK does not match sent record",
+                    );
                     return Err(protocol::Error::Invalid("invalid ACK"));
                 }
             }
@@ -241,7 +353,13 @@ where F: FileSystem + Clone,
         if last_heartbeat.elapsed() >= Duration::from_secs(1) {
             let durable_lsn = db.read().expect("db lock poisoned").last_durable_lsn();
             let send_monotonic_ns = started.elapsed().as_nanos().min(u64::MAX as u128) as u64;
-            write_message(&mut stream, &Message::Heartbeat { durable_lsn, send_monotonic_ns })?;
+            write_message(
+                &mut stream,
+                &Message::Heartbeat {
+                    durable_lsn,
+                    send_monotonic_ns,
+                },
+            )?;
             last_heartbeat = Instant::now();
         }
         thread::sleep(POLL_INTERVAL);
@@ -257,72 +375,133 @@ pub struct ReplicaRunner {
 
 impl ReplicaRunner {
     pub fn start<F>(primary: SocketAddr, db: Arc<RwLock<Db<F>>>) -> io::Result<Self>
-    where F: FileSystem + Clone + Send + Sync + 'static,
+    where
+        F: FileSystem + Clone + Send + Sync + 'static,
     {
         {
             let guard = db.read().expect("db lock poisoned");
-            if guard.identity().role != "replica" || guard.durability_mode() != DurabilityMode::Fsync {
-                return Err(io::Error::new(io::ErrorKind::InvalidInput, "replica runner requires an fsync replica"));
+            if guard.identity().role != "replica"
+                || guard.durability_mode() != DurabilityMode::Fsync
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "replica runner requires an fsync replica",
+                ));
             }
         }
         let shutdown = Arc::new(AtomicBool::new(false));
         let fatal_error = Arc::new(Mutex::new(None));
         let stop = Arc::clone(&shutdown);
         let error_slot = Arc::clone(&fatal_error);
-        let worker = thread::Builder::new().name("ddb-replica".into()).spawn(move || {
-            while !stop.load(Ordering::SeqCst) {
-                match replica_session(primary, &db, &stop) {
-                    Ok(()) => {}
-                    Err(SessionError::Retry) => {}
-                    Err(SessionError::Fatal(error)) => {
-                        *error_slot.lock().expect("replica error lock poisoned") = Some(error);
-                        break;
+        let worker = thread::Builder::new()
+            .name("ddb-replica".into())
+            .spawn(move || {
+                while !stop.load(Ordering::SeqCst) {
+                    match replica_session(primary, &db, &stop) {
+                        Ok(()) => {}
+                        Err(SessionError::Retry) => {}
+                        Err(SessionError::Fatal(error)) => {
+                            *error_slot.lock().expect("replica error lock poisoned") = Some(error);
+                            break;
+                        }
                     }
+                    thread::sleep(Duration::from_millis(100));
                 }
-                thread::sleep(Duration::from_millis(100));
-            }
-        })?;
-        Ok(Self { shutdown, worker: Some(worker), fatal_error })
+            })?;
+        Ok(Self {
+            shutdown,
+            worker: Some(worker),
+            fatal_error,
+        })
     }
 
     pub fn fatal_error(&self) -> Option<String> {
-        self.fatal_error.lock().expect("replica error lock poisoned").clone()
+        self.fatal_error
+            .lock()
+            .expect("replica error lock poisoned")
+            .clone()
     }
 
     pub fn shutdown(&mut self) {
         self.shutdown.store(true, Ordering::SeqCst);
-        if let Some(worker) = self.worker.take() { let _ = worker.join(); }
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
     }
 }
 
 impl Drop for ReplicaRunner {
-    fn drop(&mut self) { self.shutdown(); }
+    fn drop(&mut self) {
+        self.shutdown();
+    }
 }
 
-enum SessionError { Retry, Fatal(String) }
+enum SessionError {
+    Retry,
+    Fatal(String),
+}
 
-fn replica_session<F>(primary: SocketAddr, db: &Arc<RwLock<Db<F>>>, stop: &AtomicBool) -> std::result::Result<(), SessionError>
-where F: FileSystem + Clone,
+fn replica_session<F>(
+    primary: SocketAddr,
+    db: &Arc<RwLock<Db<F>>>,
+    stop: &AtomicBool,
+) -> std::result::Result<(), SessionError>
+where
+    F: FileSystem + Clone,
 {
-    let mut stream = TcpStream::connect_timeout(&primary, Duration::from_millis(500)).map_err(|_| SessionError::Retry)?;
-    stream.set_read_timeout(Some(IO_TIMEOUT)).map_err(|_| SessionError::Retry)?;
-    stream.set_write_timeout(Some(IO_TIMEOUT)).map_err(|_| SessionError::Retry)?;
+    let mut stream = TcpStream::connect_timeout(&primary, Duration::from_millis(500))
+        .map_err(|_| SessionError::Retry)?;
+    stream
+        .set_read_timeout(Some(IO_TIMEOUT))
+        .map_err(|_| SessionError::Retry)?;
+    stream
+        .set_write_timeout(Some(IO_TIMEOUT))
+        .map_err(|_| SessionError::Retry)?;
     stream.set_nodelay(true).map_err(|_| SessionError::Retry)?;
     let (cluster_id, replica_id, durable_lsn, record_hash) = {
         let guard = db.read().expect("db lock poisoned");
-        (guard.identity().cluster_id, guard.identity().node_id, guard.last_durable_lsn(), guard.record_hash_at(guard.last_durable_lsn()).unwrap_or(0))
+        (
+            guard.identity().cluster_id,
+            guard.identity().node_id,
+            guard.last_durable_lsn(),
+            guard.record_hash_at(guard.last_durable_lsn()).unwrap_or(0),
+        )
     };
-    write_message(&mut stream, &Message::Hello { cluster_id, replica_id, durable_lsn, record_hash, wal_version: 1, snapshot_version: 1 }).map_err(|_| SessionError::Retry)?;
+    write_message(
+        &mut stream,
+        &Message::Hello {
+            cluster_id,
+            replica_id,
+            durable_lsn,
+            record_hash,
+            wal_version: 1,
+            snapshot_version: 1,
+        },
+    )
+    .map_err(|_| SessionError::Retry)?;
     match read_message(&mut stream).map_err(|_| SessionError::Retry)? {
-        Some(Message::HelloAck { cluster_id: response_cluster, durable_lsn: primary_lsn, wal_version: 1, snapshot_version: 1, .. })
-            if response_cluster == cluster_id && primary_lsn >= durable_lsn => {}
-        Some(Message::Error { code, diagnostic }) if code == protocol::ERROR_DIVERGED || code == protocol::ERROR_REBOOTSTRAP_REQUIRED || code == protocol::ERROR_CLUSTER_MISMATCH =>
-            return Err(SessionError::Fatal(diagnostic)),
+        Some(Message::HelloAck {
+            cluster_id: response_cluster,
+            durable_lsn: primary_lsn,
+            wal_version: 1,
+            snapshot_version: 1,
+            ..
+        }) if response_cluster == cluster_id && primary_lsn >= durable_lsn => {}
+        Some(Message::Error { code, diagnostic })
+            if code == protocol::ERROR_DIVERGED
+                || code == protocol::ERROR_REBOOTSTRAP_REQUIRED
+                || code == protocol::ERROR_CLUSTER_MISMATCH =>
+        {
+            return Err(SessionError::Fatal(diagnostic))
+        }
         _ => return Err(SessionError::Fatal("invalid primary HELLO_ACK".into())),
     }
     while !stop.load(Ordering::SeqCst) {
         match read_message(&mut stream) {
-            Ok(Some(Message::Record { record, record_hash })) => {
+            Ok(Some(Message::Record {
+                record,
+                record_hash,
+            })) => {
                 if record.record_hash() != record_hash {
                     return Err(SessionError::Fatal("record hash mismatch".into()));
                 }
@@ -334,11 +513,23 @@ where F: FileSystem + Clone,
                 let applied_lsn = guard.last_applied_lsn();
                 let hash = guard.record_hash_at(durable_lsn).unwrap_or(0);
                 drop(guard);
-                write_message(&mut stream, &Message::Ack { durable_lsn, applied_lsn, record_hash: hash }).map_err(|_| SessionError::Retry)?;
+                write_message(
+                    &mut stream,
+                    &Message::Ack {
+                        durable_lsn,
+                        applied_lsn,
+                        record_hash: hash,
+                    },
+                )
+                .map_err(|_| SessionError::Retry)?;
             }
             Ok(Some(Message::Heartbeat { .. })) => {}
-            Ok(Some(Message::Error { code, diagnostic })) if code == protocol::ERROR_DIVERGED || code == protocol::ERROR_REBOOTSTRAP_REQUIRED =>
-                return Err(SessionError::Fatal(diagnostic)),
+            Ok(Some(Message::Error { code, diagnostic }))
+                if code == protocol::ERROR_DIVERGED
+                    || code == protocol::ERROR_REBOOTSTRAP_REQUIRED =>
+            {
+                return Err(SessionError::Fatal(diagnostic))
+            }
             Ok(None) | Err(_) => return Err(SessionError::Retry),
             _ => return Err(SessionError::Fatal("unexpected primary message".into())),
         }
