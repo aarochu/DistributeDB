@@ -18,8 +18,8 @@ use std::sync::{Arc, Mutex, RwLock};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use crate::fileio::FileSystem;
 use crate::checksum::crc64_ecma;
+use crate::fileio::FileSystem;
 use crate::wal::{Db, DurabilityMode};
 use protocol::{read_message, write_message, Message};
 
@@ -287,13 +287,15 @@ where
                     } else {
                         Ok(None)
                     };
-                    snapshot.map(|snapshot| (
-                        guard.identity().node_id,
-                        guard.last_durable_lsn(),
-                        guard.record_hash_at(guard.last_durable_lsn()).unwrap_or(0),
-                        guard.snapshot_lsn() + 1,
-                        snapshot,
-                    ))
+                    snapshot.map(|snapshot| {
+                        (
+                            guard.identity().node_id,
+                            guard.last_durable_lsn(),
+                            guard.record_hash_at(guard.last_durable_lsn()).unwrap_or(0),
+                            guard.snapshot_lsn() + 1,
+                            snapshot,
+                        )
+                    })
                 }
             }
         }
@@ -598,7 +600,11 @@ where
                 snapshot_bytes,
                 snapshot_crc64,
             })) => {
-                if !db.read().expect("db lock poisoned").allows_snapshot_rebootstrap() {
+                if !db
+                    .read()
+                    .expect("db lock poisoned")
+                    .allows_snapshot_rebootstrap()
+                {
                     send_error(
                         &mut stream,
                         protocol::ERROR_REBOOTSTRAP_REQUIRED,

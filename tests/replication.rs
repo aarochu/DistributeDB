@@ -192,7 +192,8 @@ fn snapshot_rebootstrap_is_explicit_and_recovers_after_crash() {
         )
         .unwrap(),
     ));
-    let mut denied_runner = ReplicaRunner::start(listener.local_addr(), Arc::clone(&denied)).unwrap();
+    let mut denied_runner =
+        ReplicaRunner::start(listener.local_addr(), Arc::clone(&denied)).unwrap();
     wait_until(|| denied_runner.fatal_error().is_some());
     assert_eq!(denied.read().unwrap().last_applied_lsn(), 0);
     denied_runner.shutdown();

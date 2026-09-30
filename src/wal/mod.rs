@@ -260,7 +260,9 @@ fn decode_rebootstrap_policy(bytes: &[u8]) -> WalResult<bool> {
         || u32::from_le_bytes(bytes[12..16].try_into().unwrap())
             != crate::checksum::crc32c(&bytes[..12])
     {
-        return Err(WalError::Identity("invalid rebootstrap policy checksum or flag".into()));
+        return Err(WalError::Identity(
+            "invalid rebootstrap policy checksum or flag".into(),
+        ));
     }
     Ok(bytes[8] == 1)
 }
@@ -1589,7 +1591,10 @@ impl<F: FileSystem + Clone> Db<F> {
         if self.snapshot_lsn == 0 {
             return Ok(None);
         }
-        let bytes = self.wal.fs.read(&self.wal.paths.snapshot(self.snapshot_lsn))?;
+        let bytes = self
+            .wal
+            .fs
+            .read(&self.wal.paths.snapshot(self.snapshot_lsn))?;
         let decoded = snapshot::decode(&bytes, Some(self.wal.identity.cluster_id))
             .map_err(|error| WalError::Corruption(format!("replication snapshot: {error}")))?;
         if decoded.header.snapshot_lsn != self.snapshot_lsn
@@ -1676,7 +1681,10 @@ impl<F: FileSystem + Clone> Db<F> {
         fs.rename(&pointer_tmp, &paths.current())?;
         // A failure after rename may leave the running replica with an
         // uncertain pointer. It must stop and recover rather than ACK.
-        if let Err(error) = fs.sync_dir(&paths.tmp()).and_then(|_| fs.sync_dir(&paths.root)) {
+        if let Err(error) = fs
+            .sync_dir(&paths.tmp())
+            .and_then(|_| fs.sync_dir(&paths.root))
+        {
             self.wal.failed = true;
             return Err(error.into());
         }
