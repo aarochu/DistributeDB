@@ -913,6 +913,14 @@ pub struct Db<F: FileSystem> {
     _lock: Box<dyn crate::fileio::LockGuard>,
 }
 
+/// Verified snapshot bytes and the history boundary offered to a replica.
+pub struct ReplicationSnapshot {
+    pub bytes: Vec<u8>,
+    pub lsn: u64,
+    pub record_hash: u64,
+    pub crc64: u64,
+}
+
 impl<F: FileSystem + Clone> Db<F> {
     /// Persisted node identity, including the cluster ID a replica must use
     /// when it is provisioned. This value is stable across restarts.
@@ -1588,7 +1596,7 @@ impl<F: FileSystem + Clone> Db<F> {
 
     /// Clone the verified active snapshot for a replica that cannot verify a
     /// reclaimed WAL prefix. The transfer layer bounds the offered size.
-    pub fn replication_snapshot(&self) -> WalResult<Option<(Vec<u8>, u64, u64, u64)>> {
+    pub fn replication_snapshot(&self) -> WalResult<Option<ReplicationSnapshot>> {
         if self.snapshot_lsn == 0 {
             return Ok(None);
         }
@@ -1606,7 +1614,12 @@ impl<F: FileSystem + Clone> Db<F> {
             ));
         }
         let crc = u64::from_le_bytes(bytes[bytes.len() - 8..].try_into().unwrap());
-        Ok(Some((bytes, self.snapshot_lsn, self.snapshot_hash, crc)))
+        Ok(Some(ReplicationSnapshot {
+            bytes,
+            lsn: self.snapshot_lsn,
+            record_hash: self.snapshot_hash,
+            crc64: crc,
+        }))
     }
 
     /// Atomically install a received snapshot as a new replica recovery

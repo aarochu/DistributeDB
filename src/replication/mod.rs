@@ -276,7 +276,7 @@ where
                 known => {
                     let snapshot = if known.is_none() {
                         match guard.replication_snapshot() {
-                            Ok(Some(snapshot)) if snapshot.0.len() <= MAX_SNAPSHOT_BYTES => {
+                            Ok(Some(snapshot)) if snapshot.bytes.len() <= MAX_SNAPSHOT_BYTES => {
                                 Ok(Some(snapshot))
                             }
                             _ => Err((
@@ -331,7 +331,11 @@ where
             snapshot_version: 1,
         },
     )?;
-    if let Some((bytes, snapshot_lsn, snapshot_hash, snapshot_crc64)) = snapshot {
+    if let Some(snapshot) = snapshot {
+        let bytes = snapshot.bytes;
+        let snapshot_lsn = snapshot.lsn;
+        let snapshot_hash = snapshot.record_hash;
+        let snapshot_crc64 = snapshot.crc64;
         write_message(
             &mut stream,
             &Message::SnapshotOffer {
