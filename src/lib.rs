@@ -6,8 +6,12 @@
 //! `command` holds the command types and parser for the key-value interface
 //! (SOW §4.1: SET, GET, DELETE, EXISTS).
 //!
-//! Modules are scaffolded here and filled in by later Phase 1 features
-//! (FEAT-002 storage engine, FEAT-003 command parser / CLI).
+//! FEAT-002 fills in the storage engine and the command types/parser;
+//! FEAT-003 expands `main.rs` into a small REPL/CLI over the engine.
 
 pub mod command;
 pub mod storage;
+
+// Re-export the primary types for ergonomic use by the CLI and tests.
+pub use command::{parse, Command, ParseError};
+pub use storage::{GetResult, Mutation, StorageEngine};
