@@ -196,6 +196,10 @@ impl DataPaths {
         self.root.join("CURRENT")
     }
 
+    fn rebootstrap_policy(&self) -> PathBuf {
+        self.root.join("REBOOTSTRAP_POLICY")
+    }
+
     fn lock(&self) -> PathBuf {
         self.root.join("LOCK")
     }
@@ -238,6 +242,27 @@ impl DataPaths {
     fn snapshot_tmp(&self, lsn: u64) -> PathBuf {
         self.tmp().join(format!("{lsn:020}.snap.tmp"))
     }
+}
+
+fn encode_rebootstrap_policy(allowed: bool) -> [u8; 16] {
+    let mut bytes = [0u8; 16];
+    bytes[..8].copy_from_slice(b"DDBRBP01");
+    bytes[8] = u8::from(allowed);
+    bytes[12..16].copy_from_slice(&crate::checksum::crc32c(&bytes[..12]).to_le_bytes());
+    bytes
+}
+
+fn decode_rebootstrap_policy(bytes: &[u8]) -> WalResult<bool> {
+    if bytes.len() != 16 || &bytes[..8] != b"DDBRBP01" || bytes[9..12] != [0; 3] {
+        return Err(WalError::Identity("invalid rebootstrap policy".into()));
+    }
+    if bytes[8] > 1
+        || u32::from_le_bytes(bytes[12..16].try_into().unwrap())
+            != crate::checksum::crc32c(&bytes[..12])
+    {
+        return Err(WalError::Identity("invalid rebootstrap policy checksum or flag".into()));
+    }
+    Ok(bytes[8] == 1)
 }
 
 // ---------------------------------------------------------------------------
@@ -830,6 +855,9 @@ pub struct OpenConfig {
     /// directory, a supplied ID must match the persisted IDENTITY.
     pub cluster_id: Option<[u8; 16]>,
     pub retention_budget_bytes: u64,
+    /// Provision a new replica to permit deliberate snapshot replacement when
+    /// its old prefix is no longer verifiable. Persisted on first open.
+    pub allow_snapshot_rebootstrap: bool,
 }
 
 impl Default for OpenConfig {
@@ -838,6 +866,7 @@ impl Default for OpenConfig {
             role: NodeRole::Primary,
             cluster_id: None,
             retention_budget_bytes: DEFAULT_RETENTION_BUDGET_BYTES,
+            allow_snapshot_rebootstrap: false,
         }
     }
 }
@@ -877,6 +906,7 @@ pub struct Db<F: FileSystem> {
     /// WAL). Reaching it pauses new snapshots' reclamation with
     /// [`WalError::ResourceExhausted`] (Technical-Design §7).
     retention_budget_bytes: u64,
+    allow_snapshot_rebootstrap: bool,
     _lock: Box<dyn crate::fileio::LockGuard>,
 }
 
@@ -895,6 +925,10 @@ impl<F: FileSystem + Clone> Db<F> {
     /// Active local durability policy. Replication requires `Fsync`.
     pub fn durability_mode(&self) -> DurabilityMode {
         self.wal.mode
+    }
+
+    pub fn allows_snapshot_rebootstrap(&self) -> bool {
+        self.allow_snapshot_rebootstrap
     }
 
     /// Open (initializing if fresh) the data directory at `root` under `fs`
@@ -980,6 +1014,18 @@ impl<F: FileSystem + Clone> Db<F> {
             Self::init_fresh(&fs, &paths, mode, config)?
         };
 
+        let allow_snapshot_rebootstrap = if identity.role == "replica" {
+            if fs.exists(&paths.rebootstrap_policy()) {
+                decode_rebootstrap_policy(&fs.read(&paths.rebootstrap_policy())?)?
+            } else {
+                // Directories created before snapshot rebootstrap existed stay
+                // fail-closed until explicitly reprovisioned.
+                false
+            }
+        } else {
+            false
+        };
+
         let current_bytes = fs.read(&paths.current())?;
         let generation_id = if current_bytes == b"0000000000000001" {
             // Phase 2–4 directories used a provisional ASCII pointer. Replace
@@ -1055,6 +1101,7 @@ impl<F: FileSystem + Clone> Db<F> {
             snapshot_lsn: outcome.snapshot_lsn,
             records_replayed: outcome.records.len() as u64,
             retention_budget_bytes: config.retention_budget_bytes,
+            allow_snapshot_rebootstrap,
             _lock: lock,
         })
     }
@@ -1099,6 +1146,13 @@ impl<F: FileSystem + Clone> Db<F> {
         // Write IDENTITY durably.
         fs.create_file(&paths.identity())?;
         fs.append(&paths.identity(), &identity.encode())?;
+        if config.role == NodeRole::Replica {
+            fs.create_file(&paths.rebootstrap_policy())?;
+            fs.append(
+                &paths.rebootstrap_policy(),
+                &encode_rebootstrap_policy(config.allow_snapshot_rebootstrap),
+            )?;
+        }
 
         // The checked CURRENT pointer selects the recovery generation.
         fs.create_file(&paths.current())?;
@@ -1116,6 +1170,9 @@ impl<F: FileSystem + Clone> Db<F> {
 
         if mode == DurabilityMode::Fsync {
             fs.sync_file(&paths.identity())?;
+            if config.role == NodeRole::Replica {
+                fs.sync_file(&paths.rebootstrap_policy())?;
+            }
             fs.sync_file(&paths.current())?;
             fs.sync_file(&seg)?;
             fs.sync_dir(&paths.wal_dir())?;
@@ -1524,6 +1581,123 @@ impl<F: FileSystem + Clone> Db<F> {
                 .cloned()
                 .collect(),
         )
+    }
+
+    /// Clone the verified active snapshot for a replica that cannot verify a
+    /// reclaimed WAL prefix. The transfer layer bounds the offered size.
+    pub fn replication_snapshot(&self) -> WalResult<Option<(Vec<u8>, u64, u64, u64)>> {
+        if self.snapshot_lsn == 0 {
+            return Ok(None);
+        }
+        let bytes = self.wal.fs.read(&self.wal.paths.snapshot(self.snapshot_lsn))?;
+        let decoded = snapshot::decode(&bytes, Some(self.wal.identity.cluster_id))
+            .map_err(|error| WalError::Corruption(format!("replication snapshot: {error}")))?;
+        if decoded.header.snapshot_lsn != self.snapshot_lsn
+            || decoded.header.record_hash_at_lsn != self.snapshot_hash
+        {
+            return Err(WalError::Corruption(
+                "replication snapshot boundary differs from active WAL".into(),
+            ));
+        }
+        let crc = u64::from_le_bytes(bytes[bytes.len() - 8..].try_into().unwrap());
+        Ok(Some((bytes, self.snapshot_lsn, self.snapshot_hash, crc)))
+    }
+
+    /// Atomically install a received snapshot as a new replica recovery
+    /// generation. A crash before CURRENT publication keeps the old recovery
+    /// point; a crash after it selects the fully synced new snapshot and empty
+    /// continuation WAL. An in-process I/O failure requires restart.
+    pub fn install_replica_snapshot(
+        &mut self,
+        bytes: &[u8],
+        expected_lsn: u64,
+        expected_hash: u64,
+    ) -> WalResult<u64> {
+        if self.wal.identity.role != "replica" || !self.allow_snapshot_rebootstrap {
+            return Err(WalError::Identity(
+                "snapshot rebootstrap is not provisioned for this replica".into(),
+            ));
+        }
+        if self.wal.failed {
+            return Err(WalError::FailClosed);
+        }
+        let decoded = snapshot::decode(bytes, Some(self.wal.identity.cluster_id))
+            .map_err(|error| WalError::Corruption(format!("received snapshot: {error}")))?;
+        if decoded.header.snapshot_lsn != expected_lsn
+            || decoded.header.record_hash_at_lsn != expected_hash
+            || expected_lsn <= self.last_applied_lsn
+        {
+            return Err(WalError::Corruption(
+                "received snapshot boundary is invalid or stale".into(),
+            ));
+        }
+        let next_lsn = expected_lsn
+            .checked_add(1)
+            .ok_or_else(|| WalError::Corruption("snapshot LSN exhausted".into()))?;
+        let mut generation = self.wal.paths.generation_id;
+        let paths = loop {
+            generation = generation
+                .checked_add(1)
+                .ok_or_else(|| WalError::Corruption("generation ID exhausted".into()))?;
+            let candidate = DataPaths::with_generation(&self.wal.paths.root, generation);
+            if !self.wal.fs.exists(&candidate.generation()) {
+                break candidate;
+            }
+        };
+        let fs = &self.wal.fs;
+        fs.create_dir_all(&paths.wal_dir())?;
+        fs.create_dir_all(&paths.snapshots_dir())?;
+        let snapshot_path = paths.snapshot(expected_lsn);
+        fs.create_file(&snapshot_path)?;
+        fs.append(&snapshot_path, bytes)?;
+        fs.sync_file(&snapshot_path)?;
+        let segment_path = paths.segment(next_lsn);
+        let header = SegmentHeader {
+            cluster_id: self.wal.identity.cluster_id,
+            node_id: self.wal.identity.node_id,
+            first_lsn: next_lsn,
+        };
+        fs.create_file(&segment_path)?;
+        fs.append(&segment_path, &header.encode())?;
+        fs.sync_file(&segment_path)?;
+        fs.sync_dir(&paths.snapshots_dir())?;
+        fs.sync_dir(&paths.wal_dir())?;
+        fs.sync_dir(&paths.generation())?;
+        fs.sync_dir(&paths.root.join("generations"))?;
+
+        let pointer_tmp = paths.tmp().join("CURRENT.rebootstrap.tmp");
+        if fs.exists(&pointer_tmp) {
+            fs.truncate(&pointer_tmp, 0)?;
+        } else {
+            fs.create_file(&pointer_tmp)?;
+        }
+        fs.append(&pointer_tmp, &Current { generation }.encode())?;
+        fs.sync_file(&pointer_tmp)?;
+        fs.rename(&pointer_tmp, &paths.current())?;
+        // A failure after rename may leave the running replica with an
+        // uncertain pointer. It must stop and recover rather than ACK.
+        if let Err(error) = fs.sync_dir(&paths.tmp()).and_then(|_| fs.sync_dir(&paths.root)) {
+            self.wal.failed = true;
+            return Err(error.into());
+        }
+
+        let mut engine = StorageEngine::new();
+        for (key, value) in decoded.pairs {
+            engine.apply(Mutation::Set { key, value });
+        }
+        self.engine = engine;
+        self.wal.paths = paths;
+        self.wal.next_lsn = next_lsn;
+        self.wal.last_record_hash = expected_hash;
+        self.wal.durable_lsn = expected_lsn;
+        self.wal.active_first_lsn = next_lsn;
+        self.wal.active_len = SEGMENT_HEADER_LEN as u64;
+        self.last_applied_lsn = expected_lsn;
+        self.snapshot_lsn = expected_lsn;
+        self.snapshot_hash = expected_hash;
+        self.retained_records.clear();
+        self.records_replayed = 0;
+        Ok(expected_lsn)
     }
 
     /// Accept one validated primary record on a replica. The local WAL may

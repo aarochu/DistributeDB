@@ -166,6 +166,7 @@ fn replica_command(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let cluster_hex =
         flag_value(args, "--cluster-id").ok_or("replica requires --cluster-id HEX")?;
     let cluster_id = parse_cluster_id(&cluster_hex)?;
+    let provision_rebootstrap = args.iter().any(|arg| arg == "--allow-snapshot-rebootstrap");
     let db = Db::open_configured(
         RealFs,
         std::path::Path::new(&data_dir),
@@ -173,9 +174,13 @@ fn replica_command(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         OpenConfig {
             role: NodeRole::Replica,
             cluster_id: Some(cluster_id),
+            allow_snapshot_rebootstrap: provision_rebootstrap,
             ..OpenConfig::default()
         },
     )?;
+    if provision_rebootstrap && !db.allows_snapshot_rebootstrap() {
+        return Err("existing replica was provisioned without snapshot rebootstrap".into());
+    }
     let shared = Arc::new(RwLock::new(db));
     let mut runner = ReplicaRunner::start(primary, shared)?;
     println!("replica connecting to {primary}");

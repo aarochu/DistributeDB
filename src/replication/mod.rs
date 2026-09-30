@@ -19,6 +19,7 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use crate::fileio::FileSystem;
+use crate::checksum::crc64_ecma;
 use crate::wal::{Db, DurabilityMode};
 use protocol::{read_message, write_message, Message};
 
@@ -26,6 +27,8 @@ const IO_TIMEOUT: Duration = Duration::from_secs(2);
 const POLL_INTERVAL: Duration = Duration::from_millis(50);
 const MAX_REPLICAS: usize = 16;
 const MAX_CONNECTIONS: usize = 32;
+const MAX_SNAPSHOT_BYTES: usize = 256 * 1024 * 1024;
+const SNAPSHOT_CHUNK_BYTES: usize = 256 * 1024 - 26;
 
 pub fn format_id(id: &[u8; 16]) -> String {
     id.iter().map(|byte| format!("{byte:02x}")).collect()
@@ -270,20 +273,32 @@ where
                 Some(known) if known != hash => {
                     Err((protocol::ERROR_DIVERGED, "history hash mismatch"))
                 }
-                None => Err((
-                    protocol::ERROR_REBOOTSTRAP_REQUIRED,
-                    "history prefix is no longer retained",
-                )),
-                Some(_) => Ok((
-                    guard.identity().node_id,
-                    guard.last_durable_lsn(),
-                    guard.record_hash_at(guard.last_durable_lsn()).unwrap_or(0),
-                    guard.snapshot_lsn() + 1,
-                )),
+                known => {
+                    let snapshot = if known.is_none() {
+                        match guard.replication_snapshot() {
+                            Ok(Some(snapshot)) if snapshot.0.len() <= MAX_SNAPSHOT_BYTES => {
+                                Ok(Some(snapshot))
+                            }
+                            _ => Err((
+                                protocol::ERROR_REBOOTSTRAP_REQUIRED,
+                                "snapshot unavailable for reclaimed prefix",
+                            )),
+                        }
+                    } else {
+                        Ok(None)
+                    };
+                    snapshot.map(|snapshot| (
+                        guard.identity().node_id,
+                        guard.last_durable_lsn(),
+                        guard.record_hash_at(guard.last_durable_lsn()).unwrap_or(0),
+                        guard.snapshot_lsn() + 1,
+                        snapshot,
+                    ))
+                }
             }
         }
     };
-    let (primary_id, latest_lsn, latest_hash, earliest) = match history {
+    let (primary_id, latest_lsn, latest_hash, earliest, snapshot) = match history {
         Ok(history) => history,
         Err((code, diagnostic)) => {
             send_error(&mut stream, code, diagnostic);
@@ -314,6 +329,48 @@ where
             snapshot_version: 1,
         },
     )?;
+    if let Some((bytes, snapshot_lsn, snapshot_hash, snapshot_crc64)) = snapshot {
+        write_message(
+            &mut stream,
+            &Message::SnapshotOffer {
+                snapshot_lsn,
+                record_hash: snapshot_hash,
+                snapshot_bytes: bytes.len() as u64,
+                snapshot_crc64,
+            },
+        )?;
+        for (index, chunk) in bytes.chunks(SNAPSHOT_CHUNK_BYTES).enumerate() {
+            write_message(
+                &mut stream,
+                &Message::SnapshotChunk {
+                    snapshot_lsn,
+                    offset: (index * SNAPSHOT_CHUNK_BYTES) as u64,
+                    bytes: chunk.to_vec(),
+                },
+            )?;
+        }
+        write_message(
+            &mut stream,
+            &Message::SnapshotDone {
+                snapshot_lsn,
+                snapshot_crc64,
+            },
+        )?;
+        match read_message(&mut stream)? {
+            Some(Message::Ack {
+                durable_lsn,
+                applied_lsn,
+                record_hash,
+            }) if durable_lsn == snapshot_lsn
+                && applied_lsn == snapshot_lsn
+                && record_hash == snapshot_hash =>
+            {
+                cursor = snapshot_lsn;
+                stats.ack(replica_id, cursor);
+            }
+            _ => return Err(protocol::Error::Invalid("invalid snapshot ACK")),
+        }
+    }
     let started = Instant::now();
     let mut last_heartbeat = Instant::now();
     while !shutdown.load(Ordering::SeqCst) {
@@ -535,6 +592,74 @@ where
                 .map_err(|_| SessionError::Retry)?;
             }
             Ok(Some(Message::Heartbeat { .. })) => {}
+            Ok(Some(Message::SnapshotOffer {
+                snapshot_lsn,
+                record_hash,
+                snapshot_bytes,
+                snapshot_crc64,
+            })) => {
+                if !db.read().expect("db lock poisoned").allows_snapshot_rebootstrap() {
+                    send_error(
+                        &mut stream,
+                        protocol::ERROR_REBOOTSTRAP_REQUIRED,
+                        "replica was not provisioned for snapshot rebootstrap",
+                    );
+                    return Err(SessionError::Fatal(
+                        "snapshot rebootstrap requires explicit provisioning".into(),
+                    ));
+                }
+                if snapshot_bytes > MAX_SNAPSHOT_BYTES as u64 || snapshot_bytes < 72 {
+                    return Err(SessionError::Fatal("snapshot size is invalid".into()));
+                }
+                let mut bytes = Vec::with_capacity(snapshot_bytes as usize);
+                while bytes.len() < snapshot_bytes as usize {
+                    match read_message(&mut stream) {
+                        Ok(Some(Message::SnapshotChunk {
+                            snapshot_lsn: chunk_lsn,
+                            offset,
+                            bytes: chunk,
+                        })) if chunk_lsn == snapshot_lsn
+                            && offset == bytes.len() as u64
+                            && !chunk.is_empty()
+                            && chunk.len() <= snapshot_bytes as usize - bytes.len() =>
+                        {
+                            bytes.extend_from_slice(&chunk);
+                        }
+                        Ok(None) | Err(_) => return Err(SessionError::Retry),
+                        _ => return Err(SessionError::Fatal("invalid snapshot chunk".into())),
+                    }
+                }
+                match read_message(&mut stream) {
+                    Ok(Some(Message::SnapshotDone {
+                        snapshot_lsn: done_lsn,
+                        snapshot_crc64: done_crc,
+                    })) if done_lsn == snapshot_lsn && done_crc == snapshot_crc64 => {}
+                    Ok(None) | Err(_) => return Err(SessionError::Retry),
+                    _ => return Err(SessionError::Fatal("invalid snapshot completion".into())),
+                }
+                let embedded_crc = u64::from_le_bytes(
+                    bytes[bytes.len() - 8..].try_into().expect("length checked"),
+                );
+                if embedded_crc != snapshot_crc64
+                    || crc64_ecma(&bytes[..bytes.len() - 8]) != snapshot_crc64
+                {
+                    return Err(SessionError::Fatal("snapshot checksum mismatch".into()));
+                }
+                let mut guard = db.write().expect("db lock poisoned");
+                guard
+                    .install_replica_snapshot(&bytes, snapshot_lsn, record_hash)
+                    .map_err(|error| SessionError::Fatal(error.to_string()))?;
+                drop(guard);
+                write_message(
+                    &mut stream,
+                    &Message::Ack {
+                        durable_lsn: snapshot_lsn,
+                        applied_lsn: snapshot_lsn,
+                        record_hash,
+                    },
+                )
+                .map_err(|_| SessionError::Retry)?;
+            }
             Ok(Some(Message::Error { code, diagnostic }))
                 if code == protocol::ERROR_DIVERGED
                     || code == protocol::ERROR_REBOOTSTRAP_REQUIRED =>

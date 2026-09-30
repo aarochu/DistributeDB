@@ -153,3 +153,92 @@ fn mismatched_cluster_stops_replica_without_rewriting_history() {
     runner.shutdown();
     listener.shutdown();
 }
+
+#[test]
+fn snapshot_rebootstrap_is_explicit_and_recovers_after_crash() {
+    let primary_fs = SimFs::new(SimConfig::new(40));
+    let mut primary = Db::open(primary_fs, Path::new("/primary"), DurabilityMode::Fsync).unwrap();
+    let cluster_id = primary.identity().cluster_id;
+    for index in 0..20 {
+        primary
+            .set(format!("key-{index}").into_bytes(), vec![index as u8])
+            .unwrap();
+    }
+    assert_eq!(primary.publish_snapshot().unwrap(), 20);
+    for index in 20..30 {
+        primary
+            .set(format!("key-{index}").into_bytes(), vec![index as u8])
+            .unwrap();
+    }
+    let primary = Arc::new(RwLock::new(primary));
+    let mut listener = PrimaryListener::start(
+        "127.0.0.1:0",
+        Arc::clone(&primary),
+        Arc::new(ReplicationStats::default()),
+    )
+    .unwrap();
+
+    let denied_fs = SimFs::new(SimConfig::new(41));
+    let denied = Arc::new(RwLock::new(
+        Db::open_configured(
+            denied_fs,
+            Path::new("/denied"),
+            DurabilityMode::Fsync,
+            OpenConfig {
+                role: NodeRole::Replica,
+                cluster_id: Some(cluster_id),
+                ..OpenConfig::default()
+            },
+        )
+        .unwrap(),
+    ));
+    let mut denied_runner = ReplicaRunner::start(listener.local_addr(), Arc::clone(&denied)).unwrap();
+    wait_until(|| denied_runner.fatal_error().is_some());
+    assert_eq!(denied.read().unwrap().last_applied_lsn(), 0);
+    denied_runner.shutdown();
+
+    let replica_fs = SimFs::new(SimConfig::new(42));
+    let config = OpenConfig {
+        role: NodeRole::Replica,
+        cluster_id: Some(cluster_id),
+        allow_snapshot_rebootstrap: true,
+        ..OpenConfig::default()
+    };
+    let replica = Arc::new(RwLock::new(
+        Db::open_configured(
+            replica_fs.clone(),
+            Path::new("/replica"),
+            DurabilityMode::Fsync,
+            config,
+        )
+        .unwrap(),
+    ));
+    let mut runner = ReplicaRunner::start(listener.local_addr(), Arc::clone(&replica)).unwrap();
+    wait_until(|| replica.read().unwrap().last_applied_lsn() == 30);
+    assert!(runner.fatal_error().is_none());
+    assert_eq!(replica.read().unwrap().generation_id(), 2);
+    assert_eq!(
+        replica.read().unwrap().get(b"key-29"),
+        GetResult::Found(vec![29])
+    );
+    runner.shutdown();
+    drop(replica);
+    replica_fs.crash();
+    let reopened = Db::open_configured(
+        replica_fs,
+        Path::new("/replica"),
+        DurabilityMode::Fsync,
+        OpenConfig {
+            role: NodeRole::Replica,
+            cluster_id: Some(cluster_id),
+            ..OpenConfig::default()
+        },
+    )
+    .unwrap();
+    assert!(reopened.allows_snapshot_rebootstrap());
+    assert_eq!(reopened.generation_id(), 2);
+    assert_eq!(reopened.last_applied_lsn(), 30);
+    assert_eq!(reopened.get(b"key-0"), GetResult::Found(vec![0]));
+    assert_eq!(reopened.get(b"key-29"), GetResult::Found(vec![29]));
+    listener.shutdown();
+}
