@@ -45,6 +45,7 @@
 //! closed.
 
 pub mod format;
+pub mod snapshot;
 
 use crate::fileio::{FileSystem, FsError};
 use crate::storage::{Mutation, StorageEngine};

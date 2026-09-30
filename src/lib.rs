@@ -49,4 +49,8 @@ pub use protocol::{
 pub use server::{Server, ServerConfig, ShutdownHandle};
 pub use storage::{GetResult, Mutation, StorageEngine};
 pub use wal::format::{GroupFooter, MutationRecord, RecordType, SegmentHeader};
+pub use wal::snapshot::{
+    decode as decode_snapshot, encode as encode_snapshot, DecodedSnapshot, SnapshotError,
+    SnapshotHeader,
+};
 pub use wal::{Db, DurabilityMode, Identity, Wal, WalError, WalResult};
