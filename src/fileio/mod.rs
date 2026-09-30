@@ -128,6 +128,12 @@ pub trait FileSystem {
     /// Report whether `path` currently exists.
     fn exists(&self, path: &Path) -> bool;
 
+    /// List the names (final path component) of the regular files directly
+    /// under directory `path`. Order is unspecified; callers sort as needed.
+    /// A missing directory yields an empty list rather than an error, so
+    /// recovery can probe a not-yet-created layout.
+    fn list_dir(&self, path: &Path) -> FsResult<Vec<String>>;
+
     /// Acquire the exclusive data-directory lock at `lock_path`.
     ///
     /// Returns a guard that releases the lock on drop. Fails with
@@ -278,6 +284,24 @@ impl FileSystem for RealFs {
 
     fn exists(&self, path: &Path) -> bool {
         path.exists()
+    }
+
+    fn list_dir(&self, path: &Path) -> FsResult<Vec<String>> {
+        let entries = match std::fs::read_dir(path) {
+            Ok(e) => e,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(e) => return Err(FsError::Io(e)),
+        };
+        let mut names = Vec::new();
+        for entry in entries {
+            let entry = entry?;
+            if entry.file_type()?.is_file() {
+                if let Some(name) = entry.file_name().to_str() {
+                    names.push(name.to_string());
+                }
+            }
+        }
+        Ok(names)
     }
 
     fn acquire_lock(&self, lock_path: &Path) -> FsResult<Box<dyn LockGuard>> {
@@ -659,6 +683,19 @@ impl FileSystem for SimFs {
         g.files.contains_key(path) || g.dirs_volatile.contains(path)
     }
 
+    fn list_dir(&self, path: &Path) -> FsResult<Vec<String>> {
+        let g = self.inner.lock().expect("sim lock");
+        let mut names = Vec::new();
+        for file_path in g.files.keys() {
+            if file_path.parent() == Some(path) {
+                if let Some(name) = file_path.file_name().and_then(|n| n.to_str()) {
+                    names.push(name.to_string());
+                }
+            }
+        }
+        Ok(names)
+    }
+
     fn acquire_lock(&self, lock_path: &Path) -> FsResult<Box<dyn LockGuard>> {
         let mut g = self.inner.lock().expect("sim lock");
         if g.locked {
@@ -821,6 +858,20 @@ mod tests {
         assert!(fs.acquire_lock(&p("/data/LOCK")).is_ok());
     }
 
+    #[test]
+    fn sim_list_dir_returns_files_in_that_directory_only() {
+        let fs = SimFs::new(SimConfig::new(1));
+        fs.create_dir_all(&p("/data/wal")).unwrap();
+        fs.create_file(&p("/data/wal/0001.wal")).unwrap();
+        fs.create_file(&p("/data/wal/0002.wal")).unwrap();
+        fs.create_file(&p("/data/IDENTITY")).unwrap();
+        let mut names = fs.list_dir(&p("/data/wal")).unwrap();
+        names.sort();
+        assert_eq!(names, vec!["0001.wal".to_string(), "0002.wal".to_string()]);
+        // A missing directory yields an empty list, not an error.
+        assert!(fs.list_dir(&p("/nope")).unwrap().is_empty());
+    }
+
     // ---- RealFs round trip under an OS temp dir --------------------------
 
     /// Create a unique temp subdirectory under the OS temp dir.
@@ -859,6 +910,10 @@ mod tests {
         fs.truncate(&renamed, 5).unwrap();
         fs.sync_file(&renamed).unwrap();
         assert_eq!(fs.read(&renamed).unwrap(), b"hello");
+
+        // list_dir reports the single regular file present.
+        let names = fs.list_dir(&dir).unwrap();
+        assert_eq!(names, vec!["segment-0001.wal".to_string()]);
 
         // Cleanup: remove the temp directory tree.
         let _ = std::fs::remove_dir_all(&dir);

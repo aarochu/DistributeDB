@@ -14,11 +14,17 @@
 //! `fileio` provides the append/sync/rename/truncate/read/lock file-I/O
 //! abstraction with a real Linux adapter and a deterministic
 //! simulated-power-loss adapter (Technical-Design §6.4, ADR-001).
+//!
+//! FEAT-002 adds `wal`: the persistent Write-Ahead Log with the exact §6.1
+//! byte format, LSN sequencing, group-commit durability, the data-directory
+//! layout, crash-recovery replay (§6.3, §9), and a [`Db`] entry point that
+//! reconstructs a [`StorageEngine`] from disk.
 
 pub mod checksum;
 pub mod command;
 pub mod fileio;
 pub mod storage;
+pub mod wal;
 
 // Re-export the primary types for ergonomic use by the CLI and tests.
 pub use checksum::{crc32c, crc64_ecma, Crc32c, Crc64Ecma};
@@ -27,3 +33,5 @@ pub use fileio::{
     FileSystem, FsError, FsResult, LockGuard, RealFs, SimConfig, SimFs, SplitMix64, SIM_PAGE_SIZE,
 };
 pub use storage::{GetResult, Mutation, StorageEngine};
+pub use wal::format::{GroupFooter, MutationRecord, RecordType, SegmentHeader};
+pub use wal::{Db, DurabilityMode, Identity, Wal, WalError, WalResult};
