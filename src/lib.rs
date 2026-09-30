@@ -23,6 +23,7 @@
 pub mod checksum;
 pub mod command;
 pub mod fileio;
+pub mod protocol;
 pub mod storage;
 pub mod wal;
 
@@ -31,6 +32,10 @@ pub use checksum::{crc32c, crc64_ecma, Crc32c, Crc64Ecma};
 pub use command::{parse, Command, ParseError};
 pub use fileio::{
     FileSystem, FsError, FsResult, LockGuard, RealFs, SimConfig, SimFs, SplitMix64, SIM_PAGE_SIZE,
+};
+pub use protocol::{
+    decode_request_body, decode_response_body, read_frame, write_frame, ProtocolError, Request,
+    RequestKind, Response, Status, PROTOCOL_VERSION,
 };
 pub use storage::{GetResult, Mutation, StorageEngine};
 pub use wal::format::{GroupFooter, MutationRecord, RecordType, SegmentHeader};
