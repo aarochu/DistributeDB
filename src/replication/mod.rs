@@ -251,7 +251,10 @@ where
     let history = {
         let guard = db.read().expect("db lock poisoned");
         if cluster_id != guard.identity().cluster_id || replica_id == guard.identity().node_id {
-            Err((protocol::ERROR_CLUSTER_MISMATCH, "cluster or node ID mismatch"))
+            Err((
+                protocol::ERROR_CLUSTER_MISMATCH,
+                "cluster or node ID mismatch",
+            ))
         } else if cursor > guard.last_durable_lsn() {
             Err((protocol::ERROR_DIVERGED, "replica is ahead of primary"))
         } else {
