@@ -111,6 +111,20 @@ impl StorageEngine {
     pub fn is_empty(&self) -> bool {
         self.map.is_empty()
     }
+
+    /// Return an immutable clone of every current key/value pair.
+    ///
+    /// This is what the mutation sequencer clones under the map lock at a
+    /// completed-group boundary before writing a snapshot (Technical-Design
+    /// §5, §7). It is a simple O(n) copy of the whole dataset. Iteration order
+    /// is unspecified: Snapshot v1 stores pairs in map iteration order and
+    /// does not require sorting (Technical-Design §7).
+    pub fn snapshot_pairs(&self) -> Vec<(Vec<u8>, Vec<u8>)> {
+        self.map
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect()
+    }
 }
 
 #[cfg(test)]
@@ -198,6 +212,32 @@ mod tests {
         assert_eq!(via_apply.get(b"a"), via_convenience.get(b"a"));
         assert_eq!(via_apply.get(b"b"), via_convenience.get(b"b"));
         assert_eq!(via_apply.len(), via_convenience.len());
+    }
+
+    #[test]
+    fn snapshot_pairs_returns_all_current_pairs() {
+        let mut engine = StorageEngine::new();
+        engine.set(b"a".to_vec(), b"1".to_vec());
+        engine.set(b"b".to_vec(), Vec::new());
+        engine.set(b"c".to_vec(), b"3".to_vec());
+        engine.delete(b"c".to_vec());
+
+        let mut pairs = engine.snapshot_pairs();
+        // Iteration order is unspecified; sort to compare deterministically.
+        pairs.sort();
+        assert_eq!(
+            pairs,
+            vec![(b"a".to_vec(), b"1".to_vec()), (b"b".to_vec(), Vec::new())]
+        );
+        // The returned clone is independent of later mutations.
+        engine.set(b"d".to_vec(), b"4".to_vec());
+        assert_eq!(pairs.len(), 2);
+    }
+
+    #[test]
+    fn snapshot_pairs_empty_engine_is_empty() {
+        let engine = StorageEngine::new();
+        assert!(engine.snapshot_pairs().is_empty());
     }
 
     #[test]

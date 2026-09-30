@@ -568,6 +568,9 @@ where
 /// * [`WalError::MutationTooLarge`] — the request itself is too big; this is a
 ///   client error, `BAD_REQUEST`. (The codec bounds mutation size before it
 ///   reaches here, so this is defensive.)
+/// * [`WalError::ResourceExhausted`] — retained recovery data would exceed the
+///   configured disk budget, so new writes are paused: `RESOURCE_EXHAUSTED`
+///   (Technical-Design §7).
 /// * [`WalError::Format`] / [`WalError::Identity`] — genuinely unexpected
 ///   internal faults: `INTERNAL_ERROR`.
 fn wal_error_to_status(err: &crate::wal::WalError) -> Status {
@@ -575,6 +578,7 @@ fn wal_error_to_status(err: &crate::wal::WalError) -> Status {
     match err {
         WalError::Io(_) | WalError::FailClosed | WalError::Corruption(_) => Status::Unavailable,
         WalError::MutationTooLarge { .. } => Status::BadRequest,
+        WalError::ResourceExhausted { .. } => Status::ResourceExhausted,
         WalError::Format(_) | WalError::Identity(_) => Status::InternalError,
     }
 }
@@ -687,9 +691,9 @@ fn render_stats<F>(shared: &Arc<Shared<F>>) -> String
 where
     F: FileSystem + Clone + Send + Sync + 'static,
 {
-    let (keys, current_lsn) = {
+    let (keys, current_lsn, snapshot_lsn) = {
         let db = shared.db.read().expect("db read lock poisoned");
-        (db.len(), db.last_applied_lsn())
+        (db.len(), db.last_applied_lsn(), db.snapshot_lsn())
     };
     let snapshot = StatsSnapshot {
         uptime_seconds: shared.start.elapsed().as_secs(),
@@ -698,6 +702,7 @@ where
         reads_total: shared.metrics.reads_total.load(Ordering::Relaxed),
         writes_total: shared.metrics.writes_total.load(Ordering::Relaxed),
         current_lsn,
+        snapshot_lsn,
         connected_clients: shared.metrics.connected_clients.load(Ordering::Relaxed),
     };
     render_stats_lines(&snapshot)
@@ -714,6 +719,7 @@ struct StatsSnapshot {
     reads_total: u64,
     writes_total: u64,
     current_lsn: u64,
+    snapshot_lsn: u64,
     connected_clients: usize,
 }
 
@@ -729,6 +735,7 @@ fn render_stats_lines(s: &StatsSnapshot) -> String {
     out.push_str(&format!("reads_total={}\n", s.reads_total));
     out.push_str(&format!("writes_total={}\n", s.writes_total));
     out.push_str(&format!("current_lsn={}\n", s.current_lsn));
+    out.push_str(&format!("snapshot_lsn={}\n", s.snapshot_lsn));
     out.push_str(&format!("connected_clients={}\n", s.connected_clients));
     // Replication is Phase 5; report zero for now.
     out.push_str("replicas_connected=0\n");
@@ -815,6 +822,7 @@ mod tests {
             reads_total: 70,
             writes_total: 30,
             current_lsn: 30,
+            snapshot_lsn: 20,
             connected_clients: 2,
         };
         let text = render_stats_lines(&snapshot);
@@ -832,9 +840,10 @@ mod tests {
         assert!(text.contains("reads_total=70"));
         assert!(text.contains("writes_total=30"));
         assert!(text.contains("current_lsn=30"));
+        assert!(text.contains("snapshot_lsn=20"));
         assert!(text.contains("connected_clients=2"));
         assert!(text.contains("replicas_connected=0"));
         // Bounded: a small fixed number of lines.
-        assert_eq!(lines.len(), 9);
+        assert_eq!(lines.len(), 10);
     }
 }
