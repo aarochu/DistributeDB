@@ -1,7 +1,7 @@
 //! End-to-end kill/restart exercise using the compiled server binary and real
 //! filesystem. This models process termination, not a physical power cut.
 
-use std::io::Write;
+use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -20,7 +20,7 @@ impl Process {
             .args(args)
             .stdin(Stdio::piped())
             .stdout(Stdio::null())
-            .stderr(Stdio::inherit())
+            .stderr(Stdio::piped())
             .spawn()
             .expect("spawn DistributeDB process");
         Self { child: Some(child) }
@@ -71,7 +71,7 @@ fn wait_client(addr: SocketAddr) -> Client {
     }
 }
 
-fn wait_replica(client: &mut Client, expected_lsn: usize) {
+fn wait_replica(client: &mut Client, replica: &mut Process, expected_lsn: usize) {
     let deadline = Instant::now() + Duration::from_secs(30);
     loop {
         let stats = client.stats().expect("primary STATS");
@@ -80,6 +80,14 @@ fn wait_replica(client: &mut Client, expected_lsn: usize) {
             && stats.contains("_lag=0")
         {
             return;
+        }
+        let child = replica.child.as_mut().expect("replica process exists");
+        if let Some(status) = child.try_wait().expect("poll replica") {
+            let mut stderr = String::new();
+            if let Some(pipe) = child.stderr.as_mut() {
+                pipe.read_to_string(&mut stderr).unwrap();
+            }
+            panic!("replica exited {status} before LSN {expected_lsn}: {stderr}");
         }
         assert!(
             Instant::now() < deadline,
@@ -176,19 +184,19 @@ fn replica_and_primary_process_kill_restart_converges() {
     let mut replica = Process::spawn(&replica_args);
     let mut client = wait_client(client_addr);
     write_range(&mut client, 0, first);
-    wait_replica(&mut client, first);
+    wait_replica(&mut client, &mut replica, first);
 
     replica.kill();
     write_range(&mut client, first, second);
     replica = Process::spawn(&replica_args);
-    wait_replica(&mut client, second);
+    wait_replica(&mut client, &mut replica, second);
 
     primary.kill();
     drop(client);
     primary = Process::spawn(&primary_args);
     client = wait_client(client_addr);
     write_range(&mut client, second, final_lsn);
-    wait_replica(&mut client, final_lsn);
+    wait_replica(&mut client, &mut replica, final_lsn);
     drop(client);
 
     replica.shutdown();
