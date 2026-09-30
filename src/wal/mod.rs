@@ -793,6 +793,12 @@ pub struct Db<F: FileSystem> {
     /// The LSN of the snapshot currently used as the recovery base (0 if the
     /// map was rebuilt from LSN 1 with no snapshot) (Technical-Design §7).
     snapshot_lsn: u64,
+    /// The number of WAL records replayed after the recovery base during the
+    /// last [`Db::open`] (records with `lsn > snapshot_lsn`). This is the work
+    /// recovery had to do beyond loading the snapshot map, and is bounded by
+    /// `last_applied_lsn - snapshot_lsn` (Technical-Design §7 claim boundary;
+    /// SOW §22 recovery-work-reduction acceptance goal).
+    records_replayed: u64,
     /// Bounded disk budget for retained recovery data (snapshots + retained
     /// WAL). Reaching it pauses new snapshots' reclamation with
     /// [`WalError::ResourceExhausted`] (Technical-Design §7).
@@ -887,6 +893,7 @@ impl<F: FileSystem + Clone> Db<F> {
             last_applied_lsn,
             tail_truncated: outcome.tail_truncated,
             snapshot_lsn: outcome.snapshot_lsn,
+            records_replayed: outcome.records.len() as u64,
             retention_budget_bytes,
             _lock: lock,
         })
@@ -985,6 +992,7 @@ impl<F: FileSystem + Clone> Db<F> {
                     match Self::scan_wal_tail(
                         fs,
                         paths,
+                        identity,
                         &segment_lsns,
                         mode,
                         snap_lsn,
@@ -1025,7 +1033,7 @@ impl<F: FileSystem + Clone> Db<F> {
 
         // No snapshot yielded a complete chain. Fall back to a full log from
         // LSN 1 ONLY when a complete contiguous log from LSN 1 exists.
-        match Self::scan_wal_tail(fs, paths, &segment_lsns, mode, 0, 0)? {
+        match Self::scan_wal_tail(fs, paths, identity, &segment_lsns, mode, 0, 0)? {
             Some(tail) => {
                 let last_record_hash = if tail.records.is_empty() {
                     0
@@ -1102,6 +1110,7 @@ impl<F: FileSystem + Clone> Db<F> {
     fn scan_wal_tail(
         fs: &F,
         paths: &DataPaths,
+        identity: &Identity,
         segment_lsns: &[u64],
         mode: DurabilityMode,
         base_lsn: u64,
@@ -1161,6 +1170,34 @@ impl<F: FileSystem + Clone> Db<F> {
             let seg_path = paths.segment(segment_first_lsn);
             let bytes = fs.read(&seg_path)?;
             let is_active = i == last_index;
+
+            // An ACTIVE (newest) segment too short to even hold a header is an
+            // incomplete/torn segment creation: a crash interrupted a rotate
+            // (e.g. snapshot-publication step 2) after the file appeared but
+            // before its header was durably synced. This is the active-segment
+            // analogue of a torn tail (§6.3): the earlier SEALED segments hold
+            // all committed records, so we repair the empty segment by writing
+            // a fresh header and treat it as an empty active segment. A SEALED
+            // segment (not the newest) that is this short is genuine
+            // corruption and still fails closed. (Technical-Design §6.3, §7.)
+            if is_active && bytes.len() < SEGMENT_HEADER_LEN {
+                let header = SegmentHeader {
+                    cluster_id: identity.cluster_id,
+                    node_id: identity.node_id,
+                    first_lsn: segment_first_lsn,
+                };
+                fs.truncate(&seg_path, 0)?;
+                fs.append(&seg_path, &header.encode())?;
+                if mode == DurabilityMode::Fsync {
+                    fs.sync_file(&seg_path)?;
+                    fs.sync_dir(&paths.wal_dir())?;
+                }
+                tail_truncated = true;
+                active_segment_first_lsn = segment_first_lsn;
+                active_segment_valid_len = SEGMENT_HEADER_LEN as u64;
+                // No records in this segment; the chain ends here.
+                break;
+            }
 
             let scan = scan_as(&bytes, segment_first_lsn, prev_hash, is_active)?;
 
@@ -1295,6 +1332,19 @@ impl<F: FileSystem + Clone> Db<F> {
     /// §17).
     pub fn snapshot_lsn(&self) -> u64 {
         self.snapshot_lsn
+    }
+
+    /// The number of WAL records replayed after the recovery base during the
+    /// most recent [`Db::open`] (records with `lsn > snapshot_lsn`)
+    /// (Technical-Design §7; SOW §22).
+    ///
+    /// After a snapshot at LSN *S* this is bounded by
+    /// `last_applied_lsn - snapshot_lsn`: recovery loads the snapshot map and
+    /// replays only the post-snapshot WAL tail, so its work no longer scales
+    /// with the entire command history. Segments wholly covered by *S* are
+    /// reclaimed and never read during recovery.
+    pub fn records_replayed(&self) -> u64 {
+        self.records_replayed
     }
 
     /// The configured bounded disk budget for retained recovery data in bytes
@@ -2009,6 +2059,44 @@ mod tests {
         assert_eq!(db.get(b"a"), GetResult::Found(b"1".to_vec()));
         assert_eq!(db.get(b"b"), GetResult::Found(b"2".to_vec()));
         assert_eq!(db.last_applied_lsn(), 2);
+    }
+
+    #[test]
+    fn recovery_repairs_empty_trailing_segment_from_failed_rotate() {
+        // A crash during a rotate (e.g. snapshot-publication step 2) can leave
+        // the NEW segment file present but empty on the stable image because
+        // its header sync failed. The earlier SEALED segment holds all
+        // committed records. Recovery must treat the empty trailing segment as
+        // a torn active segment (§6.3), repair its header, and recover the
+        // acknowledged writes rather than failing closed. (Regression guard for
+        // the FEAT-004 crash-safety suite.)
+        let fs = sim();
+        let seg2;
+        {
+            let mut db = Db::open(fs.clone(), &root(), DurabilityMode::Fsync).unwrap();
+            db.set(b"a".to_vec(), b"1".to_vec()).unwrap(); // lsn 1, seg 1
+            db.set(b"b".to_vec(), b"2".to_vec()).unwrap(); // lsn 2, seg 1
+            db.rotate().unwrap(); // seal seg 1, open seg 3 (first_lsn = 3)
+            seg2 = db.wal.paths.segment(3);
+        }
+        // Simulate the failed-rotate remnant: the trailing segment exists but
+        // its header never became durable (a 0-byte file on the stable image).
+        fs.truncate(&seg2, 0).unwrap();
+        fs.sync_file(&seg2).unwrap();
+        fs.crash();
+
+        let db = Db::open(fs, &root(), DurabilityMode::Fsync).unwrap();
+        // All acknowledged writes are recovered from the sealed segment 1.
+        assert_eq!(db.get(b"a"), GetResult::Found(b"1".to_vec()));
+        assert_eq!(db.get(b"b"), GetResult::Found(b"2".to_vec()));
+        assert_eq!(db.last_applied_lsn(), 2);
+        assert!(db.tail_truncated());
+        // The repaired active segment accepts a new write that continues the
+        // LSN sequence.
+        let mut db = db;
+        let lsn = db.set(b"c".to_vec(), b"3".to_vec()).unwrap();
+        assert_eq!(lsn, 3);
+        assert_eq!(db.get(b"c"), GetResult::Found(b"3".to_vec()));
     }
 
     #[test]
