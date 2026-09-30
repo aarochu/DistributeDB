@@ -44,11 +44,13 @@
 //! Interior/sealed-segment corruption or exceeding the 8 MiB group cap fails
 //! closed.
 
+pub mod current;
 pub mod format;
 pub mod snapshot;
 
 use crate::fileio::{FileSystem, FsError};
 use crate::storage::{Mutation, StorageEngine};
+use current::Current;
 use format::{
     DecodedRecord, FormatError, GroupFooter, MutationRecord, RecordType, SegmentHeader,
     GROUP_FOOTER_LEN, GROUP_MAGIC, MAX_RECORD_ENCODED_LEN, SEGMENT_HEADER_LEN,
@@ -101,6 +103,8 @@ pub enum WalError {
     /// The writer is in a fail-closed state after a prior append/sync failure
     /// (Technical-Design §3); it no longer accepts mutations.
     FailClosed,
+    /// Client mutation attempted against a statically configured replica.
+    ReadOnlyReplica,
     /// A mutation exceeded the encoded-size limit.
     MutationTooLarge {
         /// The encoded length that was rejected.
@@ -126,6 +130,7 @@ impl std::fmt::Display for WalError {
             WalError::Corruption(m) => write!(f, "wal corruption (fail closed): {m}"),
             WalError::Identity(m) => write!(f, "identity error: {m}"),
             WalError::FailClosed => write!(f, "wal is fail-closed and rejecting mutations"),
+            WalError::ReadOnlyReplica => write!(f, "replica rejects client mutations"),
             WalError::MutationTooLarge { encoded_len } => {
                 write!(f, "mutation encoded length {encoded_len} exceeds limit")
             }
@@ -165,12 +170,21 @@ pub type WalResult<T> = Result<T, WalError>;
 #[derive(Debug, Clone)]
 struct DataPaths {
     root: PathBuf,
+    generation_id: u64,
 }
 
 impl DataPaths {
     fn new(root: &Path) -> Self {
         DataPaths {
             root: root.to_path_buf(),
+            generation_id: 1,
+        }
+    }
+
+    fn with_generation(root: &Path, generation_id: u64) -> Self {
+        DataPaths {
+            root: root.to_path_buf(),
+            generation_id,
         }
     }
 
@@ -191,7 +205,9 @@ impl DataPaths {
     }
 
     fn generation(&self) -> PathBuf {
-        self.root.join("generations").join("0000000000000001")
+        self.root
+            .join("generations")
+            .join(format!("{:016x}", self.generation_id))
     }
 
     fn wal_dir(&self) -> PathBuf {
@@ -790,6 +806,42 @@ fn record_to_mutation(rec: &MutationRecord) -> Mutation {
     }
 }
 
+/// A node's statically configured role. Replicas never accept client writes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NodeRole {
+    Primary,
+    Replica,
+}
+
+impl NodeRole {
+    fn as_str(self) -> &'static str {
+        match self {
+            NodeRole::Primary => "primary",
+            NodeRole::Replica => "replica",
+        }
+    }
+}
+
+/// Options fixed when a data directory is first created or reopened.
+#[derive(Debug, Clone, Copy)]
+pub struct OpenConfig {
+    pub role: NodeRole,
+    /// A replica must be given its primary's cluster ID. On an existing data
+    /// directory, a supplied ID must match the persisted IDENTITY.
+    pub cluster_id: Option<[u8; 16]>,
+    pub retention_budget_bytes: u64,
+}
+
+impl Default for OpenConfig {
+    fn default() -> Self {
+        Self {
+            role: NodeRole::Primary,
+            cluster_id: None,
+            retention_budget_bytes: DEFAULT_RETENTION_BUDGET_BYTES,
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Db: the integration entry point.
 // ---------------------------------------------------------------------------
@@ -824,16 +876,27 @@ pub struct Db<F: FileSystem> {
 }
 
 impl<F: FileSystem + Clone> Db<F> {
+    /// Persisted node identity, including the cluster ID a replica must use
+    /// when it is provisioned. This value is stable across restarts.
+    pub fn identity(&self) -> &Identity {
+        &self.wal.identity
+    }
+
+    /// Active recovery generation selected by the checked CURRENT pointer.
+    pub fn generation_id(&self) -> u64 {
+        self.wal.paths.generation_id
+    }
+
     /// Open (initializing if fresh) the data directory at `root` under `fs`
     /// with durability `mode`, returning a ready [`Db`].
     ///
     /// On a fresh directory this acquires the LOCK, creates the generation-1
     /// layout, generates + persists a fresh IDENTITY (stable cluster/node IDs),
-    /// writes a minimal CURRENT, and creates the first segment. On an existing
+    /// writes a checked CURRENT, and creates the first segment. On an existing
     /// directory it acquires the LOCK, validates IDENTITY, then scans and
     /// replays the WAL.
     pub fn open(fs: F, root: &Path, mode: DurabilityMode) -> WalResult<Self> {
-        Self::open_with_budget(fs, root, mode, DEFAULT_RETENTION_BUDGET_BYTES)
+        Self::open_configured(fs, root, mode, OpenConfig::default())
     }
 
     /// Like [`Db::open`] but with an explicit retention disk budget in bytes
@@ -845,7 +908,36 @@ impl<F: FileSystem + Clone> Db<F> {
         mode: DurabilityMode,
         retention_budget_bytes: u64,
     ) -> WalResult<Self> {
-        let paths = DataPaths::new(root);
+        Self::open_configured(
+            fs,
+            root,
+            mode,
+            OpenConfig {
+                retention_budget_bytes,
+                ..OpenConfig::default()
+            },
+        )
+    }
+
+    /// Open with an explicit persisted role and cluster membership. This is
+    /// the entry point for statically provisioned replicas.
+    pub fn open_configured(
+        fs: F,
+        root: &Path,
+        mode: DurabilityMode,
+        config: OpenConfig,
+    ) -> WalResult<Self> {
+        if config.role == NodeRole::Replica && config.cluster_id.is_none() {
+            return Err(WalError::Identity(
+                "replica requires an explicit cluster ID".into(),
+            ));
+        }
+        if config.role == NodeRole::Replica && mode != DurabilityMode::Fsync {
+            return Err(WalError::Identity(
+                "replica requires fsync durability".into(),
+            ));
+        }
+        let mut paths = DataPaths::new(root);
         // Acquire the exclusive data-directory lock before recovery (§3, §9).
         // The parent directory must exist to create the LOCK file.
         fs.create_dir_all(&paths.root)?;
@@ -860,10 +952,36 @@ impl<F: FileSystem + Clone> Db<F> {
                     id.version
                 )));
             }
+            if id.role != config.role.as_str() {
+                return Err(WalError::Identity("configured role differs from IDENTITY".into()));
+            }
+            if config.cluster_id.is_some_and(|cluster| cluster != id.cluster_id) {
+                return Err(WalError::Identity("configured cluster ID differs from IDENTITY".into()));
+            }
             id
         } else {
-            Self::init_fresh(&fs, &paths, mode)?
+            Self::init_fresh(&fs, &paths, mode, config)?
         };
+
+        let current_bytes = fs.read(&paths.current())?;
+        let generation_id = if current_bytes == b"0000000000000001" {
+            // Phase 2–4 directories used a provisional ASCII pointer. Replace
+            // it by a synced v1 pointer through a same-filesystem rename. A
+            // crash before the rename leaves the old pointer readable, so the
+            // migration is safe to retry.
+            Self::upgrade_legacy_current(&fs, &paths, mode)?;
+            1
+        } else {
+            Current::decode(&current_bytes)
+                .map_err(|e| WalError::Identity(e.into()))?
+                .generation
+        };
+        paths = DataPaths::with_generation(root, generation_id);
+        if !fs.exists(&paths.generation()) {
+            return Err(WalError::Identity(
+                "CURRENT points to a missing generation".into(),
+            ));
+        }
 
         // Recover by loading the chosen snapshot (if any) and replaying the
         // contiguous footer-closed WAL tail after the snapshot boundary.
@@ -911,31 +1029,55 @@ impl<F: FileSystem + Clone> Db<F> {
             tail_truncated: outcome.tail_truncated,
             snapshot_lsn: outcome.snapshot_lsn,
             records_replayed: outcome.records.len() as u64,
-            retention_budget_bytes,
+            retention_budget_bytes: config.retention_budget_bytes,
             _lock: lock,
         })
     }
 
+    fn upgrade_legacy_current(fs: &F, paths: &DataPaths, mode: DurabilityMode) -> WalResult<()> {
+        fs.create_dir_all(&paths.tmp())?;
+        let temp = paths.tmp().join("CURRENT.v1.tmp");
+        if fs.exists(&temp) {
+            fs.truncate(&temp, 0)?;
+        } else {
+            fs.create_file(&temp)?;
+        }
+        fs.append(&temp, &Current { generation: 1 }.encode())?;
+        if mode == DurabilityMode::Fsync {
+            fs.sync_file(&temp)?;
+        }
+        fs.rename(&temp, &paths.current())?;
+        if mode == DurabilityMode::Fsync {
+            fs.sync_dir(&paths.tmp())?;
+            fs.sync_dir(&paths.root)?;
+        }
+        Ok(())
+    }
+
     /// Initialize a fresh data directory, returning the new IDENTITY.
-    fn init_fresh(fs: &F, paths: &DataPaths, mode: DurabilityMode) -> WalResult<Identity> {
+    fn init_fresh(
+        fs: &F,
+        paths: &DataPaths,
+        mode: DurabilityMode,
+        config: OpenConfig,
+    ) -> WalResult<Identity> {
         fs.create_dir_all(&paths.tmp())?;
         fs.create_dir_all(&paths.wal_dir())?;
         fs.create_dir_all(&paths.snapshots_dir())?;
 
         let identity = Identity {
             version: IDENTITY_VERSION,
-            cluster_id: generate_id(0xC1),
+            cluster_id: config.cluster_id.unwrap_or_else(|| generate_id(0xC1)),
             node_id: generate_id(0x0D),
-            role: "primary".to_string(),
+            role: config.role.as_str().to_string(),
         };
         // Write IDENTITY durably.
         fs.create_file(&paths.identity())?;
         fs.append(&paths.identity(), &identity.encode())?;
 
-        // Minimal CURRENT pointing at generation 1 (full 28-byte format is
-        // Phase 4). Store the generation directory name.
+        // The checked CURRENT pointer selects the recovery generation.
         fs.create_file(&paths.current())?;
-        fs.append(&paths.current(), b"0000000000000001")?;
+        fs.append(&paths.current(), &Current { generation: 1 }.encode())?;
 
         // Create the first segment with its header at first_lsn = 1.
         let header = SegmentHeader {
@@ -952,6 +1094,10 @@ impl<F: FileSystem + Clone> Db<F> {
             fs.sync_file(&paths.current())?;
             fs.sync_file(&seg)?;
             fs.sync_dir(&paths.wal_dir())?;
+            fs.sync_dir(&paths.snapshots_dir())?;
+            fs.sync_dir(&paths.generation())?;
+            fs.sync_dir(&paths.root.join("generations"))?;
+            fs.sync_dir(&paths.tmp())?;
             fs.sync_dir(&paths.root)?;
         }
         Ok(identity)
@@ -1265,6 +1411,9 @@ impl<F: FileSystem + Clone> Db<F> {
     }
 
     fn apply_durable(&mut self, m: Mutation) -> WalResult<u64> {
+        if self.wal.identity.role != "primary" {
+            return Err(WalError::ReadOnlyReplica);
+        }
         let assigned = self.wal.append_group(std::slice::from_ref(&m))?;
         let lsn = assigned[0];
         // Write-ahead order: apply to the map only after the durable append.
@@ -1291,6 +1440,9 @@ impl<F: FileSystem + Clone> Db<F> {
     /// `<= MAX_GROUP_BYTES` encoded) are enforced by
     /// [`Wal::append_group`]; callers should pre-drain within those limits.
     pub fn apply_group(&mut self, muts: &[Mutation]) -> WalResult<Vec<u64>> {
+        if self.wal.identity.role != "primary" {
+            return Err(WalError::ReadOnlyReplica);
+        }
         if muts.is_empty() {
             return Ok(Vec::new());
         }
@@ -1751,6 +1903,79 @@ mod tests {
         assert_eq!(db.get(b"A"), GetResult::Found(b"1".to_vec()));
         assert_eq!(db.last_applied_lsn(), 3);
         assert_eq!(db.last_durable_lsn(), 3);
+    }
+
+    #[test]
+    fn current_pointer_is_checked_before_recovery() {
+        let fs = sim();
+        {
+            let mut db = Db::open(fs.clone(), &root(), DurabilityMode::Fsync).unwrap();
+            db.set(b"k".to_vec(), b"v".to_vec()).unwrap();
+            assert_eq!(db.generation_id(), 1);
+        }
+        let current = DataPaths::new(&root()).current();
+        let mut bytes = fs.read(&current).unwrap();
+        assert_eq!(bytes.len(), current::CURRENT_LEN);
+        bytes[16] ^= 1;
+        fs.truncate(&current, 0).unwrap();
+        fs.append(&current, &bytes).unwrap();
+        fs.sync_file(&current).unwrap();
+        fs.crash();
+        assert!(matches!(
+            Db::open(fs, &root(), DurabilityMode::Fsync),
+            Err(WalError::Identity(_))
+        ));
+    }
+
+    #[test]
+    fn legacy_pointer_upgrades_without_losing_data() {
+        let fs = sim();
+        {
+            let mut db = Db::open(fs.clone(), &root(), DurabilityMode::Fsync).unwrap();
+            db.set(b"k".to_vec(), b"v".to_vec()).unwrap();
+        }
+        let current = DataPaths::new(&root()).current();
+        fs.truncate(&current, 0).unwrap();
+        fs.append(&current, b"0000000000000001").unwrap();
+        fs.sync_file(&current).unwrap();
+        fs.crash();
+        let db = Db::open(fs.clone(), &root(), DurabilityMode::Fsync).unwrap();
+        assert_eq!(db.get(b"k"), crate::storage::GetResult::Found(b"v".to_vec()));
+        assert_eq!(Current::decode(&fs.read(&current).unwrap()), Ok(Current { generation: 1 }));
+    }
+
+    #[test]
+    fn replica_identity_is_persisted_and_validated() {
+        let fs = sim();
+        let cluster = [7u8; 16];
+        let config = OpenConfig {
+            role: NodeRole::Replica,
+            cluster_id: Some(cluster),
+            ..OpenConfig::default()
+        };
+        {
+            let mut db = Db::open_configured(fs.clone(), &root(), DurabilityMode::Fsync, config)
+                .unwrap();
+            assert_eq!(db.identity().cluster_id, cluster);
+            assert_eq!(db.identity().role, "replica");
+            assert!(matches!(
+                db.set(b"k".to_vec(), b"v".to_vec()),
+                Err(WalError::ReadOnlyReplica)
+            ));
+        }
+        assert!(Db::open_configured(fs.clone(), &root(), DurabilityMode::Fsync, config).is_ok());
+        assert!(matches!(
+            Db::open(fs.clone(), &root(), DurabilityMode::Fsync),
+            Err(WalError::Identity(_))
+        ));
+        let wrong_cluster = OpenConfig {
+            cluster_id: Some([8u8; 16]),
+            ..config
+        };
+        assert!(matches!(
+            Db::open_configured(fs, &root(), DurabilityMode::Fsync, wrong_cluster),
+            Err(WalError::Identity(_))
+        ));
     }
 
     #[test]

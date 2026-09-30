@@ -3,11 +3,10 @@ name = "distributedb"
 version = "0.1.0"
 edition = "2021"
 rust-version = "1.92"
-description = "DistributeDB: a distributed key-value database (Phase 1: local in-memory KV engine)"
+description = "DistributeDB: a single-primary key-value database under development"
 license = "MIT"
 
-# std-only: Phase 1 uses the Rust standard library only. No external
-# dependencies because the build environment has no crates.io access.
+# The current implementation uses the Rust standard library only.
 [dependencies]
 
 [lib]
