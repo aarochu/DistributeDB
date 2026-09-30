@@ -1,0 +1,19 @@
+[package]
+name = "distributedb"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.92"
+description = "DistributeDB: a distributed key-value database (Phase 1: local in-memory KV engine)"
+license = "MIT"
+
+# std-only: Phase 1 uses the Rust standard library only. No external
+# dependencies because the build environment has no crates.io access.
+[dependencies]
+
+[lib]
+name = "distributedb"
+path = "src/lib.rs"
+
+[[bin]]
+name = "distributedb"
+path = "src/main.rs"
