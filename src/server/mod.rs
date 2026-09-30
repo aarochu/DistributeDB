@@ -26,10 +26,42 @@
 //!   per-request response slots.
 //!
 //! The shared engine is a [`RwLock<Db<F>>`]: the sequencer takes the write
-//! lock only while applying an already-synced group; readers take the read
-//! lock for `GET`/`EXISTS`/`STATS`. Because the durable `fsync` happens before
-//! the write lock is taken, the linearization point is the map apply after the
-//! WAL sync (§5).
+//! lock for a group's durable append + `fsync` + map apply, and readers take
+//! the read lock for `GET`/`EXISTS`/`STATS`. The linearization point is the
+//! map apply after the WAL sync (§5): a reader never observes an un-synced
+//! write.
+//!
+//! # Intentional divergence from §5: fsync under the write lock
+//!
+//! Technical-Design §5 describes readers running against the prior applied
+//! state *while* a batch waits for its WAL sync ("a read may run while a batch
+//! waits for WAL sync and will see the prior applied state"), i.e. the
+//! sequencer would hold the exclusive lock only around the map apply, doing
+//! the append + `fsync` outside it. This implementation instead holds the
+//! `Db` write lock across the whole [`Db::apply_group`] call (append + group
+//! `fsync` + map apply), so concurrent reads block for the duration of an
+//! in-flight group's disk sync rather than proceeding against prior state.
+//!
+//! This is a deliberate, correctness-preserving simplification, not a bug:
+//!
+//! * **Correctness is unchanged.** The linearization point is still the map
+//!   apply that happens only after a successful `fsync`; a reader either sees
+//!   the state before the group or the state after it, never a partially
+//!   applied or un-synced group.
+//! * **Why not split the phases.** [`Db::apply_group`] performs the durable
+//!   append and the map apply behind a single `&mut self`, and the engine is
+//!   shared as one `RwLock<Db<F>>`. Splitting append+sync (outside the lock)
+//!   from map apply (under it) safely would require the WAL and the in-memory
+//!   map to sit behind *separate* locks so the append could proceed while
+//!   readers hold the map's read lock. That is a larger structural change with
+//!   its own ordering hazards; for a loopback demo server the read-latency
+//!   cost of syncing under the lock is acceptable and keeps the exactly-once,
+//!   one-LSN-per-mutation, write-ahead guarantees trivially intact.
+//!
+//! The trade-off is read latency (a `GET` can block for one group's `fsync`),
+//! not correctness. If Phase 5 needs read-during-sync concurrency, the fix is
+//! to put the WAL behind its own lock and take the map write lock only for the
+//! apply step.
 //!
 //! The bounded write queue is a `Mutex<VecDeque<..>>` + [`Condvar`] with an
 //! explicit `max_queue_depth` (std has no bounded channel); an overflow returns
@@ -101,6 +133,28 @@ impl Default for ServerConfig {
 }
 
 /// Server-side operational counters for `STATS` (Technical-Design §17).
+///
+/// # Counter semantics: dispatched requests, not successful operations
+///
+/// All three request counters are incremented at **dispatch time**, i.e. once
+/// per well-framed request the server decodes, *before* the operation runs and
+/// regardless of its outcome. They count *requests dispatched*, not
+/// *operations that succeeded*. Concretely:
+///
+/// * `requests_total` counts every decoded frame (any kind).
+/// * `reads_total` counts every `GET`/`EXISTS`/`STATS` dispatched — including
+///   the `STATS` request that reads these very counters (a `STATS` call is
+///   itself a read, so it is reflected in the snapshot it returns).
+/// * `writes_total` counts every `SET`/`DELETE` dispatched — including writes
+///   that are later rejected with `RESOURCE_EXHAUSTED` (queue overflow) or
+///   `UNAVAILABLE` (WAL durability failure). It is therefore an *attempt*
+///   count, not a *committed-write* count; the count of durably committed
+///   writes is `current_lsn` (one LSN per applied mutation).
+///
+/// This "requests dispatched" definition is deliberate and consistent across
+/// the three counters: it makes `requests_total` a clean total-load gauge and
+/// keeps the read/write counters cheap (no post-outcome accounting on the hot
+/// path). Callers that need committed-write throughput read `current_lsn`.
 #[derive(Debug, Default)]
 struct Metrics {
     requests_total: AtomicU64,
@@ -498,9 +552,37 @@ where
     }
 }
 
+/// Map a durable-write [`WalError`] to the client-facing [`Status`]
+/// (Technical-Design §6.2).
+///
+/// §6.2 specifies that disk-full / sync / append failures are surfaced as
+/// `UNAVAILABLE` for the current request, and that subsequent mutations are
+/// rejected until operator recovery. After the first such failure the WAL is
+/// fail-closed and returns [`WalError::FailClosed`] for every later write, so
+/// that maps to `UNAVAILABLE` as well: the node has become read-only and the
+/// client should treat writes as unavailable, not as an internal bug.
+///
+/// * [`WalError::Io`], [`WalError::FailClosed`], [`WalError::Corruption`] —
+///   durability failures and the fail-closed state that follows them: mapped
+///   to `UNAVAILABLE` (§6.2).
+/// * [`WalError::MutationTooLarge`] — the request itself is too big; this is a
+///   client error, `BAD_REQUEST`. (The codec bounds mutation size before it
+///   reaches here, so this is defensive.)
+/// * [`WalError::Format`] / [`WalError::Identity`] — genuinely unexpected
+///   internal faults: `INTERNAL_ERROR`.
+fn wal_error_to_status(err: &crate::wal::WalError) -> Status {
+    use crate::wal::WalError;
+    match err {
+        WalError::Io(_) | WalError::FailClosed | WalError::Corruption(_) => Status::Unavailable,
+        WalError::MutationTooLarge { .. } => Status::BadRequest,
+        WalError::Format(_) | WalError::Identity(_) => Status::InternalError,
+    }
+}
+
 /// Submit a write to the sequencer and block (without holding the map lock) on
 /// its one-shot result (Technical-Design §5). Maps queue overflow to
-/// `RESOURCE_EXHAUSTED` and a WAL failure to `INTERNAL_ERROR`.
+/// `RESOURCE_EXHAUSTED` and a WAL durability failure to `UNAVAILABLE` (§6.2,
+/// via [`wal_error_to_status`]).
 fn submit_write<F>(
     shared: &Arc<Shared<F>>,
     mutation: Mutation,
@@ -577,11 +659,15 @@ where
                     let _ = job.respond.send(Ok(lsn));
                 }
             }
-            Err(_e) => {
+            Err(e) => {
                 // The whole group failed to commit durably; no mutation was
-                // applied. Report INTERNAL_ERROR to every waiter.
+                // applied (apply_group leaves the engine untouched on error).
+                // Surface the §6.2 status to every waiter: a durability failure
+                // (and the fail-closed state that follows it) is UNAVAILABLE,
+                // not INTERNAL_ERROR.
+                let status = wal_error_to_status(&e);
                 for job in batch {
-                    let _ = job.respond.send(Err(Status::InternalError));
+                    let _ = job.respond.send(Err(status));
                 }
             }
         }

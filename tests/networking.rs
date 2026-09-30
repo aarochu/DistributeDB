@@ -65,10 +65,18 @@ impl Drop for TempDir {
 /// Start a server on `127.0.0.1:0` backed by a deterministic in-memory
 /// [`SimFs`] (no disk touched) with the given config.
 fn start_sim_server(config: ServerConfig) -> Server {
+    start_sim_server_with_fs(config).0
+}
+
+/// Like [`start_sim_server`] but also returns a handle to the backing
+/// [`SimFs`], so a test can arm fault injection after the `Db` has opened
+/// cleanly (e.g. to force a WAL durability failure on the first write).
+fn start_sim_server_with_fs(config: ServerConfig) -> (Server, SimFs) {
     let n = UNIQUE.fetch_add(1, Ordering::SeqCst);
     let fs = SimFs::new(SimConfig::new(0x5eed_0000 ^ n));
-    let db = Db::open(fs, Path::new("/ddb"), DurabilityMode::Fsync).expect("open sim Db");
-    Server::start("127.0.0.1:0", db, config).expect("start server")
+    let db = Db::open(fs.clone(), Path::new("/ddb"), DurabilityMode::Fsync).expect("open sim Db");
+    let server = Server::start("127.0.0.1:0", db, config).expect("start server");
+    (server, fs)
 }
 
 /// Connect a raw stream to the server with sensible read/write timeouts so a
@@ -576,4 +584,206 @@ fn reopen_with_retry(path: &Path) -> Db<RealFs> {
         }
     }
     panic!("reopen durable Db never succeeded: {last_err:?}");
+}
+
+// ---------------------------------------------------------------------------
+// 10. WAL durability failure -> UNAVAILABLE, then the node stays fail-closed.
+// ---------------------------------------------------------------------------
+
+/// A write whose WAL sync fails must be reported to the client as `UNAVAILABLE`
+/// (Technical-Design §6.2), not `INTERNAL_ERROR`. After the first such failure
+/// the WAL is fail-closed, so every later write is rejected too -- also as
+/// `UNAVAILABLE`, since the node has become read-only rather than hit an
+/// internal bug. Reads of state committed before the failure keep working.
+#[test]
+fn wal_sync_failure_is_unavailable_and_node_stays_fail_closed() {
+    let (mut server, fs) = start_sim_server_with_fs(ServerConfig::default());
+    let mut client = Client::connect(server.local_addr()).expect("connect client");
+
+    // A clean write before any fault is armed commits durably.
+    assert_eq!(
+        client
+            .set(b"before".to_vec(), b"ok".to_vec())
+            .expect("clean set"),
+        Status::Ok
+    );
+
+    // Arm deterministic sync failures: every subsequent WAL fsync fails.
+    fs.arm_sync_failures(1000);
+
+    // The next write's group fsync fails. Per §6.2 the client sees UNAVAILABLE
+    // (mapped from WalError::Io), NOT INTERNAL_ERROR.
+    assert_eq!(
+        client
+            .set(b"boom".to_vec(), b"nope".to_vec())
+            .expect("set with failing sync"),
+        Status::Unavailable,
+        "a WAL sync failure must surface as UNAVAILABLE (§6.2), not INTERNAL_ERROR"
+    );
+
+    // The WAL is now fail-closed. Even if the disk "recovers", the writer keeps
+    // rejecting mutations until operator recovery -- and that rejection is also
+    // UNAVAILABLE (WalError::FailClosed), not INTERNAL_ERROR.
+    fs.arm_sync_failures(0);
+    assert_eq!(
+        client
+            .set(b"after".to_vec(), b"still-no".to_vec())
+            .expect("set after fail-closed"),
+        Status::Unavailable,
+        "a fail-closed node must keep reporting writes as UNAVAILABLE"
+    );
+    assert_eq!(
+        client
+            .delete(b"before".to_vec())
+            .expect("delete after fail-closed"),
+        Status::Unavailable,
+        "DELETE is a mutation too and must be rejected while fail-closed"
+    );
+
+    // Reads still work and reflect state committed before the failure: no
+    // failed write was ever applied to the map.
+    assert_eq!(
+        client.get(b"before".to_vec()).expect("get committed key"),
+        Some(b"ok".to_vec()),
+        "the pre-failure committed write is still readable"
+    );
+    assert_eq!(
+        client.get(b"boom".to_vec()).expect("get failed key"),
+        None,
+        "a write whose sync failed was never applied"
+    );
+
+    server.shutdown();
+}
+
+// ---------------------------------------------------------------------------
+// 11. Queue overflow -> RESOURCE_EXHAUSTED.
+// ---------------------------------------------------------------------------
+
+/// When the bounded write queue is full the server returns `RESOURCE_EXHAUSTED`
+/// to the overflowing writer (Technical-Design §5 backpressure). We hold the
+/// sequencer with a nonzero `group_wait` and a tiny `max_queue_depth`, then
+/// fire many concurrent writes so at least one is rejected.
+#[test]
+fn queue_overflow_returns_resource_exhausted() {
+    // Tiny queue + a group_wait long enough that the sequencer, once it has
+    // drained the first job, sleeps while the rest of the flood piles up and
+    // overflows the depth-1 queue.
+    let config = ServerConfig {
+        max_queue_depth: 1,
+        group_wait: Duration::from_millis(400),
+        ..ServerConfig::default()
+    };
+    let mut server = start_sim_server(config);
+    let addr = server.local_addr();
+
+    // Fire many concurrent writes on their own connections. With depth 1 and
+    // the sequencer asleep in group_wait, most of these cannot be enqueued and
+    // must come back RESOURCE_EXHAUSTED.
+    const FLOOD: usize = 64;
+    let handles: Vec<_> = (0..FLOOD)
+        .map(|i| {
+            thread::spawn(move || {
+                let mut client = Client::connect(addr).expect("connect flood client");
+                let key = format!("flood:{i}").into_bytes();
+                client.set(key, b"x".to_vec()).expect("set flood")
+            })
+        })
+        .collect();
+
+    let mut ok = 0usize;
+    let mut exhausted = 0usize;
+    let mut other = 0usize;
+    for h in handles {
+        match h.join().expect("join flood client") {
+            Status::Ok => ok += 1,
+            Status::ResourceExhausted => exhausted += 1,
+            _ => other += 1,
+        }
+    }
+
+    assert_eq!(ok + exhausted + other, FLOOD);
+    assert_eq!(other, 0, "unexpected non-OK/non-exhausted status");
+    assert!(
+        exhausted > 0,
+        "expected at least one RESOURCE_EXHAUSTED under a depth-1 flood (ok={ok}, exhausted={exhausted})"
+    );
+
+    // The server is still healthy: with the flood over and the queue drained,
+    // a fresh write succeeds.
+    let mut client = Client::connect(addr).expect("connect after flood");
+    assert_eq!(
+        client
+            .set(b"post".to_vec(), b"flood".to_vec())
+            .expect("set after flood"),
+        Status::Ok
+    );
+
+    server.shutdown();
+}
+
+// ---------------------------------------------------------------------------
+// 12. Connection cap -> the excess connection gets one UNAVAILABLE, then close.
+// ---------------------------------------------------------------------------
+
+/// With `max_connections=1`, one live connection occupies the only slot; a
+/// second connection is rejected by the acceptor, which writes exactly one
+/// `UNAVAILABLE` response frame and closes it (Technical-Design §5 "acceptor
+/// rejects excess").
+#[test]
+fn connection_cap_rejects_excess_with_unavailable() {
+    let config = ServerConfig {
+        max_connections: 1,
+        ..ServerConfig::default()
+    };
+    let mut server = start_sim_server(config);
+
+    // Hold the single allowed connection open and busy so its worker keeps the
+    // slot occupied while we attempt the second connection.
+    let mut live = Client::connect(server.local_addr()).expect("connect first (allowed) client");
+    assert_eq!(
+        live.set(b"hold".to_vec(), b"slot".to_vec())
+            .expect("first client set"),
+        Status::Ok
+    );
+
+    // The second connection exceeds the cap. The acceptor sends a single
+    // UNAVAILABLE frame and closes. It may be accepted at the TCP layer, so we
+    // read a raw frame off it rather than assuming connect() fails.
+    let mut second = raw_connect(&server);
+    let resp = read_one_response(&mut second);
+    assert_eq!(
+        resp.status,
+        Status::Unavailable,
+        "an over-cap connection must receive one UNAVAILABLE frame"
+    );
+    // After that single frame the server closes the connection: the next read
+    // is a clean EOF (no further frame).
+    assert!(
+        read_frame(&mut second)
+            .expect("read after cap reject")
+            .is_none(),
+        "server must close the connection after the UNAVAILABLE reject"
+    );
+    drop(second);
+
+    // The first connection is unaffected and still usable.
+    assert_eq!(
+        live.get(b"hold".to_vec())
+            .expect("first client still works"),
+        Some(b"slot".to_vec())
+    );
+
+    // Once the first client disconnects, a new connection can take the freed
+    // slot.
+    drop(live);
+    // Give the worker a moment to observe EOF and release the slot.
+    thread::sleep(Duration::from_millis(100));
+    let mut reuse = Client::connect(server.local_addr()).expect("connect after slot freed");
+    assert_eq!(
+        reuse.get(b"hold".to_vec()).expect("reuse client get"),
+        Some(b"slot".to_vec())
+    );
+
+    server.shutdown();
 }

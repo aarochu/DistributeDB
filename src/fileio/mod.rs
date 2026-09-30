@@ -486,6 +486,21 @@ impl SimFs {
         let g = self.inner.lock().expect("sim lock");
         g.files.get(path).map(|f| f.volatile.clone())
     }
+
+    /// Arm (or disarm) sync failures at runtime by overriding the sync-failure
+    /// probability (per 1000) on the live config.
+    ///
+    /// This is a test hook for scenarios that need a clean setup phase (e.g.
+    /// opening a [`Db`](crate::wal::Db) without faults) followed by a
+    /// deterministic durability failure once writes begin. Passing `1000` makes
+    /// **every** subsequent `sync_file`/`sync_dir` fail with an
+    /// [`FsError::InjectedFault`], which is exactly what the WAL treats as a
+    /// durability failure that fails the writer closed (Technical-Design §6.2).
+    /// Passing `0` disables injected sync failures again.
+    pub fn arm_sync_failures(&self, permille: u64) {
+        let mut g = self.inner.lock().expect("sim lock");
+        g.config.sync_fail_permille = permille;
+    }
 }
 
 impl SimInner {
