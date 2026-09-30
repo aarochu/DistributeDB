@@ -4,7 +4,7 @@ DistributeDB is a single-primary key-value database project for studying durable
 
 ## Status
 
-Phases 1–4 of the [Statement of Work](docs/SOW.md) have implementations and automated tests: the local key-value engine, a checksummed write-ahead log (WAL), process-restart recovery, a TCP client/server, and local snapshots. Phase 5 adds an asynchronous, ordered primary-to-replica stream with locally durable replica ACKs and reconnect from retained WAL. Phase 6 adds explicit snapshot rebootstrap for replicas beyond that WAL window. **The cluster process-failure harness and benchmark harness remain to be implemented.**
+Phases 1–4 of the [Statement of Work](docs/SOW.md) have implementations and automated tests: the local key-value engine, a checksummed write-ahead log (WAL), process-restart recovery, a TCP client/server, and local snapshots. Phase 5 adds an asynchronous, ordered primary-to-replica stream with locally durable replica ACKs and reconnect from retained WAL. Phase 6 adds explicit snapshot rebootstrap and a process kill/restart harness. **The benchmark harness remains to be implemented.**
 
 The [technical design](docs/Technical-Design.md) describes the intended distributed behavior and marks choices added beyond the SOW. The [filesystem decision record](docs/ADR-001-Language-and-Filesystem.md) identifies the initial Linux/ext4 profile. Some design details are still provisional until their implementation tests pass.
 
@@ -66,13 +66,13 @@ Use the same command with another directory for a second replica. The replicatio
 | 3 — Networking | TCP server/client and concurrent request tests implemented. |
 | 4 — Snapshots | Local publication, reload validation, WAL reclamation, and recovery tests implemented. |
 | 5 — Replication | Static identity, ordered stream, durable ACKs, and connected replica lag implemented; integration tests cover two replicas. |
-| 6 — Failure recovery | WAL reconnect and explicit snapshot catch-up implemented; kill/restart cluster tests and recovery-generation garbage collection remain. |
+| 6 — Failure recovery | WAL reconnect, explicit snapshot catch-up, and a process kill/restart test implemented; recovery-generation garbage collection remains. |
 | 7 — Performance engineering | Planned: benchmark harness, workload mixes, resource and latency measurements. |
 | 8 — Advanced storage | Optional after core acceptance. |
 
 CI runs formatting, Clippy, Rust tests, and documentation checks. Passing these checks supports the tested scenarios; it does not prove power-loss durability on physical hardware. The planned workload mixes are 90/10, 50/50, and 10/90 GET/SET. No benchmark results are published yet.
 
-See [development setup](docs/Development-Setup.md) and [recovery notes](docs/recovery.md) for test and operator details.
+See [development setup](docs/Development-Setup.md), [recovery notes](docs/recovery.md), and [failure testing](docs/failure-testing.md) for test and operator details.
 
 ## License
 
