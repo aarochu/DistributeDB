@@ -2092,6 +2092,7 @@ mod tests {
     #[test]
     fn replica_applies_only_contiguous_primary_history() {
         let fs = sim();
+        let replica_fs = sim();
         let cluster = [9u8; 16];
         let primary_config = OpenConfig {
             cluster_id: Some(cluster),
@@ -2116,7 +2117,7 @@ mod tests {
             ..OpenConfig::default()
         };
         let mut replica = Db::open_configured(
-            fs.clone(),
+            replica_fs.clone(),
             Path::new("/replica"),
             DurabilityMode::Fsync,
             replica_config,
@@ -2133,9 +2134,9 @@ mod tests {
         assert_eq!(replica.record_hash_at(2), primary.record_hash_at(2));
         drop(replica);
         drop(primary);
-        fs.crash();
+        replica_fs.crash();
         let replica = Db::open_configured(
-            fs.clone(),
+            replica_fs.clone(),
             Path::new("/replica"),
             DurabilityMode::Fsync,
             replica_config,

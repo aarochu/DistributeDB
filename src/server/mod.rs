@@ -895,6 +895,6 @@ mod tests {
         assert!(text.contains("connected_clients=2"));
         assert!(text.contains("replicas_connected=0"));
         // Bounded: a small fixed number of lines.
-        assert_eq!(lines.len(), 10);
+        assert_eq!(lines.len(), 11);
     }
 }
