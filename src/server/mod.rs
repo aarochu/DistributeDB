@@ -571,12 +571,15 @@ where
 /// * [`WalError::ResourceExhausted`] — retained recovery data would exceed the
 ///   configured disk budget, so new writes are paused: `RESOURCE_EXHAUSTED`
 ///   (Technical-Design §7).
+/// * [`WalError::ReadOnlyReplica`] — a client write reached a replica:
+///   `NOT_PRIMARY`.
 /// * [`WalError::Format`] / [`WalError::Identity`] — genuinely unexpected
 ///   internal faults: `INTERNAL_ERROR`.
 fn wal_error_to_status(err: &crate::wal::WalError) -> Status {
     use crate::wal::WalError;
     match err {
         WalError::Io(_) | WalError::FailClosed | WalError::Corruption(_) => Status::Unavailable,
+        WalError::ReadOnlyReplica => Status::NotPrimary,
         WalError::MutationTooLarge { .. } => Status::BadRequest,
         WalError::ResourceExhausted { .. } => Status::ResourceExhausted,
         WalError::Format(_) | WalError::Identity(_) => Status::InternalError,
