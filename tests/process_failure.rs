@@ -81,7 +81,10 @@ fn wait_replica(client: &mut Client, expected_lsn: usize) {
         {
             return;
         }
-        assert!(Instant::now() < deadline, "replica did not converge: {stats}");
+        assert!(
+            Instant::now() < deadline,
+            "replica did not converge: {stats}"
+        );
         thread::sleep(Duration::from_millis(25));
     }
 }
@@ -90,7 +93,10 @@ fn write_range(client: &mut Client, begin: usize, end: usize) {
     for index in begin..end {
         assert_eq!(
             client
-                .set(format!("key-{index}").into_bytes(), vec![(index % 251) as u8])
+                .set(
+                    format!("key-{index}").into_bytes(),
+                    vec![(index % 251) as u8],
+                )
                 .unwrap(),
             Status::Ok
         );
