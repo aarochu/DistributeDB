@@ -254,6 +254,59 @@ fn missing_footer_discards_valid_looking_records() {
     assert!(db.tail_truncated());
 }
 
+// ---------------------------------------------------------------------------
+// The §6.3 core guarantee, exercised head-on: an acknowledged (synced,
+// footer-CLOSED) group survives a torn group that is appended AFTER it in the
+// SAME active segment. Complements the torn-tail-only and sealed-segment
+// fail-closed cases: here the surviving group is a genuine MULTI-record group
+// and it is followed by a fully-synced-but-unclosed group.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn synced_closed_group_survives_following_torn_group_in_active_segment() {
+    let fs = sim();
+    let seg = {
+        let mut db = fresh(&fs);
+        db.set(b"A".to_vec(), b"1".to_vec()).unwrap(); // group 1 (lsn 1), synced
+        segment_path(1)
+    };
+
+    // Group A (the acknowledged group under test): TWO records (lsn 2 and 3)
+    // closed by a valid footer, then synced -> durable & acknowledged.
+    let prev_hash = last_committed_hash(&fs, &seg);
+    let (rec_b, hash_b) = set_record(2, prev_hash, b"B", b"2");
+    let (rec_c, hash_c) = set_record(3, hash_b, b"C", b"3");
+    let mut group_a = rec_b;
+    group_a.extend_from_slice(&rec_c);
+    group_a.extend_from_slice(&footer(2, 3, 2, hash_c));
+    fs.append(&seg, &group_a).unwrap();
+    fs.sync_file(&seg).unwrap(); // group A is now acknowledged (durable)
+
+    // Group B: records for lsn 4 and 5 but NO valid footer (torn / unclosed).
+    // It is even synced to disk, so this is not merely an unsynced tail: the
+    // bytes are stable, yet the group is not footer-closed and must not replay.
+    let (rec_d, hash_d) = set_record(4, hash_c, b"D", b"4");
+    let (rec_e, _hash_e) = set_record(5, hash_d, b"E", b"5");
+    let mut group_b = rec_d;
+    group_b.extend_from_slice(&rec_e);
+    // Intentionally no footer for group B.
+    fs.append(&seg, &group_b).unwrap();
+    fs.sync_file(&seg).unwrap();
+    fs.crash();
+
+    let db = Db::open(fs, Path::new(ROOT), DurabilityMode::Fsync).unwrap();
+    // (a) Every record of the acknowledged closed groups replays.
+    assert_eq!(db.get(b"A"), GetResult::Found(b"1".to_vec()));
+    assert_eq!(db.get(b"B"), GetResult::Found(b"2".to_vec()));
+    assert_eq!(db.get(b"C"), GetResult::Found(b"3".to_vec()));
+    // (c) None of the torn, unclosed group B is resurrected.
+    assert_eq!(db.get(b"D"), GetResult::NotFound);
+    assert_eq!(db.get(b"E"), GetResult::NotFound);
+    assert_eq!(db.last_applied_lsn(), 3);
+    // (b) The trailing torn group was truncated away.
+    assert!(db.tail_truncated());
+}
+
 /// Recover the record hash of the last footer-closed record in `seg` by
 /// decoding the stable bytes. Used to chain the synthetic trailing group so
 /// only the footer/tear (not the chain) determines the outcome.
