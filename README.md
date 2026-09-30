@@ -60,13 +60,32 @@ The first storage engine may use an in-memory hash map backed by persistent file
 
 The SOW gives these command names but does not freeze a wire protocol, response encoding, or edge-case semantics. Those details are proposed in the technical design and will be validated during implementation. Optional commands and transactions are not required for the core system.
 
+## Phase 3 networking
+
+Phase 3 puts the durable Phase 2 engine behind a TCP server and a matching client.
+
+- **Binary wire protocol (Technical-Design §4.1).** Each message is length-prefixed: `body_len:u32 | body`, where `body = version:u8 | kind:u8 | payload`. All integers are little-endian and `version = 1`. Request kinds are `SET`, `GET`, `DELETE`, `EXISTS`, and `STATS`; responses carry a status code (`OK`, `NOT_FOUND`, `BAD_REQUEST`, `UNSUPPORTED_VERSION`, `RESOURCE_EXHAUSTED`, `UNAVAILABLE`, and others) plus a data field. `body_len` is bounded to `2..=1_048_576` bytes and is rejected before any buffer is allocated. `STATS` returns bounded `name=value` lines with `version` first.
+- **Concurrency (Technical-Design §5).** An acceptor thread spawns one worker thread per connection, up to `max_connections` (default 128); excess connections are rejected. Reads (`GET`/`EXISTS`/`STATS`) are served directly under a shared read lock. Writes (`SET`/`DELETE`) are submitted to a single mutation sequencer thread over a bounded queue; the sequencer batches up to 64 mutations / 8 MiB into one WAL group commit (one `fsync`), applies them, and releases each waiting connection. A full queue returns `RESOURCE_EXHAUSTED`. All writes go through the Phase 2 durable path, so there is no second durability mechanism.
+- **Ports.** Clients connect to a single client port (the demo default is `127.0.0.1:5555`). A separate replication port is a later phase (Phase 5) and does not exist yet.
+- **Loopback-only, unauthenticated demo.** The server binds `127.0.0.1` and performs no authentication or encryption. It is a local demonstration, not a production listener.
+- **Disconnect / retry limitation (Technical-Design §4.2).** A write is durable once the server returns `OK`. If the connection drops before the client reads that `OK`, the outcome is **unknown**: the mutation may or may not have committed. There is no request de-duplication (no exactly-once delivery), so a client that retries may apply the mutation again. `SET` and `DELETE` are idempotent, so a naive retry is safe for those operations only.
+
+Try it locally (loopback):
+
+```sh
+cargo run -- serve --addr 127.0.0.1:5555        # in one terminal
+printf 'SET user:123 Aaron\nGET user:123\n' | cargo run -- client --addr 127.0.0.1:5555
+```
+
+With no subcommand, `cargo run` still launches the original local in-memory REPL.
+
 ## Roadmap
 
 | Phase | Planned outcome |
 |---|---|
 | 1 — Local key-value engine | **Implemented.** In-memory `SET`/`GET`/`DELETE`/`EXISTS` operations, a line parser, a local stdin REPL, and unit tests. |
 | 2 — Persistent WAL | Durable writes, sequence numbers, and restart recovery. |
-| 3 — Networking | TCP server/client and concurrent connections. |
+| 3 — Networking | **In progress.** TCP server/client, a binary wire protocol, a mutation sequencer with WAL group commit, and concurrent connections. |
 | 4 — Snapshots | Snapshot creation, loading, and WAL rotation or truncation. |
 | 5 — Replication | Primary and replicas with ordered log delivery and acknowledgments. |
 | 6 — Failure recovery | Reconnect, WAL catch-up, snapshot-based recovery, and kill/restart tests. |

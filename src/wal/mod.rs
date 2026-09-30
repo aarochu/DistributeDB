@@ -926,6 +926,38 @@ impl<F: FileSystem + Clone> Db<F> {
         Ok(lsn)
     }
 
+    /// Durably apply a group of up to [`MAX_GROUP_RECORDS`] mutations in a
+    /// single group commit (one `fsync` in `fsync` mode), then apply them to
+    /// the engine in order and return the assigned LSNs (Technical-Design §3,
+    /// §5, §6.2).
+    ///
+    /// This is the group-commit entry point used by the Phase 3 networking
+    /// sequencer (Technical-Design §5): a batch of client `SET`/`DELETE`
+    /// mutations is appended, footer-closed, and synced once, so the fixed
+    /// `fsync` cost is amortized across the whole batch. Write-ahead order is
+    /// preserved: the mutations are applied to the map only after the durable
+    /// append succeeds. On any WAL error the engine is left untouched and the
+    /// error is returned; the caller (sequencer) surfaces it to each waiting
+    /// request. An empty slice is a no-op returning an empty `Vec`.
+    ///
+    /// The batching bounds (`<= MAX_GROUP_RECORDS` records and
+    /// `<= MAX_GROUP_BYTES` encoded) are enforced by
+    /// [`Wal::append_group`]; callers should pre-drain within those limits.
+    pub fn apply_group(&mut self, muts: &[Mutation]) -> WalResult<Vec<u64>> {
+        if muts.is_empty() {
+            return Ok(Vec::new());
+        }
+        let assigned = self.wal.append_group(muts)?;
+        // Write-ahead order: apply to the map only after the durable append.
+        for m in muts {
+            self.engine.apply(m.clone());
+        }
+        if let Some(&last) = assigned.last() {
+            self.last_applied_lsn = last;
+        }
+        Ok(assigned)
+    }
+
     /// Look up `key` in the reconstructed engine.
     pub fn get(&self, key: &[u8]) -> crate::storage::GetResult {
         self.engine.get(key)

@@ -90,7 +90,11 @@ pub type FsResult<T> = Result<T, FsError>;
 ///
 /// The lock is released when this value is dropped. For [`RealFs`] the `LOCK`
 /// file is removed on drop; for [`SimFs`] the in-memory lock flag is cleared.
-pub trait LockGuard: std::fmt::Debug {}
+///
+/// The guard is `Send + Sync` so that a [`Db`](crate::wal::Db) holding one can
+/// be shared across threads behind a lock (the Phase 3 server shares the `Db`
+/// between its reader threads and the single-writer sequencer).
+pub trait LockGuard: std::fmt::Debug + Send + Sync {}
 
 /// File-I/O abstraction required by the WAL and recovery layers (§6.4).
 ///
