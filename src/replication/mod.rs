@@ -13,7 +13,7 @@ pub mod protocol;
 use std::collections::HashMap;
 use std::io;
 use std::net::{SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -25,6 +25,7 @@ use protocol::{read_message, write_message, Message};
 const IO_TIMEOUT: Duration = Duration::from_secs(2);
 const POLL_INTERVAL: Duration = Duration::from_millis(50);
 const MAX_REPLICAS: usize = 16;
+const MAX_CONNECTIONS: usize = 32;
 
 pub fn format_id(id: &[u8; 16]) -> String {
     id.iter().map(|byte| format!("{byte:02x}")).collect()
@@ -138,6 +139,7 @@ impl PrimaryListener {
         listener.set_nonblocking(true)?;
         let shutdown = Arc::new(AtomicBool::new(false));
         let stop = Arc::clone(&shutdown);
+        let active_connections = Arc::new(AtomicUsize::new(0));
         let acceptor = thread::Builder::new()
             .name("ddb-repl-accept".into())
             .spawn(move || {
@@ -145,11 +147,17 @@ impl PrimaryListener {
                 while !stop.load(Ordering::SeqCst) {
                     match listener.accept() {
                         Ok((stream, peer)) if peer.ip().is_loopback() => {
+                            if active_connections.load(Ordering::SeqCst) >= MAX_CONNECTIONS {
+                                continue;
+                            }
+                            active_connections.fetch_add(1, Ordering::SeqCst);
                             let db = Arc::clone(&db);
                             let stats = Arc::clone(&stats);
                             let stop = Arc::clone(&stop);
+                            let active_connections = Arc::clone(&active_connections);
                             workers.push(thread::spawn(move || {
                                 let _ = handle_primary_connection(stream, db, stats, stop);
+                                active_connections.fetch_sub(1, Ordering::SeqCst);
                             }));
                         }
                         Ok(_) => {}
