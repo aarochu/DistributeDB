@@ -308,9 +308,7 @@ impl FileSystem for RealFs {
             .open(lock_path)?;
         match file.try_lock() {
             Ok(()) => Ok(Box::new(RealLockGuard { _file: file })),
-            Err(std::fs::TryLockError::WouldBlock) => {
-                Err(FsError::Locked(lock_path.to_path_buf()))
-            }
+            Err(std::fs::TryLockError::WouldBlock) => Err(FsError::Locked(lock_path.to_path_buf())),
             Err(std::fs::TryLockError::Error(e)) => Err(FsError::Io(e)),
         }
     }
