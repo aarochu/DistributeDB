@@ -1707,6 +1707,15 @@ fn scan_committed_prefix(
         }
     }
 
+    // A legitimate interrupted group can occupy at most MAX_GROUP_BYTES.
+    // Damage beyond that bounded suffix cannot be explained by the writer's
+    // final in-flight batch, even if a parser stopped at its first bad byte.
+    if bytes.len().saturating_sub(committed_end as usize) > MAX_GROUP_BYTES {
+        return Err(WalError::Corruption(
+            "damaged active-segment suffix exceeds maximum group size".into(),
+        ));
+    }
+
     Ok(SegmentScan {
         records: committed_records,
         last_record_hash: committed_last_hash,
@@ -1852,6 +1861,22 @@ mod tests {
         // Writing continues from LSN 3 after truncation.
         let mut db = db;
         assert_eq!(db.set(b"d".to_vec(), b"4".to_vec()).unwrap(), 3);
+    }
+
+    #[test]
+    fn oversized_damaged_active_suffix_fails_closed() {
+        let fs = sim();
+        let seg = {
+            let mut db = Db::open(fs.clone(), &root(), DurabilityMode::Fsync).unwrap();
+            db.set(b"a".to_vec(), b"1".to_vec()).unwrap();
+            db.wal.paths.segment(1)
+        };
+        fs.append(&seg, &vec![0xff; MAX_GROUP_BYTES + 1]).unwrap();
+        fs.sync_file(&seg).unwrap();
+        fs.crash();
+
+        let err = Db::open(fs, &root(), DurabilityMode::Fsync);
+        assert!(matches!(err, Err(WalError::Corruption(_))));
     }
 
     /// Decode the committed records of a segment to find the last record hash.
