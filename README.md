@@ -10,7 +10,7 @@ The project prioritizes correctness, explicit durability and consistency semanti
 
 ## Project status
 
-**Status: Design and initial implementation planning.** The database is not implemented yet. There is no server, client, benchmark result, or runnable cluster in this repository at present.
+**Status: Phase 1 implemented (local, in-memory key-value engine).** The Phase 1 local engine works: an in-memory `SET`/`GET`/`DELETE`/`EXISTS` engine, a command parser, and a local stdin REPL, all covered by unit tests. The distributed database as a whole is still early: there is no persistent WAL, TCP server, client, replication, snapshot, benchmark result, or runnable cluster in this repository yet (those are phases 2 and later).
 
 The repository currently contains the [Statement of Work](docs/SOW.md), a [technical design and implementation plan](docs/Technical-Design.md), a [language and filesystem decision record](docs/ADR-001-Language-and-Filesystem.md), and [development setup notes](docs/Development-Setup.md). The design records proposed implementation choices; its byte formats and guarantees still require tests during implementation.
 
@@ -64,7 +64,7 @@ The SOW gives these command names but does not freeze a wire protocol, response 
 
 | Phase | Planned outcome |
 |---|---|
-| 1 — Local key-value engine | In-memory operations, parser, and unit tests. |
+| 1 — Local key-value engine | **Implemented.** In-memory `SET`/`GET`/`DELETE`/`EXISTS` operations, a line parser, a local stdin REPL, and unit tests. |
 | 2 — Persistent WAL | Durable writes, sequence numbers, and restart recovery. |
 | 3 — Networking | TCP server/client and concurrent connections. |
 | 4 — Snapshots | Snapshot creation, loading, and WAL rotation or truncation. |
@@ -73,7 +73,7 @@ The SOW gives these command names but does not freeze a wire protocol, response 
 | 7 — Performance engineering | Benchmark harness, latency and throughput measurements, and profiling. |
 | 8 — Optional advanced storage | One disk-aware index, B+ tree or LSM tree, only if the core is sound. |
 
-All phases are planned. Progress will be recorded here as implementation and tests are added; this table does not imply any phase is complete.
+Phase 1 is implemented and tested; phases 2 through 8 are still planned. Progress will be recorded here as implementation and tests are added; this table does not imply any later phase is complete.
 
 ## Testing and benchmarking plan
 
@@ -83,9 +83,25 @@ Planned benchmark mixes are 90% reads / 10% writes, 50% reads / 50% writes, and 
 
 ## Getting started
 
-There is nothing to build or run yet. Start with the [SOW](docs/SOW.md) for scope, then read the [technical design](docs/Technical-Design.md) for proposed interfaces and failure invariants. The [setup notes](docs/Development-Setup.md) describe the current documentation workflow and the proposed implementation environment.
+The Phase 1 local engine is a standard Rust (edition 2021) crate built with Cargo and the standard library only. From the repository root:
 
-The repository's CI currently checks documentation files and whitespace only. It does not represent a passing database test suite. Build, test, local-cluster, and benchmark commands will be added when those components exist.
+```sh
+cargo build   # compile the library and the REPL binary
+cargo test    # run the unit tests for the parser, engine, and dispatch layer
+cargo run     # start the local stdin REPL
+```
+
+The REPL reads one command per line, executes it against a single in-memory engine, and prints a human-readable response. `SET` and `DELETE` print `OK`, `GET` prints the stored value (or `NOT_FOUND` for a missing key, which is distinct from an empty stored value), and `EXISTS` prints `true` or `false`. Malformed input prints a `BAD_REQUEST` message to stderr and the loop continues. The REPL exits on end-of-input. For example, piping commands in:
+
+```sh
+$ printf 'SET user:123 Aaron\nGET user:123\n' | cargo run --quiet
+OK
+Aaron
+```
+
+This engine is local and in-memory only: nothing is persisted, and there is no networking. For scope and design, start with the [SOW](docs/SOW.md), then read the [technical design](docs/Technical-Design.md) for proposed interfaces and failure invariants. The [setup notes](docs/Development-Setup.md) describe the development environment. Persistent WAL, the TCP server/client, replication, and snapshots are not implemented yet; those commands will be added when their phases land.
+
+The repository's documentation CI checks that the design documents are present and whitespace-clean; it does not yet run the Rust test suite.
 
 ## Contributing
 
