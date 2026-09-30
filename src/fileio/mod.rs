@@ -11,8 +11,8 @@
 //!   (by opening the directory as a file and calling `sync_all`), same
 //!   filesystem rename ([`std::fs::rename`]), truncation
 //!   ([`std::fs::File::set_len`]), reads, directory creation, and an
-//!   exclusive data-directory lock built from an atomic `create_new` `LOCK`
-//!   file (std has no `flock`).
+//!   exclusive data-directory lock using `File::try_lock` on a persistent
+//!   `LOCK` file (released automatically after process exit).
 //!
 //! * [`SimFs`]: the deterministic simulated-power-loss adapter from §6.4. It
 //!   maintains a **volatile** image and a **stable** image of every file and
@@ -88,8 +88,9 @@ pub type FsResult<T> = Result<T, FsError>;
 
 /// A guard representing an held exclusive data-directory lock.
 ///
-/// The lock is released when this value is dropped. For [`RealFs`] the `LOCK`
-/// file is removed on drop; for [`SimFs`] the in-memory lock flag is cleared.
+/// The lock is released when this value is dropped. For [`RealFs`] the OS
+/// releases the file lock when its handle closes (including after a crash);
+/// for [`SimFs`] the in-memory lock flag is cleared.
 ///
 /// The guard is `Send + Sync` so that a [`Db`](crate::wal::Db) holding one can
 /// be shared across threads behind a lock (the Phase 3 server shares the `Db`
@@ -224,21 +225,13 @@ impl RealFs {
     }
 }
 
-/// Guard holding the real `LOCK` file. Removes the file on drop.
+/// Guard holding an OS lock on a persistent `LOCK` file.
 #[derive(Debug)]
 pub struct RealLockGuard {
-    path: PathBuf,
+    _file: std::fs::File,
 }
 
 impl LockGuard for RealLockGuard {}
-
-impl Drop for RealLockGuard {
-    fn drop(&mut self) {
-        // Best-effort release: remove the LOCK file so a later process can
-        // acquire it. Ignore errors during drop.
-        let _ = std::fs::remove_file(&self.path);
-    }
-}
 
 impl FileSystem for RealFs {
     fn create_dir_all(&self, path: &Path) -> FsResult<()> {
@@ -324,21 +317,18 @@ impl FileSystem for RealFs {
 
     fn acquire_lock(&self, lock_path: &Path) -> FsResult<Box<dyn LockGuard>> {
         use std::fs::OpenOptions;
-        // Atomic exclusivity: create_new fails if the LOCK file already
-        // exists. std has no flock, so this is the create_new(true) model
-        // documented in ADR-001 / context.
-        match OpenOptions::new()
+        // The OS releases this advisory lock when the handle closes, including
+        // after SIGKILL. The persistent file can then be locked on restart.
+        let file = OpenOptions::new()
+            .read(true)
             .write(true)
-            .create_new(true)
-            .open(lock_path)
-        {
-            Ok(_) => Ok(Box::new(RealLockGuard {
-                path: lock_path.to_path_buf(),
-            })),
-            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
-                Err(FsError::Locked(lock_path.to_path_buf()))
-            }
-            Err(e) => Err(FsError::Io(e)),
+            .create(true)
+            .truncate(false)
+            .open(lock_path)?;
+        match file.try_lock() {
+            Ok(()) => Ok(Box::new(RealLockGuard { _file: file })),
+            Err(std::fs::TryLockError::WouldBlock) => Err(FsError::Locked(lock_path.to_path_buf())),
+            Err(std::fs::TryLockError::Error(e)) => Err(FsError::Io(e)),
         }
     }
 }
@@ -1042,7 +1032,7 @@ mod tests {
         // A second acquire must fail while held.
         assert!(matches!(fs.acquire_lock(&lock), Err(FsError::Locked(_))));
         drop(guard);
-        // After drop the LOCK file is removed and can be re-acquired.
+        // The persistent LOCK file can be re-acquired after the handle closes.
         assert!(fs.acquire_lock(&lock).is_ok());
 
         let _ = std::fs::remove_dir_all(&dir);
