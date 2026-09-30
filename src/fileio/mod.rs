@@ -305,6 +305,7 @@ impl FileSystem for RealFs {
             .read(true)
             .write(true)
             .create(true)
+            .truncate(false)
             .open(lock_path)?;
         match file.try_lock() {
             Ok(()) => Ok(Box::new(RealLockGuard { _file: file })),
