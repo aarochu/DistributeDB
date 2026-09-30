@@ -248,7 +248,8 @@ fn encode_rebootstrap_policy(allowed: bool) -> [u8; 16] {
     let mut bytes = [0u8; 16];
     bytes[..8].copy_from_slice(b"DDBRBP01");
     bytes[8] = u8::from(allowed);
-    bytes[12..16].copy_from_slice(&crate::checksum::crc32c(&bytes[..12]).to_le_bytes());
+    let crc = crate::checksum::crc32c(&bytes[..12]);
+    bytes[12..16].copy_from_slice(&crc.to_le_bytes());
     bytes
 }
 
