@@ -53,4 +53,6 @@ pub use wal::snapshot::{
     decode as decode_snapshot, encode as encode_snapshot, DecodedSnapshot, SnapshotError,
     SnapshotHeader,
 };
-pub use wal::{Db, DurabilityMode, Identity, Wal, WalError, WalResult};
+pub use wal::{
+    Db, DurabilityMode, Identity, Wal, WalError, WalResult, DEFAULT_RETENTION_BUDGET_BYTES,
+};
