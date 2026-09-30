@@ -1,0 +1,29 @@
+# Rust build output (planned implementation)
+/target/
+**/*.rs.bk
+
+# Local database state and transient test data
+/data/
+/run/
+/tmp/
+
+# Local configuration and secrets
+.env
+.env.*
+!.env.example
+
+# Editors and operating systems
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# Generated logs and profiles
+*.log
+*.profraw
+*.profdata
+
+# Benchmark results are intentionally not ignored: the SOW calls for publishing them.
