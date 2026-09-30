@@ -361,6 +361,23 @@ struct WalTail {
     active_segment_valid_len: u64,
 }
 
+/// A computed reclamation plan for a freshly verified snapshot: the WAL
+/// segments and previous snapshot to delete, plus the retained recovery bytes
+/// that would remain after executing it (Technical-Design §7). Planning is
+/// separated from execution so the disk-budget check runs before any in-memory
+/// recovery base advances.
+#[derive(Debug, Clone)]
+struct ReclamationPlan {
+    /// First-LSNs of WAL segments wholly covered by the new snapshot.
+    deletable_segments: Vec<u64>,
+    /// The previous snapshot LSN whose recovery chain is now reclaimable
+    /// (`None` when there was no previous snapshot).
+    deletable_previous_snapshot: Option<u64>,
+    /// Retained recovery bytes remaining after the plan is executed (the new
+    /// snapshot plus retained WAL; excludes everything being reclaimed).
+    retained_bytes: u64,
+}
+
 // ---------------------------------------------------------------------------
 // Segment scanning.
 // ---------------------------------------------------------------------------
@@ -1450,29 +1467,48 @@ impl<F: FileSystem + Clone> Db<F> {
             ));
         }
 
-        // The new snapshot is now the verified recovery base.
+        // (8) Plan reclamation of the WAL segments wholly covered by S and of
+        // the previous snapshot's now-reclaimable recovery chain, then enforce
+        // the disk budget. The budget check happens BEFORE the in-memory base
+        // moves so a `ResourceExhausted` return leaves `snapshot_lsn` unchanged
+        // (the return value and observable state agree, §7).
+        let plan = self.plan_reclamation(s, previous_snapshot_lsn)?;
+        if plan.retained_bytes > self.retention_budget_bytes {
+            return Err(WalError::ResourceExhausted {
+                budget_bytes: self.retention_budget_bytes,
+                needed_bytes: plan.retained_bytes,
+            });
+        }
+
+        // The budget allows the new snapshot: it is now the verified recovery
+        // base. Advance the in-memory base only after the check passes.
         self.snapshot_lsn = s;
 
-        // (8) Reclaim WAL segments wholly covered by S, subject to the
-        // previous-chain retention rule and the disk budget.
-        self.reclaim_covered_wal(s, previous_snapshot_lsn)?;
+        // Execute reclamation: delete the covered WAL and the previous
+        // snapshot, then sync the affected directories (delete-then-sync keeps
+        // it crash-safe; a crash before the dir sync restores the files and the
+        // next publish re-derives the same set, so no recovery gap opens, §7).
+        self.execute_reclamation(&plan)?;
 
         Ok(s)
     }
 
-    /// Delete WAL segments wholly covered by the verified snapshot at `s`
-    /// (every record `<= s`), keeping the segment that begins at `s+1` and all
-    /// later segments (the current recovery chain), subject to the bounded
-    /// disk budget (Technical-Design §7).
+    /// Plan the reclamation for a freshly verified snapshot at `s`: which WAL
+    /// segments are wholly covered by `s`, whether the previous snapshot's
+    /// recovery chain is now reclaimable, and the retained recovery bytes that
+    /// would remain AFTER executing the plan (Technical-Design §7).
     ///
-    /// The previous snapshot at `previous_snapshot_lsn` (if any) is left on
-    /// disk: it was the prior recovery base and is only reclaimable now that
-    /// the new snapshot has passed reload verification. A segment is "wholly
-    /// covered" when the next segment's `first_lsn` is `<= s+1` (so every
-    /// record in it is `<= s`).
-    fn reclaim_covered_wal(&mut self, s: u64, previous_snapshot_lsn: u64) -> WalResult<()> {
-        let mode = self.wal.mode;
-
+    /// A segment is "wholly covered" when the next segment's `first_lsn` is
+    /// `<= s+1` (so every record in it is `<= s`). The current chain begins at
+    /// the segment starting at `s+1`; it and all later segments are never
+    /// touched.
+    ///
+    /// The previous snapshot at `previous_snapshot_lsn` (if any) was the prior
+    /// recovery base; §7 permits reclaiming the older recovery chain once the
+    /// new snapshot has passed reload verification, which has happened by the
+    /// time this runs. It is therefore scheduled for deletion and is NOT
+    /// counted in the retained-bytes total.
+    fn plan_reclamation(&self, s: u64, previous_snapshot_lsn: u64) -> WalResult<ReclamationPlan> {
         // Enumerate current segments by first LSN.
         let mut segment_lsns: Vec<u64> = Vec::new();
         for name in self.wal.fs.list_dir(&self.wal.paths.wal_dir())? {
@@ -1486,78 +1522,80 @@ impl<F: FileSystem + Clone> Db<F> {
 
         // A segment at index i is wholly covered by S when the NEXT segment
         // begins at or before S+1 (so this segment's records are all <= S).
-        // The current chain begins at the segment starting at S+1; never touch
-        // it or anything after it.
-        let mut deletable: Vec<u64> = Vec::new();
+        let mut deletable_segments: Vec<u64> = Vec::new();
         for i in 0..segment_lsns.len() {
             let first = segment_lsns[i];
-            let next = segment_lsns.get(i + 1).copied();
-            match next {
-                Some(next_first) if next_first <= s + 1 => deletable.push(first),
-                _ => {}
+            if let Some(next_first) = segment_lsns.get(i + 1).copied() {
+                if next_first <= s + 1 {
+                    deletable_segments.push(first);
+                }
             }
         }
 
-        // Compute the retained recovery bytes AFTER a hypothetical deletion:
-        // the current snapshot file plus every WAL segment we would keep. If
-        // that exceeds the budget, delete nothing and pause writes (§7).
-        let retained_bytes =
-            self.retained_recovery_bytes(&segment_lsns, &deletable, s, previous_snapshot_lsn)?;
-        if retained_bytes > self.retention_budget_bytes {
-            return Err(WalError::ResourceExhausted {
-                budget_bytes: self.retention_budget_bytes,
-                needed_bytes: retained_bytes,
-            });
-        }
+        // The previous snapshot's file is reclaimable now (the new snapshot
+        // verified). Guard against reclaiming the current snapshot (S) or a
+        // zero "no previous snapshot" sentinel.
+        let deletable_previous_snapshot =
+            if previous_snapshot_lsn != 0 && previous_snapshot_lsn != s {
+                Some(previous_snapshot_lsn)
+            } else {
+                None
+            };
 
-        if deletable.is_empty() {
-            return Ok(());
-        }
-        for first in &deletable {
-            self.wal.fs.remove_file(&self.wal.paths.segment(*first))?;
-        }
-        if mode == DurabilityMode::Fsync {
-            self.wal.fs.sync_dir(&self.wal.paths.wal_dir())?;
-        }
-        Ok(())
-    }
-
-    /// Sum the bytes of retained recovery data after a hypothetical reclamation
-    /// of `deletable`: the current snapshot file, the previous snapshot (still
-    /// retained), and every WAL segment not being deleted (Technical-Design
-    /// §7).
-    fn retained_recovery_bytes(
-        &self,
-        segment_lsns: &[u64],
-        deletable: &[u64],
-        s: u64,
-        previous_snapshot_lsn: u64,
-    ) -> WalResult<u64> {
-        let mut total: u64 = 0;
-        // Current snapshot.
+        // Retained recovery bytes AFTER executing the plan: the new snapshot
+        // file plus every WAL segment we keep. The previous snapshot and the
+        // covered WAL segments are being reclaimed, so they are excluded.
+        let mut retained_bytes: u64 = 0;
         if let Ok(bytes) = self.wal.fs.read(&self.wal.paths.snapshot(s)) {
-            total += bytes.len() as u64;
+            retained_bytes += bytes.len() as u64;
         }
-        // Previous snapshot, still retained on disk until now.
-        if previous_snapshot_lsn != 0 && previous_snapshot_lsn != s {
-            if let Ok(bytes) = self
-                .wal
-                .fs
-                .read(&self.wal.paths.snapshot(previous_snapshot_lsn))
-            {
-                total += bytes.len() as u64;
-            }
-        }
-        // Retained WAL segments (those not being deleted).
-        for &first in segment_lsns {
-            if deletable.contains(&first) {
+        for &first in &segment_lsns {
+            if deletable_segments.contains(&first) {
                 continue;
             }
             if let Ok(bytes) = self.wal.fs.read(&self.wal.paths.segment(first)) {
-                total += bytes.len() as u64;
+                retained_bytes += bytes.len() as u64;
             }
         }
-        Ok(total)
+
+        Ok(ReclamationPlan {
+            deletable_segments,
+            deletable_previous_snapshot,
+            retained_bytes,
+        })
+    }
+
+    /// Execute a [`ReclamationPlan`]: delete the covered WAL segments and the
+    /// previous snapshot file, then `sync_dir` each affected directory in
+    /// `fsync` mode (Technical-Design §7).
+    ///
+    /// Delete-then-sync keeps reclamation crash-safe: a crash after the deletes
+    /// but before the directory sync leaves the removals volatile (see the
+    /// `SimFs` delete-durability model), so recovery restores the files and the
+    /// next publish re-derives the same reclaimable set. Deleting never opens a
+    /// recovery gap because the retained chain from `s+1` is untouched, and the
+    /// previous snapshot is removed only after the new snapshot has both
+    /// verified and been recorded as the recovery base.
+    fn execute_reclamation(&mut self, plan: &ReclamationPlan) -> WalResult<()> {
+        let mode = self.wal.mode;
+
+        for first in &plan.deletable_segments {
+            self.wal.fs.remove_file(&self.wal.paths.segment(*first))?;
+        }
+        if mode == DurabilityMode::Fsync && !plan.deletable_segments.is_empty() {
+            self.wal.fs.sync_dir(&self.wal.paths.wal_dir())?;
+        }
+
+        if let Some(prev) = plan.deletable_previous_snapshot {
+            let prev_path = self.wal.paths.snapshot(prev);
+            if self.wal.fs.exists(&prev_path) {
+                self.wal.fs.remove_file(&prev_path)?;
+                if mode == DurabilityMode::Fsync {
+                    self.wal.fs.sync_dir(&self.wal.paths.snapshots_dir())?;
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Number of keys currently stored.
@@ -1950,6 +1988,7 @@ mod tests {
         // covered log); reclamation only happens when a newer snapshot's chain
         // no longer needs it. After S1, the current chain begins at seg 3.
         db.set(b"c".to_vec(), b"3".to_vec()).unwrap(); // lsn 3 in seg 3
+        let snap1 = db.wal.paths.snapshot(2);
         db.publish_snapshot().unwrap(); // S2 = 3; rotates to seg 4
         let seg3 = db.wal.paths.segment(3);
         // After S2, segments wholly covered by S2 (segs 1 and 3) are deleted;
@@ -1957,6 +1996,14 @@ mod tests {
         assert!(!db.wal.fs.exists(&seg1), "seg1 should be reclaimed");
         assert!(!db.wal.fs.exists(&seg3), "seg3 should be reclaimed");
         assert!(db.wal.fs.exists(&db.wal.paths.segment(4)));
+        // The previous snapshot's recovery chain is reclaimed once the newer
+        // snapshot has verified (§7 previous-chain rule): S1's file is gone,
+        // only S2's remains.
+        assert!(
+            !db.wal.fs.exists(&snap1),
+            "previous snapshot S1 should be reclaimed after S2 verifies"
+        );
+        assert!(db.wal.fs.exists(&db.wal.paths.snapshot(3)));
         // The snapshot at S2 remains, and recovery still works after a crash.
         drop(db);
         fs.crash();
@@ -1988,6 +2035,46 @@ mod tests {
         // The snapshot file itself was written and verified before reclamation
         // (the snapshot is durable; only the reclamation step paused).
         assert!(db.wal.fs.exists(&db.wal.paths.snapshot(2)));
+        // The in-memory recovery base did NOT advance on the ResourceExhausted
+        // path: the return value and observable state agree (§7). snapshot_lsn
+        // stays 0 because nothing was reclaimed.
+        assert_eq!(db.snapshot_lsn(), 0);
+    }
+
+    #[test]
+    fn previous_snapshot_reclamation_frees_budget_accounting() {
+        // After a second verified snapshot the previous snapshot file is gone
+        // and the retained-bytes accounting reflects it: the retained total is
+        // the new snapshot plus the retained WAL only, not the old snapshot.
+        let fs = sim();
+        let mut db = Db::open(fs.clone(), &root(), DurabilityMode::Fsync).unwrap();
+        db.set(b"a".to_vec(), b"1".to_vec()).unwrap();
+        db.set(b"b".to_vec(), b"2".to_vec()).unwrap();
+        db.publish_snapshot().unwrap(); // S1 = 2
+        db.set(b"c".to_vec(), b"3".to_vec()).unwrap();
+        db.publish_snapshot().unwrap(); // S2 = 3; reclaims S1's chain
+
+        // The old snapshot file is gone.
+        assert!(!db.wal.fs.exists(&db.wal.paths.snapshot(2)));
+
+        // Recompute the reclamation plan from the current on-disk state (a
+        // no-op replan against S2 with no previous snapshot): its retained
+        // bytes must exclude the reclaimed old snapshot and equal the sum of
+        // the new snapshot plus the retained WAL segments actually on disk.
+        let plan = db.plan_reclamation(db.snapshot_lsn(), 0).unwrap();
+        let snap_bytes = db.wal.fs.read(&db.wal.paths.snapshot(3)).unwrap().len() as u64;
+        let mut expected = snap_bytes;
+        for name in db.wal.fs.list_dir(&db.wal.paths.wal_dir()).unwrap() {
+            if let Some(stem) = name.strip_suffix(".wal") {
+                if let Ok(first) = stem.parse::<u64>() {
+                    if !plan.deletable_segments.contains(&first) {
+                        expected +=
+                            db.wal.fs.read(&db.wal.paths.segment(first)).unwrap().len() as u64;
+                    }
+                }
+            }
+        }
+        assert_eq!(plan.retained_bytes, expected);
     }
 
     #[test]
