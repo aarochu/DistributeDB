@@ -109,15 +109,8 @@ fn acknowledged_writes_survive_process_kill() {
         // Give the harness a beat, then kill it hard (SIGKILL via Child::kill).
         std::thread::sleep(Duration::from_millis(2));
         kill(&mut child);
-        // Ensure the OS released the child's LOCK file handle before reopening.
-        std::thread::sleep(Duration::from_millis(5));
-
-        // The child holds an exclusive LOCK via a LOCK file created with
-        // create_new. On SIGKILL the RealLockGuard Drop does not run, so the
-        // stale LOCK file may remain. Remove it so recovery can reacquire, the
-        // same cleanup a supervisor would perform on restart.
-        let lock_path = dir.path().join("LOCK");
-        let _ = std::fs::remove_file(&lock_path);
+        // No manual LOCK-file deletion: the OS releases the advisory lock
+        // when the killed child is reaped, so restart must succeed directly.
 
         // Reopen and verify every acknowledged write survived.
         let db = reopen(dir.path());
