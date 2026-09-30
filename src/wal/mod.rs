@@ -951,6 +951,20 @@ impl<F: FileSystem + Clone> Db<F> {
         self.tail_truncated
     }
 
+    /// Roll the WAL over to a new segment between groups (Technical-Design
+    /// §6.1). Seals the current segment with a sync and starts a new
+    /// first-LSN-named segment. Exposed so durability tests can produce a
+    /// SEALED (non-final) segment and assert the §6.3 fail-closed boundary.
+    pub fn rotate(&mut self) -> WalResult<()> {
+        self.wal.rotate_after(self.wal.next_lsn())
+    }
+
+    /// Explicitly sync the WAL through `lsn` (Technical-Design §2.1
+    /// `sync_through`); returns the highest durable LSN.
+    pub fn sync_through(&mut self, lsn: u64) -> WalResult<u64> {
+        self.wal.sync_through(lsn)
+    }
+
     /// Number of keys currently stored.
     pub fn len(&self) -> usize {
         self.engine.len()
