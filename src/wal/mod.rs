@@ -953,10 +953,17 @@ impl<F: FileSystem + Clone> Db<F> {
                 )));
             }
             if id.role != config.role.as_str() {
-                return Err(WalError::Identity("configured role differs from IDENTITY".into()));
+                return Err(WalError::Identity(
+                    "configured role differs from IDENTITY".into(),
+                ));
             }
-            if config.cluster_id.is_some_and(|cluster| cluster != id.cluster_id) {
-                return Err(WalError::Identity("configured cluster ID differs from IDENTITY".into()));
+            if config
+                .cluster_id
+                .is_some_and(|cluster| cluster != id.cluster_id)
+            {
+                return Err(WalError::Identity(
+                    "configured cluster ID differs from IDENTITY".into(),
+                ));
             }
             id
         } else {
@@ -1940,8 +1947,14 @@ mod tests {
         fs.sync_file(&current).unwrap();
         fs.crash();
         let db = Db::open(fs.clone(), &root(), DurabilityMode::Fsync).unwrap();
-        assert_eq!(db.get(b"k"), crate::storage::GetResult::Found(b"v".to_vec()));
-        assert_eq!(Current::decode(&fs.read(&current).unwrap()), Ok(Current { generation: 1 }));
+        assert_eq!(
+            db.get(b"k"),
+            crate::storage::GetResult::Found(b"v".to_vec())
+        );
+        assert_eq!(
+            Current::decode(&fs.read(&current).unwrap()),
+            Ok(Current { generation: 1 })
+        );
     }
 
     #[test]
@@ -1954,8 +1967,8 @@ mod tests {
             ..OpenConfig::default()
         };
         {
-            let mut db = Db::open_configured(fs.clone(), &root(), DurabilityMode::Fsync, config)
-                .unwrap();
+            let mut db =
+                Db::open_configured(fs.clone(), &root(), DurabilityMode::Fsync, config).unwrap();
             assert_eq!(db.identity().cluster_id, cluster);
             assert_eq!(db.identity().role, "replica");
             assert!(matches!(
