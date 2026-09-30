@@ -31,6 +31,7 @@ pub mod client;
 pub mod command;
 pub mod fileio;
 pub mod protocol;
+pub mod replication;
 pub mod server;
 pub mod storage;
 pub mod wal;
@@ -57,3 +58,4 @@ pub use wal::{
     Db, DurabilityMode, Identity, NodeRole, OpenConfig, Wal, WalError, WalResult,
     DEFAULT_RETENTION_BUDGET_BYTES,
 };
+pub use replication::{PrimaryListener, ReplicaRunner, ReplicationStats};

@@ -858,6 +858,11 @@ pub struct Db<F: FileSystem> {
     engine: StorageEngine,
     wal: Wal<F>,
     last_applied_lsn: u64,
+    /// Footer-closed records since the active snapshot boundary. These are
+    /// rebuilt from disk on restart and are the only history offered to a
+    /// replica without a snapshot transfer.
+    retained_records: Vec<MutationRecord>,
+    snapshot_hash: u64,
     tail_truncated: bool,
     /// The LSN of the snapshot currently used as the recovery base (0 if the
     /// map was rebuilt from LSN 1 with no snapshot) (Technical-Design §7).
@@ -885,6 +890,11 @@ impl<F: FileSystem + Clone> Db<F> {
     /// Active recovery generation selected by the checked CURRENT pointer.
     pub fn generation_id(&self) -> u64 {
         self.wal.paths.generation_id
+    }
+
+    /// Active local durability policy. Replication requires `Fsync`.
+    pub fn durability_mode(&self) -> DurabilityMode {
+        self.wal.mode
     }
 
     /// Open (initializing if fresh) the data directory at `root` under `fs`
@@ -1016,6 +1026,12 @@ impl<F: FileSystem + Clone> Db<F> {
             0
         };
 
+        let snapshot_hash = outcome
+            .records
+            .first()
+            .map(|record| record.prev_hash)
+            .unwrap_or(outcome.last_record_hash);
+        let retained_records = outcome.records.clone();
         let wal = Wal {
             fs,
             paths,
@@ -1033,6 +1049,8 @@ impl<F: FileSystem + Clone> Db<F> {
             engine,
             wal,
             last_applied_lsn,
+            retained_records,
+            snapshot_hash,
             tail_truncated: outcome.tail_truncated,
             snapshot_lsn: outcome.snapshot_lsn,
             records_replayed: outcome.records.len() as u64,
@@ -1421,11 +1439,14 @@ impl<F: FileSystem + Clone> Db<F> {
         if self.wal.identity.role != "primary" {
             return Err(WalError::ReadOnlyReplica);
         }
+        let prev_hash = self.wal.last_record_hash;
         let assigned = self.wal.append_group(std::slice::from_ref(&m))?;
         let lsn = assigned[0];
+        let rec = mutation_to_record(&m, lsn, prev_hash);
         // Write-ahead order: apply to the map only after the durable append.
         self.engine.apply(m);
         self.last_applied_lsn = lsn;
+        self.retained_records.push(rec);
         Ok(lsn)
     }
 
@@ -1453,15 +1474,86 @@ impl<F: FileSystem + Clone> Db<F> {
         if muts.is_empty() {
             return Ok(Vec::new());
         }
+        let mut prev_hash = self.wal.last_record_hash;
         let assigned = self.wal.append_group(muts)?;
         // Write-ahead order: apply to the map only after the durable append.
-        for m in muts {
+        for (m, &lsn) in muts.iter().zip(assigned.iter()) {
             self.engine.apply(m.clone());
+            let rec = mutation_to_record(m, lsn, prev_hash);
+            prev_hash = rec.record_hash();
+            self.retained_records.push(rec);
         }
         if let Some(&last) = assigned.last() {
             self.last_applied_lsn = last;
         }
         Ok(assigned)
+    }
+
+    /// Return a known hash at `lsn`, or `None` when that prefix was reclaimed
+    /// or the requested LSN is ahead of this node. Hashes detect accidental
+    /// divergence; they are not authentication.
+    pub fn record_hash_at(&self, lsn: u64) -> Option<u64> {
+        if lsn == self.snapshot_lsn {
+            return Some(self.snapshot_hash);
+        }
+        if lsn < self.snapshot_lsn || lsn > self.last_applied_lsn {
+            return None;
+        }
+        let index = usize::try_from(lsn - self.snapshot_lsn - 1).ok()?;
+        self.retained_records.get(index).map(MutationRecord::record_hash)
+    }
+
+    /// Copy at most `limit` durable records following a verified LSN. `None`
+    /// means the requested prefix is outside the retained history and requires
+    /// an explicit snapshot rebootstrap or divergence decision.
+    pub fn durable_records_after(&self, lsn: u64, limit: usize) -> Option<Vec<MutationRecord>> {
+        if self.wal.mode != DurabilityMode::Fsync
+            || lsn < self.snapshot_lsn
+            || lsn > self.wal.durable_lsn
+        {
+            return None;
+        }
+        let start = usize::try_from(lsn - self.snapshot_lsn).ok()?;
+        Some(
+            self.retained_records
+                .iter()
+                .skip(start)
+                .take(limit)
+                .cloned()
+                .collect(),
+        )
+    }
+
+    /// Accept one validated primary record on a replica. The local WAL may
+    /// have a different group footer, but its mutation bytes and hash chain
+    /// must be identical. ACK only after this method returns successfully.
+    pub fn apply_replicated_record(&mut self, record: &MutationRecord) -> WalResult<u64> {
+        if self.wal.identity.role != "replica" {
+            return Err(WalError::Identity(
+                "replicated records require a replica data directory".into(),
+            ));
+        }
+        if record.lsn <= self.last_applied_lsn {
+            return match self.record_hash_at(record.lsn) {
+                Some(hash) if hash == record.record_hash() => Ok(record.lsn),
+                _ => Err(WalError::Corruption("replicated history diverged".into())),
+            };
+        }
+        if record.lsn != self.wal.next_lsn || record.prev_hash != self.wal.last_record_hash {
+            return Err(WalError::Corruption(
+                "replicated LSN or previous hash is not contiguous".into(),
+            ));
+        }
+        let mutation = record_to_mutation(record);
+        let expected = mutation_to_record(&mutation, self.wal.next_lsn, self.wal.last_record_hash);
+        if expected.encode() != record.encode() {
+            return Err(WalError::Corruption("replicated record bytes differ".into()));
+        }
+        let assigned = self.wal.append_group(std::slice::from_ref(&mutation))?;
+        self.engine.apply(mutation);
+        self.last_applied_lsn = assigned[0];
+        self.retained_records.push(record.clone());
+        Ok(assigned[0])
     }
 
     /// Look up `key` in the reconstructed engine.
@@ -1642,6 +1734,8 @@ impl<F: FileSystem + Clone> Db<F> {
         // The budget allows the new snapshot: it is now the verified recovery
         // base. Advance the in-memory base only after the check passes.
         self.snapshot_lsn = s;
+        self.snapshot_hash = record_hash_at_lsn;
+        self.retained_records.clear();
 
         // Execute reclamation: delete the covered WAL and the previous
         // snapshot, then sync the affected directories (delete-then-sync keeps
@@ -1989,6 +2083,73 @@ mod tests {
             Db::open_configured(fs, &root(), DurabilityMode::Fsync, wrong_cluster),
             Err(WalError::Identity(_))
         ));
+    }
+
+    #[test]
+    fn replica_applies_only_contiguous_primary_history() {
+        let fs = sim();
+        let cluster = [9u8; 16];
+        let primary_config = OpenConfig {
+            cluster_id: Some(cluster),
+            ..OpenConfig::default()
+        };
+        let mut primary = Db::open_configured(
+            fs.clone(),
+            Path::new("/primary"),
+            DurabilityMode::Fsync,
+            primary_config,
+        )
+        .unwrap();
+        primary.set(b"a".to_vec(), b"1".to_vec()).unwrap();
+        primary.set(b"b".to_vec(), b"2".to_vec()).unwrap();
+        let records = primary.durable_records_after(0, 64).unwrap();
+        assert_eq!(records.len(), 2);
+        assert_eq!(primary.record_hash_at(2), Some(records[1].record_hash()));
+
+        let replica_config = OpenConfig {
+            role: NodeRole::Replica,
+            cluster_id: Some(cluster),
+            ..OpenConfig::default()
+        };
+        let mut replica = Db::open_configured(
+            fs.clone(),
+            Path::new("/replica"),
+            DurabilityMode::Fsync,
+            replica_config,
+        )
+        .unwrap();
+        assert!(replica.apply_replicated_record(&records[1]).is_err());
+        assert_eq!(replica.apply_replicated_record(&records[0]).unwrap(), 1);
+        assert_eq!(replica.apply_replicated_record(&records[0]).unwrap(), 1);
+        assert_eq!(replica.apply_replicated_record(&records[1]).unwrap(), 2);
+        assert_eq!(replica.get(b"b"), crate::storage::GetResult::Found(b"2".to_vec()));
+        assert_eq!(replica.record_hash_at(2), primary.record_hash_at(2));
+        drop(replica);
+        drop(primary);
+        fs.crash();
+        let replica = Db::open_configured(
+            fs.clone(),
+            Path::new("/replica"),
+            DurabilityMode::Fsync,
+            replica_config,
+        )
+        .unwrap();
+        assert_eq!(replica.last_applied_lsn(), 2);
+        assert_eq!(replica.get(b"a"), crate::storage::GetResult::Found(b"1".to_vec()));
+    }
+
+    #[test]
+    fn snapshot_moves_replication_history_boundary() {
+        let fs = sim();
+        let mut db = Db::open(fs, &root(), DurabilityMode::Fsync).unwrap();
+        db.set(b"a".to_vec(), b"1".to_vec()).unwrap();
+        let hash_at_one = db.record_hash_at(1);
+        db.publish_snapshot().unwrap();
+        assert!(db.durable_records_after(0, 64).is_none());
+        assert_eq!(db.record_hash_at(1), hash_at_one);
+        assert_eq!(db.durable_records_after(1, 64).unwrap().len(), 0);
+        db.set(b"b".to_vec(), b"2".to_vec()).unwrap();
+        assert_eq!(db.durable_records_after(1, 64).unwrap().len(), 1);
     }
 
     #[test]

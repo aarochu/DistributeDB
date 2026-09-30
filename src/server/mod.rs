@@ -95,6 +95,7 @@ use crate::protocol::{
     self, Request, Response, Status, KIND_DELETE, KIND_EXISTS, KIND_GET, KIND_SET, KIND_STATS,
     PROTOCOL_VERSION,
 };
+use crate::replication::{PeerProgress, ReplicationStats};
 use crate::storage::{GetResult, Mutation};
 use crate::wal::{Db, MAX_GROUP_BYTES, MAX_GROUP_RECORDS};
 
@@ -119,6 +120,8 @@ pub struct ServerConfig {
     pub max_queue_depth: usize,
     /// Intentional wait the sequencer allows for a group to fill (default 0).
     pub group_wait: Duration,
+    /// Optional primary-side replica ACK state included in STATS.
+    pub replication_stats: Option<Arc<ReplicationStats>>,
 }
 
 impl Default for ServerConfig {
@@ -128,6 +131,7 @@ impl Default for ServerConfig {
             idle_timeout: DEFAULT_IDLE_TIMEOUT,
             max_queue_depth: DEFAULT_MAX_QUEUE_DEPTH,
             group_wait: DEFAULT_GROUP_WAIT,
+            replication_stats: None,
         }
     }
 }
@@ -324,7 +328,7 @@ impl ShutdownHandle {
 
 /// Shared state handed to each connection worker and the sequencer.
 struct Shared<F: FileSystem + Clone + Send + 'static> {
-    db: RwLock<Db<F>>,
+    db: Arc<RwLock<Db<F>>>,
     metrics: Metrics,
     start: Instant,
     queue: Arc<WriteQueue>,
@@ -347,13 +351,27 @@ impl Server {
         A: std::net::ToSocketAddrs,
         FS: FileSystem + Clone + Send + Sync + 'static,
     {
+        Self::start_shared(addr, Arc::new(RwLock::new(db)), config)
+    }
+
+    /// Start a client server with a database also held by the replication
+    /// listener. Each subsystem shares the same map/WAL lock and write path.
+    pub fn start_shared<A, FS>(
+        addr: A,
+        db: Arc<RwLock<Db<FS>>>,
+        config: ServerConfig,
+    ) -> std::io::Result<Server>
+    where
+        A: std::net::ToSocketAddrs,
+        FS: FileSystem + Clone + Send + Sync + 'static,
+    {
         let listener = TcpListener::bind(addr)?;
         let local_addr = listener.local_addr()?;
         let shutdown = Arc::new(AtomicBool::new(false));
         let queue = Arc::new(WriteQueue::new(config.max_queue_depth));
 
         let shared = Arc::new(Shared {
-            db: RwLock::new(db),
+            db,
             metrics: Metrics::default(),
             start: Instant::now(),
             queue: Arc::clone(&queue),
@@ -694,10 +712,11 @@ fn render_stats<F>(shared: &Arc<Shared<F>>) -> String
 where
     F: FileSystem + Clone + Send + Sync + 'static,
 {
-    let (keys, current_lsn, snapshot_lsn) = {
+    let (keys, current_lsn, durable_lsn, snapshot_lsn) = {
         let db = shared.db.read().expect("db read lock poisoned");
-        (db.len(), db.last_applied_lsn(), db.snapshot_lsn())
+        (db.len(), db.last_applied_lsn(), db.last_durable_lsn(), db.snapshot_lsn())
     };
+    let replicas = shared.config.replication_stats.as_ref().map(|stats| stats.snapshot()).unwrap_or_default();
     let snapshot = StatsSnapshot {
         uptime_seconds: shared.start.elapsed().as_secs(),
         keys,
@@ -705,8 +724,10 @@ where
         reads_total: shared.metrics.reads_total.load(Ordering::Relaxed),
         writes_total: shared.metrics.writes_total.load(Ordering::Relaxed),
         current_lsn,
+        durable_lsn,
         snapshot_lsn,
         connected_clients: shared.metrics.connected_clients.load(Ordering::Relaxed),
+        replicas,
     };
     render_stats_lines(&snapshot)
 }
@@ -722,8 +743,10 @@ struct StatsSnapshot {
     reads_total: u64,
     writes_total: u64,
     current_lsn: u64,
+    durable_lsn: u64,
     snapshot_lsn: u64,
     connected_clients: usize,
+    replicas: Vec<([u8; 16], PeerProgress)>,
 }
 
 /// Render a [`StatsSnapshot`] as bounded UTF-8 `name=value` lines with
@@ -738,10 +761,20 @@ fn render_stats_lines(s: &StatsSnapshot) -> String {
     out.push_str(&format!("reads_total={}\n", s.reads_total));
     out.push_str(&format!("writes_total={}\n", s.writes_total));
     out.push_str(&format!("current_lsn={}\n", s.current_lsn));
+    out.push_str(&format!("durable_lsn={}\n", s.durable_lsn));
     out.push_str(&format!("snapshot_lsn={}\n", s.snapshot_lsn));
     out.push_str(&format!("connected_clients={}\n", s.connected_clients));
-    // Replication is Phase 5; report zero for now.
-    out.push_str("replicas_connected=0\n");
+    let connected = s.replicas.iter().filter(|(_, peer)| peer.connected).count();
+    out.push_str(&format!("replicas_connected={connected}\n"));
+    for (id, peer) in &s.replicas {
+        let hex = crate::replication::format_id(id);
+        out.push_str(&format!("replica_{hex}_applied_lsn={}\n", peer.applied_lsn));
+        if peer.connected && peer.applied_lsn <= s.durable_lsn {
+            out.push_str(&format!("replica_{hex}_lag={}\n", s.durable_lsn - peer.applied_lsn));
+        } else {
+            out.push_str(&format!("replica_{hex}_lag=unknown\n"));
+        }
+    }
     out
 }
 
@@ -825,8 +858,10 @@ mod tests {
             reads_total: 70,
             writes_total: 30,
             current_lsn: 30,
+            durable_lsn: 30,
             snapshot_lsn: 20,
             connected_clients: 2,
+            replicas: Vec::new(),
         };
         let text = render_stats_lines(&snapshot);
         let lines: Vec<&str> = text.lines().collect();

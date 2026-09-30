@@ -33,9 +33,11 @@
 //! With no subcommand the original local in-memory stdin REPL runs unchanged.
 
 use std::io::{self, BufRead, Write};
+use std::sync::{Arc, RwLock};
 
 use distributedb::{
-    parse, Client, Command, GetResult, Server, ServerConfig, Status, StorageEngine,
+    parse, Client, Command, GetResult, NodeRole, OpenConfig, PrimaryListener, ReplicaRunner,
+    ReplicationStats, Server, ServerConfig, Status, StorageEngine,
 };
 
 fn main() {
@@ -50,6 +52,12 @@ fn main() {
         Some("client") => {
             if let Err(err) = client_command(&args[2..]) {
                 eprintln!("client error: {err}");
+                std::process::exit(1);
+            }
+        }
+        Some("replica") => {
+            if let Err(err) = replica_command(&args[2..]) {
+                eprintln!("replica error: {err}");
                 std::process::exit(1);
             }
         }
@@ -80,6 +88,8 @@ fn serve_command(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     use distributedb::{Db, DurabilityMode, RealFs};
 
     let addr = flag_value(args, "--addr").unwrap_or_else(|| "127.0.0.1:5555".to_string());
+    let replication_addr = flag_value(args, "--replication-addr")
+        .unwrap_or_else(|| "127.0.0.1:5556".to_string());
     let data_dir = flag_value(args, "--data").unwrap_or_else(|| {
         // Default under the OS temp dir so runtime data never lands in the repo
         // (.gitignore also excludes /data/, /run/, /tmp/, /target/).
@@ -94,8 +104,15 @@ fn serve_command(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         std::path::Path::new(&data_dir),
         DurabilityMode::Fsync,
     )?;
-    let server = Server::start(addr.as_str(), db, ServerConfig::default())?;
+    let cluster_id = distributedb::replication::format_id(&db.identity().cluster_id);
+    let shared = Arc::new(RwLock::new(db));
+    let stats = Arc::new(ReplicationStats::default());
+    let mut replication = PrimaryListener::start(replication_addr.as_str(), Arc::clone(&shared), Arc::clone(&stats))?;
+    let config = ServerConfig { replication_stats: Some(stats), ..ServerConfig::default() };
+    let server = Server::start_shared(addr.as_str(), shared, config)?;
     println!("DistributeDB listening on {}", server.local_addr());
+    println!("replication listening on {}", replication.local_addr());
+    println!("cluster ID: {cluster_id}");
     println!("data directory: {data_dir}");
     println!("press Ctrl-D (EOF) on stdin to shut down");
 
@@ -114,7 +131,58 @@ fn serve_command(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     }
     handle.shutdown();
     drop(server); // joins acceptor + sequencer threads.
+    replication.shutdown();
     println!("shut down");
+    Ok(())
+}
+
+fn parse_cluster_id(hex: &str) -> Result<[u8; 16], Box<dyn std::error::Error>> {
+    if hex.len() != 32 || !hex.is_ascii() {
+        return Err("cluster ID must be exactly 32 hexadecimal characters".into());
+    }
+    let mut id = [0u8; 16];
+    for (index, byte) in id.iter_mut().enumerate() {
+        *byte = u8::from_str_radix(&hex[index * 2..index * 2 + 2], 16)?;
+    }
+    Ok(id)
+}
+
+/// Run a statically configured read-only replica. A separate data directory
+/// and the primary's printed cluster ID are required on first start.
+fn replica_command(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    use distributedb::{Db, DurabilityMode, RealFs};
+
+    let primary = flag_value(args, "--primary-addr").ok_or("replica requires --primary-addr HOST:PORT")?;
+    let primary: std::net::SocketAddr = primary.parse()?;
+    let data_dir = flag_value(args, "--data").ok_or("replica requires --data DIRECTORY")?;
+    let cluster_hex = flag_value(args, "--cluster-id").ok_or("replica requires --cluster-id HEX")?;
+    let cluster_id = parse_cluster_id(&cluster_hex)?;
+    let db = Db::open_configured(
+        RealFs,
+        std::path::Path::new(&data_dir),
+        DurabilityMode::Fsync,
+        OpenConfig { role: NodeRole::Replica, cluster_id: Some(cluster_id), ..OpenConfig::default() },
+    )?;
+    let shared = Arc::new(RwLock::new(db));
+    let mut runner = ReplicaRunner::start(primary, shared)?;
+    println!("replica connecting to {primary}");
+    println!("data directory: {data_dir}");
+    println!("press Ctrl-D (EOF) or enter shutdown to stop");
+    let stdin = io::stdin();
+    let mut line = String::new();
+    loop {
+        line.clear();
+        match stdin.lock().read_line(&mut line) {
+            Ok(0) => break,
+            Ok(_) if line.trim() == "shutdown" => break,
+            Ok(_) => {}
+            Err(_) => break,
+        }
+    }
+    runner.shutdown();
+    if let Some(error) = runner.fatal_error() {
+        return Err(error.into());
+    }
     Ok(())
 }
 

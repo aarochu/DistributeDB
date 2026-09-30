@@ -17,6 +17,17 @@ jobs:
         run: rustc --version && cargo --version
       - name: Format
         run: cargo fmt --all -- --check
+      - name: Capture formatting patch
+        if: failure()
+        run: |
+          cargo fmt --all
+          git diff --binary > rustfmt.patch
+      - name: Upload formatting patch
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: rustfmt-patch
+          path: rustfmt.patch
       - name: Lint
         run: cargo clippy --offline --all-targets -- -D warnings
       - name: Test
