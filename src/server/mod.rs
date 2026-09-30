@@ -655,7 +655,7 @@ where
 
         match result {
             Ok(lsns) => {
-                for (job, lsn) in batch.into_iter().zip(lsns.into_iter()) {
+                for (job, lsn) in batch.into_iter().zip(lsns) {
                     let _ = job.respond.send(Ok(lsn));
                 }
             }
