@@ -31,6 +31,15 @@ printf 'SET user:1 Aaron\nSET user:2 Alice\nSET user:3 Bob\n' | client \
     | grep -c '^OK$' | grep -qx 3
 wait_for_replicas
 
+# The primary is stopped while the offline snapshot command holds its data
+# directory lock. Restart it and require replicas to reconnect before testing
+# an additional replica outage.
+docker compose stop primary
+docker compose run --rm --no-deps primary snapshot --data /data \
+    | grep -Eq '^snapshot LSN: [1-9][0-9]*$'
+docker compose start primary
+wait_for_replicas
+
 docker compose stop replica-2
 printf 'SET user:4 David\nSET user:5 Emma\n' | client \
     | grep -c '^OK$' | grep -qx 2

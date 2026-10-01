@@ -26,6 +26,16 @@ sh scripts/smoke_cluster.sh
 
 The smoke script stops replica 2, writes while it is offline, restarts it, waits for two connected replicas with zero reported lag, then restarts the primary and verifies an acknowledged value is still readable. CI runs the same script. A container stop can terminate the process without an orderly application shutdown; this tests process restart behavior, not physical power-loss durability.
 
+The smoke script also publishes an offline primary snapshot after the first three writes. To repeat that step manually, stop the primary first so the data-directory lock is released:
+
+```sh
+docker compose stop primary
+docker compose run --rm --no-deps primary snapshot --data /data
+docker compose start primary
+```
+
+The command prints the snapshot LSN. It will refuse to run while another primary process holds the data directory.
+
 To inspect individual containers, use `docker compose --profile replicas ps` and `docker compose --profile replicas logs`. To stop the cluster while keeping all data volumes:
 
 ```sh

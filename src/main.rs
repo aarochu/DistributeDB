@@ -96,7 +96,11 @@ fn snapshot_command(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     use distributedb::{Db, DurabilityMode, RealFs};
 
     let data_dir = flag_value(args, "--data").ok_or("snapshot requires --data DIRECTORY")?;
-    let mut db = Db::open(RealFs, std::path::Path::new(&data_dir), DurabilityMode::Fsync)?;
+    let mut db = Db::open(
+        RealFs,
+        std::path::Path::new(&data_dir),
+        DurabilityMode::Fsync,
+    )?;
     if db.identity().role != "primary" {
         return Err("snapshot command requires a primary data directory".into());
     }

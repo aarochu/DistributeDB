@@ -11,8 +11,11 @@ fn offline_snapshot_preserves_data_and_reduces_replay() {
     {
         let mut db = Db::open(RealFs, dir.path(), DurabilityMode::Fsync).unwrap();
         for index in 0..100u32 {
-            db.set(format!("key:{index}").into_bytes(), format!("value:{index}").into_bytes())
-                .unwrap();
+            db.set(
+                format!("key:{index}").into_bytes(),
+                format!("value:{index}").into_bytes(),
+            )
+            .unwrap();
         }
     }
 
@@ -21,8 +24,15 @@ fn offline_snapshot_preserves_data_and_reduces_replay() {
         .arg(dir.path())
         .output()
         .unwrap();
-    assert!(snapshot.status.success(), "{}", String::from_utf8_lossy(&snapshot.stderr));
-    assert_eq!(String::from_utf8_lossy(&snapshot.stdout).trim(), "snapshot LSN: 100");
+    assert!(
+        snapshot.status.success(),
+        "{}",
+        String::from_utf8_lossy(&snapshot.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&snapshot.stdout).trim(),
+        "snapshot LSN: 100"
+    );
 
     let mut db = Db::open(RealFs, dir.path(), DurabilityMode::Fsync).unwrap();
     assert_eq!(db.snapshot_lsn(), 100);
