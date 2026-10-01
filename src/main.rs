@@ -216,6 +216,12 @@ fn replica_command(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
 
     let primary =
         flag_value(args, "--primary-addr").ok_or("replica requires --primary-addr HOST:PORT")?;
+    // The host is resolved on every reconnect, so reject a malformed address
+    // now rather than retrying it silently forever.
+    match primary.rsplit_once(':') {
+        Some((host, port)) if !host.is_empty() && port.parse::<u16>().is_ok() => {}
+        _ => return Err("--primary-addr must be HOST:PORT".into()),
+    }
     let data_dir = flag_value(args, "--data").ok_or("replica requires --data DIRECTORY")?;
     let cluster_hex =
         flag_value(args, "--cluster-id").ok_or("replica requires --cluster-id HEX")?;
