@@ -61,6 +61,12 @@ fn main() {
                 std::process::exit(1);
             }
         }
+        Some("snapshot") => {
+            if let Err(err) = snapshot_command(&args[2..]) {
+                eprintln!("snapshot error: {err}");
+                std::process::exit(1);
+            }
+        }
         // No subcommand (or an unknown first token): preserve the original
         // local in-memory stdin REPL exactly.
         _ => {
@@ -81,6 +87,22 @@ fn flag_value(args: &[String], flag: &str) -> Option<String> {
         }
     }
     None
+}
+
+/// Publish a local snapshot while the primary is stopped. `Db::open` holds
+/// the exclusive data-directory lock, so a concurrent server makes this fail
+/// before any snapshot files are changed.
+fn snapshot_command(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    use distributedb::{Db, DurabilityMode, RealFs};
+
+    let data_dir = flag_value(args, "--data").ok_or("snapshot requires --data DIRECTORY")?;
+    let mut db = Db::open(RealFs, std::path::Path::new(&data_dir), DurabilityMode::Fsync)?;
+    if db.identity().role != "primary" {
+        return Err("snapshot command requires a primary data directory".into());
+    }
+    let lsn = db.publish_snapshot()?;
+    println!("snapshot LSN: {lsn}");
+    Ok(())
 }
 
 /// Run the `serve` subcommand: open a durable `Db` and start the TCP server.

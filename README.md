@@ -47,7 +47,7 @@ In another terminal:
 printf 'SET user:123 Aaron\nGET user:123\n' | cargo run -- client --addr 127.0.0.1:5555
 ```
 
-The `serve` process exits after `shutdown` on stdin or EOF. Run `cargo run` without a subcommand for the original **in-memory** REPL. Snapshot publication and recovery are exercised through the library API and tests; an operator CLI for snapshot scheduling is still pending.
+The `serve` process exits after `shutdown` on stdin or EOF. Run `cargo run` without a subcommand for the original **in-memory** REPL. A stopped primary can publish a snapshot with `cargo run -- snapshot --data ./data/primary`; see [snapshot operations](docs/snapshot-operations.md) for the locking and downtime requirements. Automatic scheduling is not implemented.
 
 For a local replica, copy the `cluster_id` printed by the primary at startup and start a separate process and data directory:
 
