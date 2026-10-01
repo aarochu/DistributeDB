@@ -31,7 +31,7 @@ To exercise disconnect, catch-up, and primary recovery:
 sh scripts/smoke_cluster.sh
 ```
 
-The smoke script verifies values on both replicas, stops replica 2, writes while it is offline, restarts it, waits for two connected replicas with zero reported lag, then restarts the primary and verifies an acknowledged value on all three nodes. CI runs the same script. A container stop can terminate the process without an orderly application shutdown; this tests process restart behavior, not physical power-loss durability.
+The smoke script verifies values on both replicas, stops replica 2, writes while it is offline, restarts it, waits for two connected replicas with zero reported lag, then restarts the primary and verifies an acknowledged value on all three nodes. CI runs the same script. Each service runs under Compose's `init` process, so a container stop delivers `SIGTERM` to the node and terminates it immediately, without an orderly application shutdown; this tests process restart behavior, not physical power-loss durability.
 
 The smoke script also publishes an offline primary snapshot after the first three writes. To repeat that step manually, stop the primary first so the data-directory lock is released:
 

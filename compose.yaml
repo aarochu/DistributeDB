@@ -1,6 +1,7 @@
 services:
   primary:
     build: .
+    init: true
     command:
       - serve
       - --addr
@@ -19,6 +20,7 @@ services:
       - cluster
   replica-1:
     build: .
+    init: true
     profiles: [replicas]
     depends_on: [primary]
     command:
@@ -39,6 +41,7 @@ services:
       - cluster
   replica-2:
     build: .
+    init: true
     profiles: [replicas]
     depends_on: [primary]
     command:
