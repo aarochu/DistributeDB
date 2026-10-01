@@ -152,12 +152,15 @@ fn run_operations(
     }
     let value = vec![b'x'; config.value_bytes];
     for index in 0..count {
-        let selected = (next_random(state) as usize) % config.keys;
+        let selected = key((next_random(state) as usize) % config.keys);
         let is_read = (next_random(state) % 10_000) < config.read_bps as u64;
+        // Build the request payload before timing so latency covers only the
+        // client round trip.
+        let payload = if is_read { Vec::new() } else { value.clone() };
         let started = Instant::now();
         let outcome = if is_read {
             result.reads += 1;
-            match client.get(key(selected)) {
+            match client.get(selected) {
                 Ok(Some(_)) => true,
                 Ok(None) => {
                     result.read_misses += 1;
@@ -167,7 +170,7 @@ fn run_operations(
             }
         } else {
             result.writes += 1;
-            matches!(client.set(key(selected), value.clone()), Ok(status) if write_ok(status, &config.durability))
+            matches!(client.set(selected, payload), Ok(status) if write_ok(status, &config.durability))
         };
         if outcome {
             result.succeeded += 1;
@@ -194,9 +197,18 @@ fn wait_replicas(client: &mut Client, count: usize) -> Result<(), String> {
     let deadline = Instant::now() + Duration::from_secs(30);
     loop {
         let stats = client.stats().map_err(|error| error.to_string())?;
-        if stats.contains(&format!("replicas_connected={count}"))
-            && stats.matches("_lag=0").count() == count
-        {
+        let fields: Vec<(&str, &str)> = stats
+            .lines()
+            .filter_map(|line| line.split_once('='))
+            .collect();
+        let connected = fields
+            .iter()
+            .any(|&(name, value)| name == "replicas_connected" && value == count.to_string());
+        let caught_up = fields
+            .iter()
+            .filter(|&&(name, value)| name.ends_with("_lag") && value == "0")
+            .count();
+        if connected && caught_up == count {
             return Ok(());
         }
         if Instant::now() >= deadline {

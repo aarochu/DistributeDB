@@ -33,7 +33,7 @@ for ratio in 0.9 0.5 0.1; do
       --value-bytes "$DDB_VALUE_BYTES" --seed "$seed" \
       --durability "$DDB_DURABILITY" --replicas "$DDB_REPLICAS" \
       --filesystem "$DDB_FILESYSTEM" --storage-medium "$DDB_STORAGE_MEDIUM" \
-      --topology "$DDB_TOPOLOGY" --output "$DDB_OUTPUT" "${extra[@]}"
+      --topology "$DDB_TOPOLOGY" --output "$DDB_OUTPUT" ${extra[@]+"${extra[@]}"}
   done
 done
 

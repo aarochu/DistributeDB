@@ -1,0 +1,29 @@
+name: Benchmarks
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - "src/bin/ddb_bench.rs"
+      - "benchmarks/*.sh"
+      - ".github/workflows/benchmarks.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  benchmark:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - name: Toolchain
+        run: rustc --version && cargo --version
+      - name: Run 90/10, 50/50, 10/90 mixes on three configurations
+        run: DDB_RESULTS_DIR=bench-out bash benchmarks/ci_benchmark.sh
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: benchmark-results
+          path: bench-out/
