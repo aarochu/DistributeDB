@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Run the SOW mixes against three local configurations on one host: an fsync
+# Run the SOW mixes against four local configurations on one host: an fsync
 # primary, a disposable os-durability primary, and an fsync primary with one
-# asynchronous replica. Rows are written to $DDB_RESULTS_DIR (default
+# or two asynchronous replicas. Rows are written to $DDB_RESULTS_DIR (default
 # benchmarks/results). Intended for CI runners; see docs/benchmarks.md.
 : "${DDB_RESULTS_DIR:=benchmarks/results}"
 : "${DDB_OPERATIONS:=20000}"
@@ -51,10 +51,12 @@ run_config() {
   if [[ "$replicas" -gt 0 ]]; then
     local cluster
     cluster=$(awk -F': ' '/^cluster ID:/ {print $2}' "$dir.log")
-    sleep infinity | "$bin" replica --primary-addr "127.0.0.1:$((port + 1))" \
-      --cluster-id "$cluster" --data "$work/$topology-replica" \
-      --allow-snapshot-rebootstrap >"$work/$topology-replica.log" 2>&1 &
-    pids+=("$!")
+    for ((index = 1; index <= replicas; index++)); do
+      sleep infinity | "$bin" replica --primary-addr "127.0.0.1:$((port + 1))" \
+        --cluster-id "$cluster" --data "$work/$topology-replica-$index" \
+        --allow-snapshot-rebootstrap >"$work/$topology-replica-$index.log" 2>&1 &
+      pids+=("$!")
+    done
   fi
   DDB_ADDR="127.0.0.1:$port" DDB_DURABILITY="$durability" \
     DDB_REPLICAS="$replicas" DDB_DATA_DIR="$dir" DDB_SERVER_PID="$primary_pid" \
@@ -68,3 +70,4 @@ run_config() {
 run_config fsync 0 one-primary 6100
 run_config os 0 one-primary-os 6200
 run_config fsync 1 primary-one-replica 6300
+run_config fsync 2 primary-two-replicas 6400
