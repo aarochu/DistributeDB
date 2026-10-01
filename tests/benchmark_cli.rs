@@ -2,7 +2,7 @@
 
 use std::process::Command;
 
-use distributedb::{Db, DurabilityMode, Server, ServerConfig, SimConfig, SimFs};
+use distributedb::{Client, Db, DurabilityMode, Server, ServerConfig, SimConfig, SimFs, Status};
 
 #[test]
 fn benchmark_records_successful_measured_operations() {
@@ -60,5 +60,26 @@ fn benchmark_records_successful_measured_operations() {
     assert_eq!(value("skipped_ops"), "0");
     assert!(value("p95_latency_ns").parse::<u64>().unwrap() > 0);
     std::fs::remove_file(output_path).unwrap();
+    server.shutdown();
+}
+
+#[test]
+fn os_durability_server_reports_volatile_writes() {
+    let fs = SimFs::new(SimConfig::new(92));
+    let db = Db::open(
+        fs,
+        std::path::Path::new("/benchmark-os"),
+        DurabilityMode::Os,
+    )
+    .unwrap();
+    let mut server = Server::start("127.0.0.1:0", db, ServerConfig::default()).unwrap();
+    let mut client = Client::connect(server.local_addr()).unwrap();
+    assert_eq!(
+        client.set(b"k".to_vec(), b"v".to_vec()).unwrap(),
+        Status::OkVolatile
+    );
+    assert_eq!(client.get(b"k".to_vec()).unwrap(), Some(b"v".to_vec()));
+    assert_eq!(client.delete(b"k".to_vec()).unwrap(), Status::OkVolatile);
+    drop(client);
     server.shutdown();
 }

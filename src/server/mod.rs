@@ -97,7 +97,7 @@ use crate::protocol::{
 };
 use crate::replication::{PeerProgress, ReplicationStats};
 use crate::storage::{GetResult, Mutation};
-use crate::wal::{Db, MAX_GROUP_BYTES, MAX_GROUP_RECORDS};
+use crate::wal::{Db, DurabilityMode, MAX_GROUP_BYTES, MAX_GROUP_RECORDS};
 
 /// Default maximum number of concurrent connections (Technical-Design §16, §5).
 pub const DEFAULT_MAX_CONNECTIONS: usize = 128;
@@ -335,6 +335,9 @@ struct Shared<F: FileSystem + Clone + Send + 'static> {
     config: ServerConfig,
     live_connections: AtomicUsize,
     shutdown: Arc<AtomicBool>,
+    /// Successful mutations answer `OK_VOLATILE` because the database runs in
+    /// benchmark-only `os` durability mode (Technical-Design §6.1).
+    volatile: bool,
 }
 
 impl Server {
@@ -370,6 +373,8 @@ impl Server {
         let shutdown = Arc::new(AtomicBool::new(false));
         let queue = Arc::new(WriteQueue::new(config.max_queue_depth));
 
+        let mode = db.read().expect("db read lock poisoned").durability_mode();
+        let volatile = mode == DurabilityMode::Os;
         let shared = Arc::new(Shared {
             db,
             metrics: Metrics::default(),
@@ -378,6 +383,7 @@ impl Server {
             config: config.clone(),
             live_connections: AtomicUsize::new(0),
             shutdown: Arc::clone(&shutdown),
+            volatile,
         });
 
         // Sequencer thread: single owner of the WAL append + group sync + apply.
@@ -628,7 +634,14 @@ where
     }
     // Block on the one-shot. We hold NO map lock here (deadlock rule, §5).
     match rx.recv() {
-        Ok(Ok(_lsn)) => Response::new(kind, Status::Ok, Vec::new()),
+        Ok(Ok(_lsn)) => {
+            let status = if shared.volatile {
+                Status::OkVolatile
+            } else {
+                Status::Ok
+            };
+            Response::new(kind, status, Vec::new())
+        }
         Ok(Err(status)) => Response::new(kind, status, Vec::new()),
         // The sequencer dropped the sender without responding (shutdown mid
         // flight): report unavailable.
