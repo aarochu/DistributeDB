@@ -568,6 +568,9 @@ where
         {
             return Err(SessionError::Fatal(diagnostic))
         }
+        Some(Message::Error { code, .. }) if code == protocol::ERROR_UNAVAILABLE => {
+            return Err(SessionError::Retry)
+        }
         _ => return Err(SessionError::Fatal("invalid primary HELLO_ACK".into())),
     }
     while !stop.load(Ordering::SeqCst) {
