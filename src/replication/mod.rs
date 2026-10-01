@@ -120,6 +120,21 @@ impl PrimaryListener {
         A: ToSocketAddrs,
         F: FileSystem + Clone + Send + Sync + 'static,
     {
+        Self::start_with_network(addr, db, stats, false)
+    }
+
+    /// Explicitly permit a non-loopback listener and peers for an isolated
+    /// local container network. The wire protocol has no authentication.
+    pub fn start_with_network<A, F>(
+        addr: A,
+        db: Arc<RwLock<Db<F>>>,
+        stats: Arc<ReplicationStats>,
+        allow_non_loopback: bool,
+    ) -> io::Result<Self>
+    where
+        A: ToSocketAddrs,
+        F: FileSystem + Clone + Send + Sync + 'static,
+    {
         {
             let guard = db.read().expect("db lock poisoned");
             if guard.identity().role != "primary"
@@ -133,7 +148,7 @@ impl PrimaryListener {
         }
         let listener = TcpListener::bind(addr)?;
         let local_addr = listener.local_addr()?;
-        if !local_addr.ip().is_loopback() {
+        if !allow_non_loopback && !local_addr.ip().is_loopback() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "Phase 5 replication must bind loopback",
@@ -149,7 +164,7 @@ impl PrimaryListener {
                 let mut workers: Vec<JoinHandle<()>> = Vec::new();
                 while !stop.load(Ordering::SeqCst) {
                     match listener.accept() {
-                        Ok((stream, peer)) if peer.ip().is_loopback() => {
+                        Ok((stream, peer)) if allow_non_loopback || peer.ip().is_loopback() => {
                             if active_connections.load(Ordering::SeqCst) >= MAX_CONNECTIONS {
                                 continue;
                             }
@@ -452,6 +467,15 @@ impl ReplicaRunner {
     where
         F: FileSystem + Clone + Send + Sync + 'static,
     {
+        Self::start_with_host(primary.to_string(), db)
+    }
+
+    /// Resolve the configured primary host on each retry so a restarted
+    /// container can be reached if its network address changes.
+    pub fn start_with_host<F>(primary: String, db: Arc<RwLock<Db<F>>>) -> io::Result<Self>
+    where
+        F: FileSystem + Clone + Send + Sync + 'static,
+    {
         {
             let guard = db.read().expect("db lock poisoned");
             if guard.identity().role != "replica"
@@ -471,7 +495,7 @@ impl ReplicaRunner {
             .name("ddb-replica".into())
             .spawn(move || {
                 while !stop.load(Ordering::SeqCst) {
-                    match replica_session(primary, &db, &stop) {
+                    match replica_session(&primary, &db, &stop) {
                         Ok(()) => {}
                         Err(SessionError::Retry) => {}
                         Err(SessionError::Fatal(error)) => {
@@ -516,15 +540,20 @@ enum SessionError {
 }
 
 fn replica_session<F>(
-    primary: SocketAddr,
+    primary: &str,
     db: &Arc<RwLock<Db<F>>>,
     stop: &AtomicBool,
 ) -> std::result::Result<(), SessionError>
 where
     F: FileSystem + Clone,
 {
-    let mut stream = TcpStream::connect_timeout(&primary, Duration::from_millis(500))
+    let addresses = primary
+        .to_socket_addrs()
         .map_err(|_| SessionError::Retry)?;
+    let mut stream = addresses
+        .filter_map(|address| TcpStream::connect_timeout(&address, Duration::from_millis(500)).ok())
+        .next()
+        .ok_or(SessionError::Retry)?;
     stream
         .set_read_timeout(Some(IO_TIMEOUT))
         .map_err(|_| SessionError::Retry)?;

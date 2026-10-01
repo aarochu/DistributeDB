@@ -1,0 +1,63 @@
+services:
+  primary:
+    build: .
+    command:
+      - serve
+      - --addr
+      - 0.0.0.0:5555
+      - --replication-addr
+      - 0.0.0.0:5556
+      - --allow-non-loopback-replication
+      - --run-forever
+      - --data
+      - /data
+    ports:
+      - "127.0.0.1:5555:5555"
+    volumes:
+      - primary-data:/data
+    networks:
+      - cluster
+  replica-1:
+    build: .
+    profiles: [replicas]
+    depends_on: [primary]
+    command:
+      - replica
+      - --primary-addr
+      - primary:5556
+      - --cluster-id
+      - "${DDB_CLUSTER_ID:-unset}"
+      - --data
+      - /data
+      - --allow-snapshot-rebootstrap
+      - --run-forever
+    volumes:
+      - replica-1-data:/data
+    networks:
+      - cluster
+  replica-2:
+    build: .
+    profiles: [replicas]
+    depends_on: [primary]
+    command:
+      - replica
+      - --primary-addr
+      - primary:5556
+      - --cluster-id
+      - "${DDB_CLUSTER_ID:-unset}"
+      - --data
+      - /data
+      - --allow-snapshot-rebootstrap
+      - --run-forever
+    volumes:
+      - replica-2-data:/data
+    networks:
+      - cluster
+
+networks:
+  cluster: {}
+
+volumes:
+  primary-data: {}
+  replica-1-data: {}
+  replica-2-data: {}

@@ -57,6 +57,8 @@ cargo run -- replica --primary-addr 127.0.0.1:5556 --cluster-id CLUSTER_ID --dat
 
 Use the same command with another directory for a second replica. The replication listener is bound to loopback and has no authentication. The replica process does not expose a client TCP listener yet.
 
+For a reproducible three-node Docker demo, use [the local cluster guide](docs/docker-cluster.md). It includes startup, catch-up and restart commands plus the current replica read limitation.
+
 ## Roadmap and verification
 
 | Phase | State |

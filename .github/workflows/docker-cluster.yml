@@ -1,0 +1,36 @@
+name: Docker cluster
+
+on:
+  pull_request:
+    paths:
+      - "Dockerfile"
+      - ".dockerignore"
+      - "compose.yaml"
+      - "scripts/start_cluster.sh"
+      - "scripts/smoke_cluster.sh"
+      - "src/main.rs"
+      - "src/replication/**"
+      - ".github/workflows/docker-cluster.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  cluster:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate Compose file
+        run: docker compose config --quiet
+      - name: Start three-node cluster
+        run: sh scripts/start_cluster.sh
+      - name: Test reconnect and primary recovery
+        run: sh scripts/smoke_cluster.sh
+      - name: Show logs on failure
+        if: failure()
+        run: docker compose --profile replicas logs --no-color --tail 100
+      - name: Remove test data
+        if: always()
+        run: docker compose --profile replicas down --volumes

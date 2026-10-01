@@ -108,11 +108,15 @@ fn serve_command(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let cluster_id = distributedb::replication::format_id(&db.identity().cluster_id);
     let shared = Arc::new(RwLock::new(db));
     let stats = Arc::new(ReplicationStats::default());
+    let allow_non_loopback = args
+        .iter()
+        .any(|arg| arg == "--allow-non-loopback-replication");
     let mut replication = if durability == DurabilityMode::Fsync {
-        Some(PrimaryListener::start(
+        Some(PrimaryListener::start_with_network(
             replication_addr.as_str(),
             Arc::clone(&shared),
             Arc::clone(&stats),
+            allow_non_loopback,
         )?)
     } else {
         None
@@ -137,6 +141,14 @@ fn serve_command(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     println!("cluster ID: {cluster_id}");
     println!("data directory: {data_dir}");
     println!("press Ctrl-D (EOF) on stdin to shut down");
+
+    // A container has no interactive stdin. SIGTERM may stop it immediately;
+    // acknowledged fsync writes remain recoverable through the WAL.
+    if args.iter().any(|arg| arg == "--run-forever") {
+        loop {
+            std::thread::sleep(std::time::Duration::from_secs(60));
+        }
+    }
 
     // Block until stdin closes (EOF) or a line is read, then shut down cleanly.
     let handle = server.shutdown_handle();
@@ -178,7 +190,6 @@ fn replica_command(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
 
     let primary =
         flag_value(args, "--primary-addr").ok_or("replica requires --primary-addr HOST:PORT")?;
-    let primary: std::net::SocketAddr = primary.parse()?;
     let data_dir = flag_value(args, "--data").ok_or("replica requires --data DIRECTORY")?;
     let cluster_hex =
         flag_value(args, "--cluster-id").ok_or("replica requires --cluster-id HEX")?;
@@ -199,10 +210,19 @@ fn replica_command(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         return Err("existing replica was provisioned without snapshot rebootstrap".into());
     }
     let shared = Arc::new(RwLock::new(db));
-    let mut runner = ReplicaRunner::start(primary, shared)?;
+    let mut runner = ReplicaRunner::start_with_host(primary.clone(), shared)?;
     println!("replica connecting to {primary}");
     println!("data directory: {data_dir}");
     println!("press Ctrl-D (EOF) or enter shutdown to stop");
+    if args.iter().any(|arg| arg == "--run-forever") {
+        loop {
+            if let Some(error) = runner.fatal_error() {
+                runner.shutdown();
+                return Err(error.into());
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+    }
     let (input_tx, input_rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
         let stdin = io::stdin();
@@ -239,6 +259,10 @@ fn replica_command(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
 fn client_command(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let addr = flag_value(args, "--addr").ok_or("client requires --addr HOST:PORT")?;
     let mut client = Client::connect(addr.as_str())?;
+    if args.iter().any(|arg| arg == "--stats") {
+        print!("{}", client.stats()?);
+        return Ok(());
+    }
 
     let stdin = io::stdin();
     let stdout = io::stdout();

@@ -1,0 +1,10 @@
+.git
+.github
+target
+data
+run
+tmp
+.env
+.env.*
+benchmarks/results
+*.log
