@@ -34,7 +34,7 @@ Limits on interpretation:
 Source: [`20261001T053120Z-ci.csv`](20261001T053120Z-ci.csv), produced by [workflow run 36820141192](https://github.com/aarochu/DistributeDB/actions/runs/36820141192). This is a separate runner allocation from the preceding table; compare topologies **within this run**, not throughput values across the two runs.
 
 - Host: GitHub-hosted `ubuntu-24.04` runner, Linux `6.17.0-1022-azure`, x86_64, ext4 reported by `df -T`. The storage device and mount options were not captured. Client, primary, and replicas shared one host and loopback network.
-- Build: release at recorded revision `41a2a69851f5839467a7658b2784df39dc888f71`, the pull-request test merge commit for the two-replica benchmark change. Each topology used a separate data directory.
+- Build: release at recorded revision `41a2a69851f5839467a7658b2784df39dc888f71`, the pull-request test merge commit for the two-replica benchmark change before it was rebased onto `main`. The rebase added only the offline `snapshot` CLI command; the benchmark binary, runner, and client/replication request paths were unchanged. Each topology used a separate data directory.
 - Workload: 32 clients, 10,000 prepopulated keys, 128-byte values, uniform key distribution, 2,000 warm-up and 20,000 measured operations per run. Three seeds per GET/SET mix and topology produced 36 rows. All rows report 20,000 successful operations, zero failures, zero skipped operations, zero read misses, and caught-up replicas at the post-run check.
 
 The table reports the median of three rows per cell. Throughput parentheses give the minimum and maximum; latency columns are medians of each row's successful-operation percentile, in microseconds.
