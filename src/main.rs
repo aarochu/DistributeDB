@@ -186,15 +186,29 @@ fn replica_command(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     println!("replica connecting to {primary}");
     println!("data directory: {data_dir}");
     println!("press Ctrl-D (EOF) or enter shutdown to stop");
-    let stdin = io::stdin();
-    let mut line = String::new();
-    loop {
-        line.clear();
-        match stdin.lock().read_line(&mut line) {
-            Ok(0) => break,
-            Ok(_) if line.trim() == "shutdown" => break,
-            Ok(_) => {}
-            Err(_) => break,
+    let (input_tx, input_rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let stdin = io::stdin();
+        let mut line = String::new();
+        loop {
+            line.clear();
+            let stop = match stdin.lock().read_line(&mut line) {
+                Ok(0) | Err(_) => true,
+                Ok(_) => line.trim() == "shutdown",
+            };
+            if stop {
+                let _ = input_tx.send(());
+                break;
+            }
+        }
+    });
+    while input_rx
+        .recv_timeout(std::time::Duration::from_millis(100))
+        .is_err()
+    {
+        if let Some(error) = runner.fatal_error() {
+            runner.shutdown();
+            return Err(error.into());
         }
     }
     runner.shutdown();
