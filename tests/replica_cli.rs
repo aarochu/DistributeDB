@@ -28,5 +28,8 @@ fn replica_rejects_malformed_primary_address_at_startup() {
             String::from_utf8_lossy(&output.stderr)
         );
     }
-    assert!(!data.exists(), "rejected replica created its data directory");
+    assert!(
+        !data.exists(),
+        "rejected replica created its data directory"
+    );
 }
