@@ -90,6 +90,11 @@ fn serve_command(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let addr = flag_value(args, "--addr").unwrap_or_else(|| "127.0.0.1:5555".to_string());
     let replication_addr =
         flag_value(args, "--replication-addr").unwrap_or_else(|| "127.0.0.1:5556".to_string());
+    let durability = match flag_value(args, "--durability").as_deref() {
+        None | Some("fsync") => DurabilityMode::Fsync,
+        Some("os") => DurabilityMode::Os,
+        Some(_) => return Err("--durability must be fsync or os".into()),
+    };
     let data_dir = flag_value(args, "--data").unwrap_or_else(|| {
         // Default under the OS temp dir so runtime data never lands in the repo
         // (.gitignore also excludes /data/, /run/, /tmp/, /target/).
@@ -99,26 +104,29 @@ fn serve_command(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
             .into_owned()
     });
 
-    let db = Db::open(
-        RealFs,
-        std::path::Path::new(&data_dir),
-        DurabilityMode::Fsync,
-    )?;
+    let db = Db::open(RealFs, std::path::Path::new(&data_dir), durability)?;
     let cluster_id = distributedb::replication::format_id(&db.identity().cluster_id);
     let shared = Arc::new(RwLock::new(db));
     let stats = Arc::new(ReplicationStats::default());
-    let mut replication = PrimaryListener::start(
-        replication_addr.as_str(),
-        Arc::clone(&shared),
-        Arc::clone(&stats),
-    )?;
+    let mut replication = if durability == DurabilityMode::Fsync {
+        Some(PrimaryListener::start(
+            replication_addr.as_str(),
+            Arc::clone(&shared),
+            Arc::clone(&stats),
+        )?)
+    } else {
+        None
+    };
     let config = ServerConfig {
-        replication_stats: Some(stats),
+        replication_stats: replication.as_ref().map(|_| stats),
         ..ServerConfig::default()
     };
     let server = Server::start_shared(addr.as_str(), shared, config)?;
     println!("DistributeDB listening on {}", server.local_addr());
-    println!("replication listening on {}", replication.local_addr());
+    if let Some(ref listener) = replication {
+        println!("replication listening on {}", listener.local_addr());
+    }
+    println!("durability: {}", if durability == DurabilityMode::Fsync { "fsync" } else { "os" });
     println!("cluster ID: {cluster_id}");
     println!("data directory: {data_dir}");
     println!("press Ctrl-D (EOF) on stdin to shut down");
@@ -138,7 +146,9 @@ fn serve_command(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     }
     handle.shutdown();
     drop(server); // joins acceptor + sequencer threads.
-    replication.shutdown();
+    if let Some(ref mut listener) = replication {
+        listener.shutdown();
+    }
     println!("shut down");
     Ok(())
 }

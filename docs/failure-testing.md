@@ -4,4 +4,6 @@
 
 Normal CI runs one seed. The [100-trial runner](../scripts/run_failure_trials.sh) changes the number of writes at each kill boundary using `DDB_FAILURE_SEED`. The **Process failure trials** GitHub workflow runs all 100 seeds on pull requests that change source, the test or the runner, and can also be dispatched manually. Its completion is a separate acceptance gate; the presence of the script or workflow alone does not establish that 100 trials have passed. Preserve the failing seed and logs if a trial fails.
 
+On 2026-10-01 UTC, [workflow run 36807244555](https://github.com/aarochu/DistributeDB/actions/runs/36807244555) passed all seeds 0–99 on `ubuntu-24.04` at revision `a682504`. The log contains 100 seed markers and ends at `99/99`. In those trials, the test found no missing acknowledged keys after replica and primary process kills and restarts. This result applies to the specific process-kill test and runner environment.
+
 The test models process termination. It does not prove that a storage device honors sync after loss of power. The simulated filesystem tests cover separately stated crash and torn-write models. A physical power-cut exercise on the [selected filesystem profile](ADR-001-Language-and-Filesystem.md) would be needed to make a stronger hardware durability claim.
