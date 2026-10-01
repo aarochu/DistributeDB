@@ -7,7 +7,12 @@ use distributedb::{Db, DurabilityMode, Server, ServerConfig, SimConfig, SimFs};
 #[test]
 fn benchmark_records_successful_measured_operations() {
     let fs = SimFs::new(SimConfig::new(91));
-    let db = Db::open(fs, std::path::Path::new("/benchmark"), DurabilityMode::Fsync).unwrap();
+    let db = Db::open(
+        fs,
+        std::path::Path::new("/benchmark"),
+        DurabilityMode::Fsync,
+    )
+    .unwrap();
     let mut server = Server::start("127.0.0.1:0", db, ServerConfig::default()).unwrap();
     let output_path = std::env::temp_dir().join(format!(
         "ddb-benchmark-test-{}-{}.csv",

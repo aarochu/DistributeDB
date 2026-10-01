@@ -126,7 +126,14 @@ fn serve_command(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     if let Some(ref listener) = replication {
         println!("replication listening on {}", listener.local_addr());
     }
-    println!("durability: {}", if durability == DurabilityMode::Fsync { "fsync" } else { "os" });
+    println!(
+        "durability: {}",
+        if durability == DurabilityMode::Fsync {
+            "fsync"
+        } else {
+            "os"
+        }
+    );
     println!("cluster ID: {cluster_id}");
     println!("data directory: {data_dir}");
     println!("press Ctrl-D (EOF) on stdin to shut down");
