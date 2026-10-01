@@ -19,7 +19,7 @@ jobs:
       - uses: actions/checkout@v4
       - name: Toolchain
         run: rustc --version && cargo --version
-      - name: Run 90/10, 50/50, 10/90 mixes on three configurations
+      - name: Run 90/10, 50/50, 10/90 mixes on four configurations
         run: DDB_RESULTS_DIR=bench-out bash benchmarks/ci_benchmark.sh
       - name: Upload results
         if: always()
