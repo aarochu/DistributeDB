@@ -547,9 +547,7 @@ fn replica_session<F>(
 where
     F: FileSystem + Clone,
 {
-    let addresses = primary
-        .to_socket_addrs()
-        .map_err(|_| SessionError::Retry)?;
+    let addresses = primary.to_socket_addrs().map_err(|_| SessionError::Retry)?;
     let mut stream = addresses
         .filter_map(|address| TcpStream::connect_timeout(&address, Duration::from_millis(500)).ok())
         .next()
