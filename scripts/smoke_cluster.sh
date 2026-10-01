@@ -6,6 +6,10 @@ client() {
     docker compose exec -T primary distributedb client --addr 127.0.0.1:5555
 }
 
+replica_client() {
+    docker compose exec -T "$1" distributedb client --addr 127.0.0.1:5555
+}
+
 stats() {
     docker compose exec -T primary distributedb client --addr 127.0.0.1:5555 --stats
 }
@@ -30,6 +34,19 @@ wait_for_replicas() {
 printf 'SET user:1 Aaron\nSET user:2 Alice\nSET user:3 Bob\n' | client \
     | grep -c '^OK$' | grep -qx 3
 wait_for_replicas
+for replica in replica-1 replica-2; do
+    actual=$(printf 'GET user:1\nGET user:2\nGET user:3\n' | replica_client "$replica")
+    expected=$(printf 'Aaron\nAlice\nBob')
+    if [ "$actual" != "$expected" ]; then
+        echo "$replica returned unexpected values: $actual" >&2
+        exit 1
+    fi
+    write_reply=$(printf 'SET replica:write forbidden\n' | replica_client "$replica")
+    case "$write_reply" in
+        *NotPrimary*) ;;
+        *) echo "$replica accepted or misreported a client write: $write_reply" >&2; exit 1 ;;
+    esac
+done
 
 # The primary is stopped while the offline snapshot command holds its data
 # directory lock. Restart it and require replicas to reconnect before testing
@@ -57,4 +74,7 @@ until printf 'GET user:5\n' | client 2>/dev/null | grep -qx Emma; do
     sleep 1
 done
 wait_for_replicas
+for replica in replica-1 replica-2; do
+    printf 'GET user:5\n' | replica_client "$replica" | grep -qx Emma
+done
 echo 'three-node reconnect and primary recovery smoke test passed'

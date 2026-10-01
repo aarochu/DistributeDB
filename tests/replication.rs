@@ -63,6 +63,12 @@ fn two_replicas_catch_up_after_one_disconnects() {
     ));
     let mut runner_a = ReplicaRunner::start(listener.local_addr(), Arc::clone(&replica_a)).unwrap();
     let mut runner_b = ReplicaRunner::start(listener.local_addr(), Arc::clone(&replica_b)).unwrap();
+    let mut replica_read_server = Server::start_shared(
+        "127.0.0.1:0",
+        Arc::clone(&replica_a),
+        ServerConfig::default(),
+    )
+    .unwrap();
     let mut client = Client::connect(server.local_addr()).unwrap();
 
     for index in 0..40 {
@@ -80,6 +86,19 @@ fn two_replicas_catch_up_after_one_disconnects() {
         replica_a.read().unwrap().last_applied_lsn() == 40
             && replica_b.read().unwrap().last_applied_lsn() == 40
     });
+    let mut replica_client = Client::connect(replica_read_server.local_addr()).unwrap();
+    assert_eq!(
+        replica_client.get(b"key-37".to_vec()).unwrap(),
+        Some(b"value-37".to_vec())
+    );
+    assert!(replica_client.exists(b"key-37".to_vec()).unwrap());
+    assert_eq!(
+        replica_client
+            .set(b"replica-write".to_vec(), b"denied".to_vec())
+            .unwrap(),
+        Status::NotPrimary
+    );
+    assert_eq!(replica_client.get(b"replica-write".to_vec()).unwrap(), None);
     assert_eq!(
         replica_a.read().unwrap().record_hash_at(40),
         primary_db.read().unwrap().record_hash_at(40)
@@ -119,6 +138,7 @@ fn two_replicas_catch_up_after_one_disconnects() {
     drop(client);
     runner_a.shutdown();
     runner_b.shutdown();
+    replica_read_server.shutdown();
     listener.shutdown();
     server.shutdown();
 }

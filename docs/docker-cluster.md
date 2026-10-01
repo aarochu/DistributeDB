@@ -16,7 +16,14 @@ printf 'SET user:1 Aaron\nSET user:2 Alice\nSET user:3 Bob\n' |
 docker compose exec -T primary distributedb client --addr 127.0.0.1:5555 --stats
 ```
 
-The `STATS` response reports connected replicas and their last acknowledged applied LSN. A zero reported lag means the primary has received an ACK through its sampled durable LSN; it is not a quorum commit. Live replicas do not yet expose a client read port, so this demo cannot independently query their maps. Replication integration tests verify replica contents directly.
+The `STATS` response reports connected replicas and their last acknowledged applied LSN. A zero reported lag means the primary has received an ACK through its sampled durable LSN; it is not a quorum commit. The Compose replicas expose read-only client listeners on their internal network. To query each replica independently:
+
+```sh
+printf 'GET user:1\n' | docker compose exec -T replica-1 distributedb client --addr 127.0.0.1:5555
+printf 'GET user:1\n' | docker compose exec -T replica-2 distributedb client --addr 127.0.0.1:5555
+```
+
+Replica reads are eventually consistent while replication lags. Client writes sent to a replica return `NOT_PRIMARY`. The replica client ports are not published on the host.
 
 To exercise disconnect, catch-up, and primary recovery:
 
@@ -24,7 +31,7 @@ To exercise disconnect, catch-up, and primary recovery:
 sh scripts/smoke_cluster.sh
 ```
 
-The smoke script stops replica 2, writes while it is offline, restarts it, waits for two connected replicas with zero reported lag, then restarts the primary and verifies an acknowledged value is still readable. CI runs the same script. A container stop can terminate the process without an orderly application shutdown; this tests process restart behavior, not physical power-loss durability.
+The smoke script verifies values on both replicas, stops replica 2, writes while it is offline, restarts it, waits for two connected replicas with zero reported lag, then restarts the primary and verifies an acknowledged value on all three nodes. CI runs the same script. A container stop can terminate the process without an orderly application shutdown; this tests process restart behavior, not physical power-loss durability.
 
 The smoke script also publishes an offline primary snapshot after the first three writes. To repeat that step manually, stop the primary first so the data-directory lock is released:
 

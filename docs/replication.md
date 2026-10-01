@@ -11,7 +11,7 @@ cargo run -- serve --addr 127.0.0.1:5555 --replication-addr 127.0.0.1:5556 --dat
 cargo run -- replica --primary-addr 127.0.0.1:5556 --cluster-id CLUSTER_ID --data ./data/replica-1 --allow-snapshot-rebootstrap
 ```
 
-The demo listener is unauthenticated and bound to loopback. Use a different data directory for every node. The replica process currently has no client listener.
+The demo listener is unauthenticated and bound to loopback. Use a different data directory for every node. A replica may add `--read-addr 127.0.0.1:5557` for a client read listener. Its `GET` and `EXISTS` responses reflect the replica's current applied prefix and may be stale; `SET` and `DELETE` return `NOT_PRIMARY`. Keep the read listener on loopback unless it is isolated on a trusted local container network.
 
 ## Reconnect decisions
 

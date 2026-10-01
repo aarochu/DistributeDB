@@ -236,8 +236,14 @@ fn replica_command(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         return Err("existing replica was provisioned without snapshot rebootstrap".into());
     }
     let shared = Arc::new(RwLock::new(db));
-    let mut runner = ReplicaRunner::start_with_host(primary.clone(), shared)?;
+    let mut runner = ReplicaRunner::start_with_host(primary.clone(), Arc::clone(&shared))?;
+    let mut read_server = flag_value(args, "--read-addr")
+        .map(|addr| Server::start_shared(addr.as_str(), shared, ServerConfig::default()))
+        .transpose()?;
     println!("replica connecting to {primary}");
+    if let Some(ref server) = read_server {
+        println!("replica reads listening on {}", server.local_addr());
+    }
     println!("data directory: {data_dir}");
     println!("press Ctrl-D (EOF) or enter shutdown to stop");
     if args.iter().any(|arg| arg == "--run-forever") {
@@ -275,6 +281,9 @@ fn replica_command(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         }
     }
     runner.shutdown();
+    if let Some(ref mut server) = read_server {
+        server.shutdown();
+    }
     if let Some(error) = runner.fatal_error() {
         return Err(error.into());
     }

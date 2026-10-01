@@ -27,6 +27,8 @@ services:
       - primary:5556
       - --cluster-id
       - "${DDB_CLUSTER_ID:-unset}"
+      - --read-addr
+      - 0.0.0.0:5555
       - --data
       - /data
       - --allow-snapshot-rebootstrap
@@ -45,6 +47,8 @@ services:
       - primary:5556
       - --cluster-id
       - "${DDB_CLUSTER_ID:-unset}"
+      - --read-addr
+      - 0.0.0.0:5555
       - --data
       - /data
       - --allow-snapshot-rebootstrap

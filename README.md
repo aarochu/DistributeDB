@@ -55,9 +55,9 @@ For a local replica, copy the `cluster_id` printed by the primary at startup and
 cargo run -- replica --primary-addr 127.0.0.1:5556 --cluster-id CLUSTER_ID --data ./data/replica-1 --allow-snapshot-rebootstrap
 ```
 
-Use the same command with another directory for a second replica. The replication listener is bound to loopback and has no authentication. The replica process does not expose a client TCP listener yet.
+Use the same command with another directory for a second replica. The replication listener is bound to loopback and has no authentication. Add `--read-addr 127.0.0.1:5557` to a replica command to expose optional eventually consistent reads on that port; writes sent there return `NOT_PRIMARY`.
 
-For a reproducible three-node Docker demo, use [the local cluster guide](docs/docker-cluster.md). It includes startup, catch-up and restart commands plus the current replica read limitation.
+For a reproducible three-node Docker demo, use [the local cluster guide](docs/docker-cluster.md). It includes startup, replica read checks, catch-up, and restart commands.
 
 ## Roadmap and verification
 
