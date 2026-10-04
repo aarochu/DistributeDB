@@ -56,6 +56,9 @@ impl FileSystem for SlowSyncFs {
     fn read(&self, path: &Path) -> FsResult<Vec<u8>> {
         self.inner.read(path)
     }
+    fn read_at(&self, path: &Path, offset: u64, len: usize) -> FsResult<Vec<u8>> {
+        self.inner.read_at(path, offset, len)
+    }
     fn exists(&self, path: &Path) -> bool {
         self.inner.exists(path)
     }

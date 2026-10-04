@@ -145,6 +145,11 @@ pub trait FileSystem {
     /// Read the entire contents of `path`.
     fn read(&self, path: &Path) -> FsResult<Vec<u8>>;
 
+    /// Read exactly `len` bytes of `path` starting at byte `offset`. Reading
+    /// past the end of the file is an error. SSTable lookups use this to read
+    /// one block instead of the whole file.
+    fn read_at(&self, path: &Path, offset: u64, len: usize) -> FsResult<Vec<u8>>;
+
     /// Report whether `path` currently exists.
     fn exists(&self, path: &Path) -> bool;
 
@@ -301,6 +306,15 @@ impl FileSystem for RealFs {
 
     fn read(&self, path: &Path) -> FsResult<Vec<u8>> {
         let bytes = std::fs::read(path)?;
+        Ok(bytes)
+    }
+
+    fn read_at(&self, path: &Path, offset: u64, len: usize) -> FsResult<Vec<u8>> {
+        use std::io::{Read, Seek, SeekFrom};
+        let mut file = std::fs::File::open(path)?;
+        file.seek(SeekFrom::Start(offset))?;
+        let mut bytes = vec![0; len];
+        file.read_exact(&mut bytes)?;
         Ok(bytes)
     }
 
@@ -768,6 +782,26 @@ impl FileSystem for SimFs {
         }
     }
 
+    fn read_at(&self, path: &Path, offset: u64, len: usize) -> FsResult<Vec<u8>> {
+        let g = self.inner.lock().expect("sim lock");
+        match g.files.get(path) {
+            Some(f) if !f.removed_volatile => {
+                let range = usize::try_from(offset)
+                    .ok()
+                    .and_then(|start| Some(start..start.checked_add(len)?))
+                    .filter(|range| range.end <= f.volatile.len());
+                match range {
+                    Some(range) => Ok(f.volatile[range].to_vec()),
+                    None => Err(FsError::Io(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        format!("read past the end of {}", path.display()),
+                    ))),
+                }
+            }
+            _ => Err(FsError::NotFound(path.to_path_buf())),
+        }
+    }
+
     fn exists(&self, path: &Path) -> bool {
         let g = self.inner.lock().expect("sim lock");
         let file_present = g
@@ -936,6 +970,32 @@ mod tests {
             fs.remove_file(&p("/nope")),
             Err(FsError::NotFound(_))
         ));
+    }
+
+    #[test]
+    fn read_at_returns_a_range_and_rejects_reads_past_the_end() {
+        let sim = SimFs::new(SimConfig::new(1));
+        sim.create_file(&p("/f")).unwrap();
+        sim.append(&p("/f"), b"0123456789").unwrap();
+        assert_eq!(sim.read_at(&p("/f"), 3, 4).unwrap(), b"3456");
+        assert_eq!(sim.read_at(&p("/f"), 10, 0).unwrap(), b"");
+        assert!(sim.read_at(&p("/f"), 8, 3).is_err());
+        assert!(matches!(
+            sim.read_at(&p("/missing"), 0, 1),
+            Err(FsError::NotFound(_))
+        ));
+
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("ddb-read-at-{}-{nanos}", std::process::id()));
+        let real = RealFs::new();
+        real.create_file(&path).unwrap();
+        real.append(&path, b"0123456789").unwrap();
+        assert_eq!(real.read_at(&path, 3, 4).unwrap(), b"3456");
+        assert!(real.read_at(&path, 8, 3).is_err());
+        std::fs::remove_file(&path).unwrap();
     }
 
     #[test]

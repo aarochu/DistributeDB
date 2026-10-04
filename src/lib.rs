@@ -30,6 +30,7 @@ pub mod checksum;
 pub mod client;
 pub mod command;
 pub mod fileio;
+pub mod lsm;
 pub mod protocol;
 pub mod replication;
 pub mod server;
