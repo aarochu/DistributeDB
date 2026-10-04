@@ -11,7 +11,7 @@
 pub mod protocol;
 
 use std::collections::HashMap;
-use std::io;
+use std::io::{self, BufReader, BufWriter, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
@@ -20,7 +20,7 @@ use std::time::{Duration, Instant};
 
 use crate::checksum::crc64_ecma;
 use crate::fileio::FileSystem;
-use crate::wal::{Db, DurabilityMode};
+use crate::wal::{Db, DurabilityMode, MAX_GROUP_RECORDS};
 use protocol::{read_message, write_message, Message};
 
 const IO_TIMEOUT: Duration = Duration::from_secs(2);
@@ -397,7 +397,7 @@ where
     while !shutdown.load(Ordering::SeqCst) {
         let next = {
             let guard = db.read().expect("db lock poisoned");
-            guard.durable_records_after(cursor, 1)
+            guard.durable_records_after(cursor, MAX_GROUP_RECORDS)
         };
         let Some(records) = next else {
             send_error(
@@ -407,34 +407,48 @@ where
             );
             return Err(protocol::Error::Invalid("required WAL was reclaimed"));
         };
-        if let Some(record) = records.into_iter().next() {
-            let expected_hash = record.record_hash();
-            write_message(
-                &mut stream,
-                &Message::Record {
-                    record: record.clone(),
-                    record_hash: expected_hash,
-                },
-            )?;
-            match read_message(&mut stream)? {
-                Some(Message::Ack {
-                    durable_lsn,
-                    applied_lsn,
-                    record_hash,
-                }) if durable_lsn == record.lsn
-                    && applied_lsn == record.lsn
-                    && record_hash == expected_hash =>
-                {
-                    cursor = record.lsn;
-                    stats.ack(replica_id, cursor);
+        if !records.is_empty() {
+            // Send up to one replica group's worth of records back to back,
+            // then read ACKs until the last is acknowledged. A replica may
+            // acknowledge a batch in several steps, one per local group.
+            let first_lsn = records[0].lsn;
+            let last_lsn = records[records.len() - 1].lsn;
+            let hashes: Vec<u64> = records.iter().map(|record| record.record_hash()).collect();
+            {
+                let mut out = BufWriter::new(&stream);
+                for (record, &record_hash) in records.into_iter().zip(&hashes) {
+                    write_message(
+                        &mut out,
+                        &Message::Record {
+                            record,
+                            record_hash,
+                        },
+                    )?;
                 }
-                _ => {
-                    send_error(
-                        &mut stream,
-                        protocol::ERROR_DIVERGED,
-                        "ACK does not match sent record",
-                    );
-                    return Err(protocol::Error::Invalid("invalid ACK"));
+                out.flush()?;
+            }
+            while cursor < last_lsn {
+                match read_message(&mut stream)? {
+                    Some(Message::Ack {
+                        durable_lsn,
+                        applied_lsn,
+                        record_hash,
+                    }) if durable_lsn > cursor
+                        && durable_lsn <= last_lsn
+                        && applied_lsn == durable_lsn
+                        && hashes[(durable_lsn - first_lsn) as usize] == record_hash =>
+                    {
+                        cursor = durable_lsn;
+                        stats.ack(replica_id, cursor);
+                    }
+                    _ => {
+                        send_error(
+                            &mut stream,
+                            protocol::ERROR_DIVERGED,
+                            "ACK does not match sent records",
+                        );
+                        return Err(protocol::Error::Invalid("invalid ACK"));
+                    }
                 }
             }
             continue;
@@ -600,17 +614,52 @@ where
         }
         _ => return Err(SessionError::Fatal("invalid primary HELLO_ACK".into())),
     }
+    // Buffer reads so records the primary has already sent can be applied
+    // together. Writes (ACKs) go directly to `stream`.
+    let mut reader = BufReader::with_capacity(
+        256 * 1024,
+        stream.try_clone().map_err(|_| SessionError::Retry)?,
+    );
+    let mut lookahead: Option<Message> = None;
     while !stop.load(Ordering::SeqCst) {
-        match read_message(&mut stream) {
+        let message = match lookahead.take() {
+            Some(message) => Ok(Some(message)),
+            None => read_message(&mut reader),
+        };
+        match message {
             Ok(Some(Message::Record {
                 record,
                 record_hash,
             })) => {
-                if record.record_hash() != record_hash {
+                // Gather the records already delivered into one local group;
+                // stop at a non-record message or when the buffer is empty.
+                let mut batch = vec![(record, record_hash)];
+                let mut disconnected = false;
+                while batch.len() < MAX_GROUP_RECORDS && !reader.buffer().is_empty() {
+                    match read_message(&mut reader) {
+                        Ok(Some(Message::Record {
+                            record,
+                            record_hash,
+                        })) => batch.push((record, record_hash)),
+                        Ok(Some(other)) => {
+                            lookahead = Some(other);
+                            break;
+                        }
+                        Ok(None) | Err(_) => {
+                            disconnected = true;
+                            break;
+                        }
+                    }
+                }
+                if batch
+                    .iter()
+                    .any(|(record, hash)| record.record_hash() != *hash)
+                {
                     return Err(SessionError::Fatal("record hash mismatch".into()));
                 }
+                let records: Vec<_> = batch.into_iter().map(|(record, _)| record).collect();
                 let mut guard = db.write().expect("db lock poisoned");
-                if let Err(error) = guard.apply_replicated_record(&record) {
+                if let Err(error) = guard.apply_replicated_records(&records) {
                     return Err(SessionError::Fatal(error.to_string()));
                 }
                 let durable_lsn = guard.last_durable_lsn();
@@ -626,6 +675,9 @@ where
                     },
                 )
                 .map_err(|_| SessionError::Retry)?;
+                if disconnected {
+                    return Err(SessionError::Retry);
+                }
             }
             Ok(Some(Message::Heartbeat { .. })) => {}
             Ok(Some(Message::SnapshotOffer {
@@ -653,7 +705,7 @@ where
                 }
                 let mut bytes = Vec::with_capacity(snapshot_bytes as usize);
                 while bytes.len() < snapshot_bytes as usize {
-                    match read_message(&mut stream) {
+                    match read_message(&mut reader) {
                         Ok(Some(Message::SnapshotChunk {
                             snapshot_lsn: chunk_lsn,
                             offset,
@@ -669,7 +721,7 @@ where
                         _ => return Err(SessionError::Fatal("invalid snapshot chunk".into())),
                     }
                 }
-                match read_message(&mut stream) {
+                match read_message(&mut reader) {
                     Ok(Some(Message::SnapshotDone {
                         snapshot_lsn: done_lsn,
                         snapshot_crc64: done_crc,

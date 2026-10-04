@@ -1968,34 +1968,70 @@ impl<F: FileSystem + Clone> Db<F> {
     /// have a different group footer, but its mutation bytes and hash chain
     /// must be identical. ACK only after this method returns successfully.
     pub fn apply_replicated_record(&mut self, record: &MutationRecord) -> WalResult<u64> {
+        self.apply_replicated_records(std::slice::from_ref(record))?;
+        Ok(record.lsn)
+    }
+
+    /// Accept a run of validated primary records on a replica, appending them
+    /// as local groups of up to [`MAX_GROUP_RECORDS`] records and
+    /// [`MAX_GROUP_BYTES`], each with one sync, instead of one sync per record.
+    /// Every record is checked for contiguity and identical bytes before any
+    /// is written. Records already applied must match local history and are
+    /// skipped. Returns the last applied LSN; ACK only after it returns.
+    pub fn apply_replicated_records(&mut self, records: &[MutationRecord]) -> WalResult<u64> {
         if self.wal.identity.role != "replica" {
             return Err(WalError::Identity(
                 "replicated records require a replica data directory".into(),
             ));
         }
-        if record.lsn <= self.last_applied_lsn {
-            return match self.record_hash_at(record.lsn) {
-                Some(hash) if hash == record.record_hash() => Ok(record.lsn),
-                _ => Err(WalError::Corruption("replicated history diverged".into())),
-            };
+        let mut next_lsn = self.wal.next_lsn;
+        let mut prev_hash = self.wal.last_record_hash;
+        let mut fresh: Vec<(Mutation, &MutationRecord)> = Vec::with_capacity(records.len());
+        for record in records {
+            if record.lsn <= self.last_applied_lsn {
+                match self.record_hash_at(record.lsn) {
+                    Some(hash) if hash == record.record_hash() => continue,
+                    _ => return Err(WalError::Corruption("replicated history diverged".into())),
+                }
+            }
+            if record.lsn != next_lsn || record.prev_hash != prev_hash {
+                return Err(WalError::Corruption(
+                    "replicated LSN or previous hash is not contiguous".into(),
+                ));
+            }
+            let mutation = record_to_mutation(record);
+            let expected = mutation_to_record(&mutation, next_lsn, prev_hash);
+            if expected.encode() != record.encode() {
+                return Err(WalError::Corruption(
+                    "replicated record bytes differ".into(),
+                ));
+            }
+            next_lsn += 1;
+            prev_hash = record.record_hash();
+            fresh.push((mutation, record));
         }
-        if record.lsn != self.wal.next_lsn || record.prev_hash != self.wal.last_record_hash {
-            return Err(WalError::Corruption(
-                "replicated LSN or previous hash is not contiguous".into(),
-            ));
+        let mut start = 0;
+        while start < fresh.len() {
+            let mut end = start;
+            let mut bytes = GROUP_FOOTER_LEN;
+            while end < fresh.len() && end - start < MAX_GROUP_RECORDS {
+                let len = fresh[end].1.encoded_len();
+                if end > start && bytes + len > MAX_GROUP_BYTES {
+                    break;
+                }
+                bytes += len;
+                end += 1;
+            }
+            let group: Vec<Mutation> = fresh[start..end].iter().map(|(m, _)| m.clone()).collect();
+            self.wal.append_group(&group)?;
+            for (mutation, record) in &fresh[start..end] {
+                self.engine.apply(mutation.clone());
+                self.last_applied_lsn = record.lsn;
+                self.retained_records.push(MutationRecord::clone(record));
+            }
+            start = end;
         }
-        let mutation = record_to_mutation(record);
-        let expected = mutation_to_record(&mutation, self.wal.next_lsn, self.wal.last_record_hash);
-        if expected.encode() != record.encode() {
-            return Err(WalError::Corruption(
-                "replicated record bytes differ".into(),
-            ));
-        }
-        let assigned = self.wal.append_group(std::slice::from_ref(&mutation))?;
-        self.engine.apply(mutation);
-        self.last_applied_lsn = assigned[0];
-        self.retained_records.push(record.clone());
-        Ok(assigned[0])
+        Ok(self.last_applied_lsn)
     }
 
     /// Look up `key` in the reconstructed engine.
