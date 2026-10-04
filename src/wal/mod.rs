@@ -49,7 +49,11 @@ pub mod format;
 pub mod snapshot;
 
 use crate::fileio::{FileSystem, FsError, FsResult};
-use crate::storage::{Mutation, StorageEngine};
+use crate::lsm::tree::{
+    CompactedTables, CompactionJob, FlushJob, LsmConfig, LsmTree, WrittenTable,
+};
+use crate::lsm::{LsmError, LsmResult};
+use crate::storage::{GetResult, Mutation, StorageEngine};
 use current::Current;
 use format::{
     DecodedRecord, FormatError, GroupFooter, MutationRecord, RecordType, SegmentHeader,
@@ -158,6 +162,16 @@ impl From<FsError> for WalError {
     }
 }
 
+impl From<LsmError> for WalError {
+    fn from(e: LsmError) -> Self {
+        match e {
+            LsmError::Fs(e) => WalError::Io(e),
+            LsmError::Corrupt(detail) => WalError::Corruption(format!("lsm: {detail}")),
+            LsmError::Usage(detail) => WalError::Corruption(format!("lsm misuse: {detail}")),
+        }
+    }
+}
+
 impl From<FormatError> for WalError {
     fn from(e: FormatError) -> Self {
         WalError::Format(e)
@@ -223,6 +237,14 @@ impl DataPaths {
         self.generation().join("wal")
     }
 
+    fn lsm_dir(&self) -> PathBuf {
+        self.generation().join("lsm")
+    }
+
+    fn storage_engine(&self) -> PathBuf {
+        self.root.join("STORAGE_ENGINE")
+    }
+
     fn snapshots_dir(&self) -> PathBuf {
         self.generation().join("snapshots")
     }
@@ -247,6 +269,32 @@ impl DataPaths {
     fn snapshot_tmp(&self, lsn: u64) -> PathBuf {
         self.tmp().join(format!("{lsn:020}.snap.tmp"))
     }
+}
+
+/// The persisted engine choice. Directories created before it existed have
+/// no `STORAGE_ENGINE` file and use the in-memory map.
+const ENGINE_LSM: u8 = 1;
+
+fn encode_storage_engine(kind: u8) -> [u8; 16] {
+    let mut bytes = [0u8; 16];
+    bytes[..8].copy_from_slice(b"DDBENG01");
+    bytes[8] = kind;
+    let crc = crate::checksum::crc32c(&bytes[..12]);
+    bytes[12..16].copy_from_slice(&crc.to_le_bytes());
+    bytes
+}
+
+fn decode_storage_engine(bytes: &[u8]) -> WalResult<u8> {
+    if bytes.len() != 16
+        || &bytes[..8] != b"DDBENG01"
+        || bytes[9..12] != [0; 3]
+        || bytes[8] != ENGINE_LSM
+        || u32::from_le_bytes(bytes[12..16].try_into().unwrap())
+            != crate::checksum::crc32c(&bytes[..12])
+    {
+        return Err(WalError::Identity("invalid STORAGE_ENGINE file".into()));
+    }
+    Ok(bytes[8])
 }
 
 fn encode_rebootstrap_policy(allowed: bool) -> [u8; 16] {
@@ -977,6 +1025,9 @@ pub struct OpenConfig {
     /// Provision a new replica to permit deliberate snapshot replacement when
     /// its old prefix is no longer verifiable. Persisted on first open.
     pub allow_snapshot_rebootstrap: bool,
+    /// Storage engine for the key/value map. Persisted when a directory is
+    /// created; reopening with a different engine is refused.
+    pub storage: StorageKind,
 }
 
 impl Default for OpenConfig {
@@ -986,7 +1037,81 @@ impl Default for OpenConfig {
             cluster_id: None,
             retention_budget_bytes: DEFAULT_RETENTION_BUDGET_BYTES,
             allow_snapshot_rebootstrap: false,
+            storage: StorageKind::Memory,
         }
+    }
+}
+
+/// Storage engine for the key/value map (SOW §16).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum StorageKind {
+    /// The in-memory hash map, rebuilt from snapshot and WAL on open.
+    #[default]
+    Memory,
+    /// The LSM tree. Its tables are the recovery base; the WAL after the last
+    /// flush is replayed into the memtable on open, and older WAL is deleted.
+    /// `durable` is taken from the database's durability mode.
+    Lsm(LsmConfig),
+}
+
+/// The map behind a [`Db`].
+#[derive(Debug)]
+enum Engine<F: FileSystem + Clone> {
+    Memory(StorageEngine),
+    Lsm(LsmTree<F>),
+}
+
+impl<F: FileSystem + Clone> Engine<F> {
+    fn apply(&mut self, mutation: Mutation) {
+        match self {
+            Engine::Memory(engine) => engine.apply(mutation),
+            Engine::Lsm(tree) => tree.apply(mutation),
+        }
+    }
+}
+
+/// LSM counters reported by `STATS`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LsmStats {
+    /// Approximate bytes in the mutable memtable.
+    pub memtable_bytes: usize,
+    /// Installed tables.
+    pub tables: usize,
+    /// Installed level-0 tables.
+    pub level_zero_tables: usize,
+    /// Bytes of installed table files.
+    pub table_bytes: u64,
+    /// Flushes installed by this process.
+    pub flushes: u64,
+    /// Compactions installed by this process.
+    pub compactions: u64,
+}
+
+/// A memtable flush started by [`Db::begin_lsm_flush`]. Write it without
+/// holding the database lock, then pass the result to
+/// [`Db::finish_lsm_flush`].
+pub struct LsmFlush<F: FileSystem> {
+    job: FlushJob<F>,
+}
+
+impl<F: FileSystem> LsmFlush<F> {
+    /// Encode, publish, and verify the table.
+    pub fn write(&self) -> LsmResult<WrittenTable> {
+        self.job.write()
+    }
+}
+
+/// A compaction started by [`Db::begin_lsm_compaction`]. Write it without
+/// holding the database lock, then pass the result to
+/// [`Db::finish_lsm_compaction`].
+pub struct LsmCompaction<F: FileSystem> {
+    job: CompactionJob<F>,
+}
+
+impl<F: FileSystem> LsmCompaction<F> {
+    /// Merge the inputs and publish the output tables.
+    pub fn write(&self) -> LsmResult<CompactedTables> {
+        self.job.write()
     }
 }
 
@@ -1002,8 +1127,8 @@ impl Default for OpenConfig {
 /// footer-closed mutation through [`StorageEngine::apply`], then exposes a
 /// durable write path ([`Db::set`], [`Db::delete`]) that appends to the WAL,
 /// group-commits, applies, and only then returns.
-pub struct Db<F: FileSystem> {
-    engine: StorageEngine,
+pub struct Db<F: FileSystem + Clone> {
+    engine: Engine<F>,
     wal: Wal<F>,
     last_applied_lsn: u64,
     /// Footer-closed records since the active snapshot boundary. These are
@@ -1027,6 +1152,9 @@ pub struct Db<F: FileSystem> {
     /// Stale recovery generations this process has removed (see
     /// [`Db::remove_stale_generations`]).
     generations_removed: u64,
+    /// LSM flushes and compactions installed by this process.
+    lsm_flushes: u64,
+    lsm_compactions: u64,
     /// Bounded disk budget for retained recovery data (snapshots + retained
     /// WAL). Reaching it pauses new snapshots' reclamation with
     /// [`WalError::ResourceExhausted`] (Technical-Design §7).
@@ -1163,6 +1291,15 @@ impl<F: FileSystem + Clone> Db<F> {
             Self::init_fresh(&fs, &paths, mode, config)?
         };
 
+        let stored_lsm = fs.exists(&paths.storage_engine())
+            && decode_storage_engine(&fs.read(&paths.storage_engine())?)? == ENGINE_LSM;
+        if stored_lsm != matches!(config.storage, StorageKind::Lsm(_)) {
+            let stored = if stored_lsm { "lsm" } else { "memory" };
+            return Err(WalError::Identity(format!(
+                "data directory uses the {stored} storage engine"
+            )));
+        }
+
         let allow_snapshot_rebootstrap = if identity.role == "replica" {
             if fs.exists(&paths.rebootstrap_policy()) {
                 decode_rebootstrap_policy(&fs.read(&paths.rebootstrap_policy())?)?
@@ -1195,19 +1332,43 @@ impl<F: FileSystem + Clone> Db<F> {
             ));
         }
 
-        // Recover by loading the chosen snapshot (if any) and replaying the
-        // contiguous footer-closed WAL tail after the snapshot boundary.
-        let outcome = Self::recover(&fs, &paths, &identity, mode)?;
-
-        // Start from the snapshot map (empty when no snapshot qualified), then
-        // replay post-snapshot records in order.
-        let mut engine = StorageEngine::new();
-        for (key, value) in &outcome.snapshot_pairs {
-            engine.apply(Mutation::Set {
-                key: key.clone(),
-                value: value.clone(),
-            });
-        }
+        // Recover the map's base, then replay the contiguous footer-closed WAL
+        // tail after it. The in-memory map starts from the chosen snapshot
+        // (empty when none qualified); the LSM tree starts from its installed
+        // tables, which cover the WAL up to their flush boundary.
+        let (outcome, mut engine) = match config.storage {
+            StorageKind::Memory => {
+                let outcome = Self::recover(&fs, &paths, &identity, mode)?;
+                let mut engine = StorageEngine::new();
+                for (key, value) in &outcome.snapshot_pairs {
+                    engine.apply(Mutation::Set {
+                        key: key.clone(),
+                        value: value.clone(),
+                    });
+                }
+                (outcome, Engine::Memory(engine))
+            }
+            StorageKind::Lsm(lsm_config) => {
+                let tree = LsmTree::open(
+                    fs.clone(),
+                    &paths.lsm_dir(),
+                    &paths.tmp(),
+                    LsmConfig {
+                        durable: mode == DurabilityMode::Fsync,
+                        ..lsm_config
+                    },
+                )?;
+                let outcome = Self::recover_from_lsm_base(
+                    &fs,
+                    &paths,
+                    &identity,
+                    mode,
+                    tree.flushed_lsn(),
+                    tree.flushed_hash(),
+                )?;
+                (outcome, Engine::Lsm(tree))
+            }
+        };
         let mut last_applied_lsn = outcome.snapshot_lsn;
         for rec in &outcome.records {
             engine.apply(record_to_mutation(rec));
@@ -1260,6 +1421,8 @@ impl<F: FileSystem + Clone> Db<F> {
             records_replayed: outcome.records.len() as u64,
             recovery_duration: recovery_started.elapsed(),
             generations_removed,
+            lsm_flushes: 0,
+            lsm_compactions: 0,
             retention_budget_bytes: config.retention_budget_bytes,
             allow_snapshot_rebootstrap,
             _lock: lock,
@@ -1303,6 +1466,13 @@ impl<F: FileSystem + Clone> Db<F> {
             node_id: generate_id(0x0D),
             role: config.role.as_str().to_string(),
         };
+        // Record the engine before IDENTITY, whose presence marks a
+        // completed initialization.
+        let lsm = matches!(config.storage, StorageKind::Lsm(_));
+        if lsm {
+            fs.create_file(&paths.storage_engine())?;
+            fs.append(&paths.storage_engine(), &encode_storage_engine(ENGINE_LSM))?;
+        }
         // Write IDENTITY durably.
         fs.create_file(&paths.identity())?;
         fs.append(&paths.identity(), &identity.encode())?;
@@ -1329,6 +1499,9 @@ impl<F: FileSystem + Clone> Db<F> {
         fs.append(&seg, &header.encode())?;
 
         if mode == DurabilityMode::Fsync {
+            if lsm {
+                fs.sync_file(&paths.storage_engine())?;
+            }
             fs.sync_file(&paths.identity())?;
             if config.role == NodeRole::Replica {
                 fs.sync_file(&paths.rebootstrap_policy())?;
@@ -1352,13 +1525,8 @@ impl<F: FileSystem + Clone> Db<F> {
     /// be entirely footer-closed (interior corruption fails closed). The newest
     /// segment is the ACTIVE one: a final unclosed/torn group is discarded and
     /// the segment truncated at the last valid footer (`tail_truncated`).
-    fn recover(
-        fs: &F,
-        paths: &DataPaths,
-        identity: &Identity,
-        mode: DurabilityMode,
-    ) -> WalResult<RecoveryOutcome> {
-        // Enumerate segments and order them by their embedded first LSN.
+    /// First LSNs of the WAL segments, ascending.
+    fn segment_first_lsns(fs: &F, paths: &DataPaths) -> WalResult<Vec<u64>> {
         let mut segment_lsns: Vec<u64> = Vec::new();
         for name in fs.list_dir(&paths.wal_dir())? {
             if let Some(stem) = name.strip_suffix(".wal") {
@@ -1368,6 +1536,53 @@ impl<F: FileSystem + Clone> Db<F> {
             }
         }
         segment_lsns.sort_unstable();
+        Ok(segment_lsns)
+    }
+
+    /// Recovery for the LSM engine: the installed tables are the base, so
+    /// replay the WAL that continues from their flush boundary. Each flush
+    /// starts a WAL segment right after its boundary, so the chain must exist;
+    /// its absence is corruption, not a reason to fall back.
+    fn recover_from_lsm_base(
+        fs: &F,
+        paths: &DataPaths,
+        identity: &Identity,
+        mode: DurabilityMode,
+        base_lsn: u64,
+        base_hash: u64,
+    ) -> WalResult<RecoveryOutcome> {
+        let segment_lsns = Self::segment_first_lsns(fs, paths)?;
+        let tail =
+            Self::scan_wal_tail(fs, paths, identity, &segment_lsns, mode, base_lsn, base_hash)?
+                .ok_or_else(|| {
+                    WalError::Corruption(format!(
+                        "the WAL does not continue from the LSM flush boundary {base_lsn}"
+                    ))
+                })?;
+        let last_record_hash = if tail.records.is_empty() {
+            base_hash
+        } else {
+            tail.last_record_hash
+        };
+        Ok(RecoveryOutcome {
+            snapshot_lsn: base_lsn,
+            snapshot_pairs: Vec::new(),
+            records: tail.records,
+            last_record_hash,
+            tail_truncated: tail.tail_truncated,
+            active_segment_first_lsn: tail.active_segment_first_lsn,
+            active_segment_valid_len: tail.active_segment_valid_len,
+        })
+    }
+
+    fn recover(
+        fs: &F,
+        paths: &DataPaths,
+        identity: &Identity,
+        mode: DurabilityMode,
+    ) -> WalResult<RecoveryOutcome> {
+        // Enumerate segments and order them by their embedded first LSN.
+        let segment_lsns = Self::segment_first_lsns(fs, paths)?;
 
         // Enumerate verified-candidate snapshots, ordered by LSN descending so
         // we prefer the newest recoverable state (Technical-Design §7, §9.3).
@@ -1664,6 +1879,9 @@ impl<F: FileSystem + Clone> Db<F> {
         self.engine.apply(m);
         self.last_applied_lsn = lsn;
         self.retained_records.push(rec);
+        // The write is durable and applied. A maintenance failure makes the
+        // node fail closed, so later writes report it.
+        let _ = self.maintain_lsm();
         Ok(lsn)
     }
 
@@ -1693,7 +1911,10 @@ impl<F: FileSystem + Clone> Db<F> {
         }
         let pending = self.begin_group(muts)?;
         let synced = pending.sync();
-        self.finish_group(pending, muts, synced)
+        let assigned = self.finish_group(pending, muts, synced)?;
+        // As in `apply_durable`, a maintenance failure fails closed.
+        let _ = self.maintain_lsm();
+        Ok(assigned)
     }
 
     /// First half of [`Db::apply_group`]: append `muts` to the WAL without
@@ -1782,6 +2003,24 @@ impl<F: FileSystem + Clone> Db<F> {
         if self.snapshot_lsn == 0 {
             return Ok(None);
         }
+        if let Engine::Lsm(tree) = &self.engine {
+            // The LSM base is its installed tables, which hold exactly the
+            // state at the flush boundary; encode them as a snapshot image.
+            let pairs = tree.table_pairs()?;
+            let bytes = snapshot::encode(
+                self.wal.identity.cluster_id,
+                self.snapshot_lsn,
+                self.snapshot_hash,
+                &pairs,
+            );
+            let crc64 = u64::from_le_bytes(bytes[bytes.len() - 8..].try_into().unwrap());
+            return Ok(Some(ReplicationSnapshot {
+                bytes,
+                lsn: self.snapshot_lsn,
+                record_hash: self.snapshot_hash,
+                crc64,
+            }));
+        }
         let bytes = self
             .wal
             .fs
@@ -1848,10 +2087,27 @@ impl<F: FileSystem + Clone> Db<F> {
         let fs = &self.wal.fs;
         fs.create_dir_all(&paths.wal_dir())?;
         fs.create_dir_all(&paths.snapshots_dir())?;
-        let snapshot_path = paths.snapshot(expected_lsn);
-        fs.create_file(&snapshot_path)?;
-        fs.append(&snapshot_path, bytes)?;
-        fs.sync_file(&snapshot_path)?;
+        // The new generation's base: a snapshot file for the in-memory map,
+        // or a tree holding the image as its first table for the LSM engine.
+        let engine = match &self.engine {
+            Engine::Memory(_) => {
+                let snapshot_path = paths.snapshot(expected_lsn);
+                fs.create_file(&snapshot_path)?;
+                fs.append(&snapshot_path, bytes)?;
+                fs.sync_file(&snapshot_path)?;
+                let mut engine = StorageEngine::new();
+                for (key, value) in decoded.pairs {
+                    engine.apply(Mutation::Set { key, value });
+                }
+                Engine::Memory(engine)
+            }
+            Engine::Lsm(old) => {
+                let mut tree =
+                    LsmTree::open(fs.clone(), &paths.lsm_dir(), &paths.tmp(), old.config())?;
+                tree.ingest(decoded.pairs, expected_lsn, expected_hash)?;
+                Engine::Lsm(tree)
+            }
+        };
         let segment_path = paths.segment(next_lsn);
         let header = SegmentHeader {
             cluster_id: self.wal.identity.cluster_id,
@@ -1885,10 +2141,6 @@ impl<F: FileSystem + Clone> Db<F> {
             return Err(error.into());
         }
 
-        let mut engine = StorageEngine::new();
-        for (key, value) in decoded.pairs {
-            engine.apply(Mutation::Set { key, value });
-        }
         self.engine = engine;
         self.wal.paths = paths;
         self.wal.next_lsn = next_lsn;
@@ -1942,7 +2194,7 @@ impl<F: FileSystem + Clone> Db<F> {
             above = id;
         }
         for paths in &stale {
-            for dir in [paths.wal_dir(), paths.snapshots_dir()] {
+            for dir in [paths.wal_dir(), paths.snapshots_dir(), paths.lsm_dir()] {
                 for name in fs.list_dir(&dir)? {
                     fs.remove_file(&dir.join(name))?;
                 }
@@ -2031,17 +2283,190 @@ impl<F: FileSystem + Clone> Db<F> {
             }
             start = end;
         }
+        // As in `apply_durable`, a maintenance failure fails closed.
+        let _ = self.maintain_lsm();
         Ok(self.last_applied_lsn)
     }
 
-    /// Look up `key` in the reconstructed engine.
-    pub fn get(&self, key: &[u8]) -> crate::storage::GetResult {
-        self.engine.get(key)
+    /// Look up `key`. The LSM engine reads tables from disk, so a lookup can
+    /// fail; servers use this rather than [`Db::get`].
+    pub fn try_get(&self, key: &[u8]) -> WalResult<GetResult> {
+        match &self.engine {
+            Engine::Memory(engine) => Ok(engine.get(key)),
+            Engine::Lsm(tree) => Ok(match tree.get(key)? {
+                Some(value) => GetResult::Found(value),
+                None => GetResult::NotFound,
+            }),
+        }
     }
 
-    /// Whether `key` exists.
+    /// Whether `key` exists; fallible like [`Db::try_get`].
+    pub fn try_exists(&self, key: &[u8]) -> WalResult<bool> {
+        match &self.engine {
+            Engine::Memory(engine) => Ok(engine.exists(key)),
+            Engine::Lsm(tree) => Ok(tree.get(key)?.is_some()),
+        }
+    }
+
+    /// Look up `key`. Panics if the LSM engine cannot read a table; use
+    /// [`Db::try_get`] where that must be handled.
+    pub fn get(&self, key: &[u8]) -> GetResult {
+        self.try_get(key)
+            .unwrap_or_else(|error| panic!("storage read failed: {error}"))
+    }
+
+    /// Whether `key` exists. Panics like [`Db::get`].
     pub fn exists(&self, key: &[u8]) -> bool {
-        self.engine.exists(key)
+        self.try_exists(key)
+            .unwrap_or_else(|error| panic!("storage read failed: {error}"))
+    }
+
+    /// `"memory"` or `"lsm"`.
+    pub fn storage_engine(&self) -> &'static str {
+        match self.engine {
+            Engine::Memory(_) => "memory",
+            Engine::Lsm(_) => "lsm",
+        }
+    }
+
+    /// LSM counters, or `None` for the in-memory engine.
+    pub fn lsm_stats(&self) -> Option<LsmStats> {
+        let Engine::Lsm(tree) = &self.engine else {
+            return None;
+        };
+        Some(LsmStats {
+            memtable_bytes: tree.memtable_bytes(),
+            tables: tree.tables().count(),
+            level_zero_tables: tree.level_zero_tables(),
+            table_bytes: tree.table_bytes(),
+            flushes: self.lsm_flushes,
+            compactions: self.lsm_compactions,
+        })
+    }
+
+    /// Start a memtable flush if the LSM memtable is full: rotate the WAL so
+    /// a segment begins after the boundary, then freeze the memtable. Call
+    /// between groups; the returned job is written without the database lock.
+    /// Any error makes the node fail closed.
+    pub fn begin_lsm_flush(&mut self) -> WalResult<Option<LsmFlush<F>>> {
+        let Engine::Lsm(tree) = &mut self.engine else {
+            return Ok(None);
+        };
+        if self.wal.failed || !tree.should_flush() {
+            return Ok(None);
+        }
+        if let Err(error) = self.wal.ensure_idle() {
+            self.wal.failed = true;
+            return Err(error);
+        }
+        if self.wal.next_lsn != self.wal.active_first_lsn {
+            if let Err(error) = self.wal.rotate() {
+                self.wal.failed = true;
+                return Err(error);
+            }
+        }
+        match tree.freeze(self.last_applied_lsn, self.wal.last_record_hash) {
+            Ok(job) => Ok(job.map(|job| LsmFlush { job })),
+            Err(error) => {
+                self.wal.failed = true;
+                Err(error.into())
+            }
+        }
+    }
+
+    /// Install a written flush: list the table, advance the replication
+    /// history base to its boundary, and delete WAL segments it covers. A
+    /// replica behind the new boundary receives a table image instead of
+    /// records. Any error makes the node fail closed; the WAL still holds
+    /// every flushed mutation.
+    pub fn finish_lsm_flush(&mut self, written: LsmResult<WrittenTable>) -> WalResult<()> {
+        let Engine::Lsm(tree) = &mut self.engine else {
+            return Err(WalError::Corruption("no LSM flush is in progress".into()));
+        };
+        if let Err(error) = written.and_then(|table| tree.install(table)) {
+            self.wal.failed = true;
+            return Err(error.into());
+        }
+        let (base, hash) = (tree.flushed_lsn(), tree.flushed_hash());
+        self.lsm_flushes += 1;
+        self.advance_history_base(base, hash);
+        let reclaimed = self.reclaim_wal_through(base);
+        if reclaimed.is_err() {
+            self.wal.failed = true;
+        }
+        reclaimed
+    }
+
+    /// Start a compaction if level 0 has reached its trigger.
+    pub fn begin_lsm_compaction(&mut self) -> Option<LsmCompaction<F>> {
+        let Engine::Lsm(tree) = &mut self.engine else {
+            return None;
+        };
+        if self.wal.failed {
+            return None;
+        }
+        tree.plan_compaction().map(|job| LsmCompaction { job })
+    }
+
+    /// Install a written compaction. Any error makes the node fail closed.
+    pub fn finish_lsm_compaction(&mut self, compacted: LsmResult<CompactedTables>) -> WalResult<()> {
+        let Engine::Lsm(tree) = &mut self.engine else {
+            return Err(WalError::Corruption("no LSM compaction is in progress".into()));
+        };
+        match compacted.and_then(|tables| tree.install_compaction(tables)) {
+            Ok(()) => {
+                self.lsm_compactions += 1;
+                Ok(())
+            }
+            Err(error) => {
+                tree.abort_compaction();
+                self.wal.failed = true;
+                Err(error.into())
+            }
+        }
+    }
+
+    /// Run any due LSM flush and compaction synchronously. Library callers
+    /// and replicas use this; the server runs the slow steps without the
+    /// database lock instead.
+    pub fn maintain_lsm(&mut self) -> WalResult<()> {
+        if let Some(flush) = self.begin_lsm_flush()? {
+            let written = flush.write();
+            self.finish_lsm_flush(written)?;
+        }
+        if let Some(compaction) = self.begin_lsm_compaction() {
+            let compacted = compaction.write();
+            self.finish_lsm_compaction(compacted)?;
+        }
+        Ok(())
+    }
+
+    /// Drop replication history at or below `base`, which is now covered by
+    /// the LSM tables.
+    fn advance_history_base(&mut self, base: u64, hash: u64) {
+        let covered = usize::try_from(base.saturating_sub(self.snapshot_lsn))
+            .unwrap_or(usize::MAX)
+            .min(self.retained_records.len());
+        self.retained_records.drain(..covered);
+        self.snapshot_lsn = base;
+        self.snapshot_hash = hash;
+    }
+
+    /// Delete WAL segments that hold only records at or below `base`. The
+    /// flush rotated the WAL at the boundary, so every segment starting at or
+    /// below it ends at or below it.
+    fn reclaim_wal_through(&mut self, base: u64) -> WalResult<()> {
+        let mut removed = false;
+        for first_lsn in Self::segment_first_lsns(&self.wal.fs, &self.wal.paths)? {
+            if first_lsn <= base && first_lsn != self.wal.active_first_lsn {
+                self.wal.fs.remove_file(&self.wal.paths.segment(first_lsn))?;
+                removed = true;
+            }
+        }
+        if removed && self.wal.mode == DurabilityMode::Fsync {
+            self.wal.fs.sync_dir(&self.wal.paths.wal_dir())?;
+        }
+        Ok(())
     }
 
     /// The highest LSN applied to the engine.
@@ -2140,6 +2565,12 @@ impl<F: FileSystem + Clone> Db<F> {
     ///
     /// [`last_applied_lsn`]: Db::last_applied_lsn
     pub fn publish_snapshot(&mut self) -> WalResult<u64> {
+        let Engine::Memory(engine) = &self.engine else {
+            return Err(WalError::Identity(
+                "the LSM engine checkpoints by flushing tables, not by snapshots".into(),
+            ));
+        };
+        let pairs = engine.snapshot_pairs();
         self.wal.ensure_idle()?;
         if self.wal.is_failed() {
             return Err(WalError::FailClosed);
@@ -2148,7 +2579,6 @@ impl<F: FileSystem + Clone> Db<F> {
         // (1) Clone the map pairs and capture the boundary hash at S.
         let s = self.last_applied_lsn;
         let record_hash_at_lsn = self.wal.last_record_hash;
-        let pairs = self.engine.snapshot_pairs();
         let cluster_id = self.wal.identity.cluster_id;
         let mode = self.wal.mode;
 
@@ -2342,14 +2772,31 @@ impl<F: FileSystem + Clone> Db<F> {
         Ok(())
     }
 
-    /// Number of keys currently stored.
+    /// Number of keys currently stored. For the LSM engine this merges every
+    /// table, so it panics on a read failure and costs a full scan; `STATS`
+    /// uses [`Db::approximate_len`].
     pub fn len(&self) -> usize {
-        self.engine.len()
+        match &self.engine {
+            Engine::Memory(engine) => engine.len(),
+            Engine::Lsm(tree) => tree
+                .live_pairs()
+                .unwrap_or_else(|error| panic!("storage read failed: {error}"))
+                .len(),
+        }
     }
 
     /// Whether the engine holds no keys.
     pub fn is_empty(&self) -> bool {
-        self.engine.is_empty()
+        self.len() == 0
+    }
+
+    /// The exact key count for the in-memory map; for the LSM engine an upper
+    /// bound that counts versions and tombstones not yet compacted away.
+    pub fn approximate_len(&self) -> u64 {
+        match &self.engine {
+            Engine::Memory(engine) => engine.len() as u64,
+            Engine::Lsm(tree) => tree.approx_key_count(),
+        }
     }
 }
 
