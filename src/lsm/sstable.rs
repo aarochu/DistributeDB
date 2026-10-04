@@ -466,13 +466,9 @@ impl SsTable {
         let footer_offset = file_len - FOOTER_LEN as u64;
         let footer = Footer::decode(&fs.read_at(path, footer_offset, FOOTER_LEN)?)
             .map_err(|detail| corrupt(&detail))?;
-        let sections_fit = footer
-            .index_offset
-            .checked_add(u64::from(footer.index_len))
+        let sections_fit = footer.index_offset.checked_add(u64::from(footer.index_len))
             == Some(footer_offset)
-            && footer
-                .bloom_offset
-                .checked_add(u64::from(footer.bloom_len))
+            && footer.bloom_offset.checked_add(u64::from(footer.bloom_len))
                 == Some(footer.index_offset);
         if !sections_fit || footer.bloom_len == 0 {
             return Err(corrupt("section offsets do not match the file length"));
@@ -560,8 +556,9 @@ impl SsTable {
 
     fn read_block<F: FileSystem>(&self, fs: &F, block: usize) -> LsmResult<Vec<(Vec<u8>, Entry)>> {
         let handle = &self.index[block];
-        let corrupt =
-            |detail: &str| LsmError::Corrupt(format!("{} block {block}: {detail}", self.path.display()));
+        let corrupt = |detail: &str| {
+            LsmError::Corrupt(format!("{} block {block}: {detail}", self.path.display()))
+        };
         let len = handle.len as usize;
         let bytes = fs.read_at(&self.path, handle.offset, len + 4)?;
         let (data, crc) = bytes.split_at(len);
@@ -733,10 +730,7 @@ mod tests {
         let mut bytes = build(2000);
         bytes[20] ^= 0xff;
         let table = open_sim(&fs, &bytes);
-        assert!(matches!(
-            table.get(&fs, &key(0)),
-            Err(LsmError::Corrupt(_))
-        ));
+        assert!(matches!(table.get(&fs, &key(0)), Err(LsmError::Corrupt(_))));
         let first = table.iter(&fs).next().unwrap();
         assert!(matches!(first, Err(LsmError::Corrupt(_))));
         assert!(table.iter(&fs).nth(1).is_none());

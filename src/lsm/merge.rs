@@ -96,7 +96,12 @@ mod tests {
     fn source(items: &[(&str, Option<&str>)]) -> Source<'static> {
         let items: Vec<LsmResult<(Vec<u8>, Entry)>> = items
             .iter()
-            .map(|(key, value)| Ok((key.as_bytes().to_vec(), value.map(|v| v.as_bytes().to_vec()))))
+            .map(|(key, value)| {
+                Ok((
+                    key.as_bytes().to_vec(),
+                    value.map(|v| v.as_bytes().to_vec()),
+                ))
+            })
             .collect();
         Box::new(items.into_iter())
     }
