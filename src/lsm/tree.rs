@@ -320,12 +320,7 @@ impl<F: FileSystem + Clone> LsmTree<F> {
     /// Up to `limit` live pairs with `start <= key < end` in key order, and
     /// whether more remain. Tables outside the range are skipped, and each
     /// table is read from the block that may hold `start`.
-    pub fn scan(
-        &self,
-        start: &[u8],
-        end: Option<&[u8]>,
-        limit: usize,
-    ) -> LsmResult<ScanPage> {
+    pub fn scan(&self, start: &[u8], end: Option<&[u8]>, limit: usize) -> LsmResult<ScanPage> {
         let mut sources: Vec<Source<'_>> = Vec::new();
         sources.push(Box::new(
             self.memtable
