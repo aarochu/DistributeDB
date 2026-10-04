@@ -465,7 +465,11 @@ mod tests {
         tree.apply(set("d", "4"));
         tree.apply(set("a", "5"));
         assert_eq!(get(&tree, "a").as_deref(), Some("5"));
-        assert_eq!(get(&tree, "b"), None, "the frozen tombstone hides the table");
+        assert_eq!(
+            get(&tree, "b"),
+            None,
+            "the frozen tombstone hides the table"
+        );
         assert_eq!(get(&tree, "c").as_deref(), Some("3"));
         assert_eq!(get(&tree, "d").as_deref(), Some("4"));
         assert_eq!(get(&tree, "e"), None);
@@ -499,7 +503,11 @@ mod tests {
         assert_eq!(tree.flushed_lsn(), 500);
         assert_eq!(tree.flushed_hash(), 5000);
         assert_eq!(get(&tree, "key-0123").as_deref(), Some("123"));
-        assert_eq!(get(&tree, "unflushed"), None, "the caller's WAL replays this");
+        assert_eq!(
+            get(&tree, "unflushed"),
+            None,
+            "the caller's WAL replays this"
+        );
     }
 
     #[test]

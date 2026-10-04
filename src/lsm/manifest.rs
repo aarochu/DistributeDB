@@ -112,10 +112,7 @@ impl Manifest {
         if crc32c(body) != u32_at(crc, 0) {
             return Err("manifest checksum mismatch".into());
         }
-        let mut reader = Reader {
-            bytes: body,
-            at: 0,
-        };
+        let mut reader = Reader { bytes: body, at: 0 };
         if reader.take(8)? != MANIFEST_MAGIC {
             return Err("bad manifest magic".into());
         }
