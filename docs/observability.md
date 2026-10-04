@@ -20,6 +20,9 @@
 | `wal_sync_avg_us`, `wal_sync_max_us` | Mean and longest group-commit sync time. |
 | `recovery_us` | Time the last startup spent recovering: from taking the data-directory lock through loading the snapshot and replaying the WAL tail. |
 | `recovery_records_replayed` | WAL records replayed after the snapshot during that recovery. |
+| `storage_engine` | `memory` or `lsm`. For `lsm`, `keys` is an upper bound that counts versions and tombstones not yet compacted. |
+| `lsm_memtable_bytes`, `lsm_tables`, `lsm_level0_tables`, `lsm_table_bytes` | LSM engine only: memtable size, installed tables, level-0 tables, and table bytes on disk. |
+| `lsm_flushes_total`, `lsm_compactions_total` | LSM engine only: flushes and compactions installed since startup. See [the LSM engine](lsm.md). |
 | `replicas_connected` | Replicas currently streaming from this primary. |
 | `replica_<id>_applied_lsn`, `replica_<id>_lag` | Each known replica's last acknowledged LSN, and its distance from `durable_lsn`. Lag is `unknown` while the replica is disconnected. |
 

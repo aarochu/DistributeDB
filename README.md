@@ -85,11 +85,11 @@ For a reproducible three-node Docker demo, use [the local cluster guide](docs/do
 | 5 — Replication | Static identity, ordered stream, durable ACKs, and connected replica lag implemented; integration tests cover two replicas. |
 | 6 — Failure recovery | WAL reconnect, explicit snapshot catch-up, recovery-generation garbage collection, and a process kill/restart test implemented. |
 | 7 — Performance engineering | Benchmark harness, published results, lock-contention metrics, and a measured lock-scope change ([analysis](docs/performance.md)) implemented. |
-| 8 — Advanced storage | Optional after core acceptance. |
+| 8 — Advanced storage | LSM tree engine (memtable, SSTables, flush, two-level compaction) selectable with `--storage lsm`, with crash, replication, and server tests and a [comparison with the in-memory engine](docs/lsm.md). |
 
 CI runs formatting, Clippy, Rust tests, and documentation checks. Passing these checks supports the tested scenarios; it does not prove power-loss durability on physical hardware. The workload mixes are 90/10, 50/50, and 10/90 GET/SET; [published results](benchmarks/results/README.md) come from a shared CI runner and are for comparing revisions, not a hardware performance claim.
 
-See [development setup](docs/Development-Setup.md), [recovery notes](docs/recovery.md), [failure testing](docs/failure-testing.md), [benchmark method](docs/benchmarks.md), [`STATS` fields](docs/observability.md), and [performance analysis](docs/performance.md) for test and operator details.
+See [development setup](docs/Development-Setup.md), [recovery notes](docs/recovery.md), [failure testing](docs/failure-testing.md), [benchmark method](docs/benchmarks.md), [`STATS` fields](docs/observability.md), [performance analysis](docs/performance.md), and the [LSM storage engine](docs/lsm.md) for test and operator details.
 
 ## License
 
