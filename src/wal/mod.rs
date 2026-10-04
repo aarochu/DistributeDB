@@ -2320,7 +2320,9 @@ mod tests {
         }
         // An install that stopped before publishing CURRENT leaves a complete
         // generation 2 and a partial generation 3 that recovery never reads.
-        let segment = generation_dir(2).join("wal").join("00000000000000000002.wal");
+        let segment = generation_dir(2)
+            .join("wal")
+            .join("00000000000000000002.wal");
         fs.create_dir_all(segment.parent().unwrap()).unwrap();
         fs.create_file(&segment).unwrap();
         fs.append(&segment, b"unpublished").unwrap();
