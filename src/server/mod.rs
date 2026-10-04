@@ -97,7 +97,7 @@ use crate::protocol::{
 };
 use crate::replication::{PeerProgress, ReplicationStats};
 use crate::storage::{GetResult, Mutation};
-use crate::wal::{Db, DurabilityMode, WalSyncStats, MAX_GROUP_BYTES, MAX_GROUP_RECORDS};
+use crate::wal::{Db, DurabilityMode, LsmStats, WalSyncStats, MAX_GROUP_BYTES, MAX_GROUP_RECORDS};
 
 mod latency;
 use latency::LatencyHistogram;
@@ -369,6 +369,9 @@ struct Shared<F: FileSystem + Clone + Send + 'static> {
     /// Successful mutations answer `OK_VOLATILE` because the database runs in
     /// benchmark-only `os` durability mode (Technical-Design §6.1).
     volatile: bool,
+    /// The database uses the LSM engine, so the sequencer flushes and
+    /// compacts between groups.
+    lsm: bool,
 }
 
 impl Server {
@@ -405,7 +408,10 @@ impl Server {
         let shutdown = Arc::new(AtomicBool::new(false));
         let queue = Arc::new(WriteQueue::new(config.max_queue_depth));
 
-        let mode = db.read().expect("db read lock poisoned").durability_mode();
+        let (mode, lsm) = {
+            let db = db.read().expect("db read lock poisoned");
+            (db.durability_mode(), db.storage_engine() == "lsm")
+        };
         let volatile = mode == DurabilityMode::Os;
         let shared = Arc::new(Shared {
             db,
@@ -416,6 +422,7 @@ impl Server {
             live_connections: AtomicUsize::new(0),
             shutdown: Arc::clone(&shutdown),
             volatile,
+            lsm,
         });
 
         // Sequencer thread: single owner of the WAL append + group sync + apply.
@@ -613,11 +620,12 @@ where
             let waiting = Instant::now();
             let db = shared.db.read().expect("db read lock poisoned");
             shared.metrics.read_lock_wait.record(waiting.elapsed());
-            match db.get(&key) {
-                GetResult::Found(value) => (Response::new(KIND_GET, Status::Ok, value), true),
-                GetResult::NotFound => {
+            match db.try_get(&key) {
+                Ok(GetResult::Found(value)) => (Response::new(KIND_GET, Status::Ok, value), true),
+                Ok(GetResult::NotFound) => {
                     (Response::new(KIND_GET, Status::NotFound, Vec::new()), true)
                 }
+                Err(error) => (read_failure(KIND_GET, &error), true),
             }
         }
         Request::Exists { key } => {
@@ -625,8 +633,13 @@ where
             let waiting = Instant::now();
             let db = shared.db.read().expect("db read lock poisoned");
             shared.metrics.read_lock_wait.record(waiting.elapsed());
-            let byte = if db.exists(&key) { 1u8 } else { 0u8 };
-            (Response::new(KIND_EXISTS, Status::Ok, vec![byte]), true)
+            match db.try_exists(&key) {
+                Ok(exists) => (
+                    Response::new(KIND_EXISTS, Status::Ok, vec![u8::from(exists)]),
+                    true,
+                ),
+                Err(error) => (read_failure(KIND_EXISTS, &error), true),
+            }
         }
         Request::Stats => {
             shared.metrics.reads_total.fetch_add(1, Ordering::Relaxed);
@@ -652,6 +665,13 @@ where
             )
         }
     }
+}
+
+/// A read the storage engine could not complete, such as an LSM table that
+/// failed its checksum. The client sees `UNAVAILABLE`; the node keeps serving
+/// other keys.
+fn read_failure(kind: u8, error: &crate::wal::WalError) -> Response {
+    Response::new(kind, Status::Unavailable, error.to_string().into_bytes())
 }
 
 /// Map a durable-write [`WalError`] to the client-facing [`Status`]
@@ -811,6 +831,48 @@ where
                 }
             }
         }
+        if shared.lsm {
+            run_lsm_maintenance(&shared);
+        }
+    }
+}
+
+/// Flush and compact the LSM tree after a group's responses are released.
+/// Only freezing and installing take the write lock; writing tables happens
+/// without it, so reads continue. Writes arriving meanwhile wait in the
+/// queue and commit together as the next group. A failure makes the node
+/// fail closed (see [`Db::finish_lsm_flush`]), so it reaches clients as
+/// `UNAVAILABLE` on their next write.
+fn run_lsm_maintenance<F>(shared: &Arc<Shared<F>>)
+where
+    F: FileSystem + Clone + Send + Sync + 'static,
+{
+    let begun = shared
+        .db
+        .write()
+        .expect("db write lock poisoned")
+        .begin_lsm_flush();
+    if let Ok(Some(flush)) = begun {
+        let written = flush.write();
+        // An error is recorded as the fail-closed state.
+        let _ = shared
+            .db
+            .write()
+            .expect("db write lock poisoned")
+            .finish_lsm_flush(written);
+    }
+    let planned = shared
+        .db
+        .write()
+        .expect("db write lock poisoned")
+        .begin_lsm_compaction();
+    if let Some(compaction) = planned {
+        let compacted = compaction.write();
+        let _ = shared
+            .db
+            .write()
+            .expect("db write lock poisoned")
+            .finish_lsm_compaction(compacted);
     }
 }
 
@@ -827,14 +889,14 @@ fn render_stats<F>(shared: &Arc<Shared<F>>) -> String
 where
     F: FileSystem + Clone + Send + Sync + 'static,
 {
-    let (keys, current_lsn, durable_lsn, snapshot_lsn, role, durability, wal_sync, recovery) = {
+    let (keys, current_lsn, durable_lsn, snapshot_lsn, role, durability, wal_sync, recovery, storage) = {
         let db = shared.db.read().expect("db read lock poisoned");
         let durability = match db.durability_mode() {
             DurabilityMode::Fsync => "fsync",
             DurabilityMode::Os => "os",
         };
         (
-            db.len(),
+            db.approximate_len(),
             db.last_applied_lsn(),
             db.last_durable_lsn(),
             db.snapshot_lsn(),
@@ -842,6 +904,7 @@ where
             durability,
             db.wal_sync_stats(),
             (db.recovery_duration(), db.records_replayed()),
+            (db.storage_engine(), db.lsm_stats()),
         )
     };
     let percentiles = |histogram: &LatencyHistogram| {
@@ -873,6 +936,8 @@ where
         wal_sync,
         recovery_duration: recovery.0,
         records_replayed: recovery.1,
+        storage_engine: storage.0,
+        lsm: storage.1,
     };
     render_stats_lines(&snapshot)
 }
@@ -883,7 +948,8 @@ where
 /// a live server (Technical-Design §17).
 struct StatsSnapshot {
     uptime_seconds: u64,
-    keys: usize,
+    /// Exact for the in-memory engine; an upper bound for the LSM engine.
+    keys: u64,
     requests_total: u64,
     reads_total: u64,
     writes_total: u64,
@@ -902,6 +968,8 @@ struct StatsSnapshot {
     wal_sync: WalSyncStats,
     recovery_duration: Duration,
     records_replayed: u64,
+    storage_engine: &'static str,
+    lsm: Option<LsmStats>,
 }
 
 /// Render nanoseconds as whole microseconds, rounded up so a nonzero latency
@@ -930,6 +998,15 @@ fn render_stats_lines(s: &StatsSnapshot) -> String {
     out.push_str(&format!("connected_clients={}\n", s.connected_clients));
     out.push_str(&format!("role={}\n", s.role));
     out.push_str(&format!("durability={}\n", s.durability));
+    out.push_str(&format!("storage_engine={}\n", s.storage_engine));
+    if let Some(lsm) = &s.lsm {
+        out.push_str(&format!("lsm_memtable_bytes={}\n", lsm.memtable_bytes));
+        out.push_str(&format!("lsm_tables={}\n", lsm.tables));
+        out.push_str(&format!("lsm_level0_tables={}\n", lsm.level_zero_tables));
+        out.push_str(&format!("lsm_table_bytes={}\n", lsm.table_bytes));
+        out.push_str(&format!("lsm_flushes_total={}\n", lsm.flushes));
+        out.push_str(&format!("lsm_compactions_total={}\n", lsm.compactions));
+    }
     // Records recovery would replay after the snapshot boundary.
     let wal_entries = s.current_lsn.saturating_sub(s.snapshot_lsn);
     out.push_str(&format!("wal_entries={wal_entries}\n"));
@@ -1072,6 +1149,8 @@ mod tests {
             },
             recovery_duration: Duration::from_millis(12),
             records_replayed: 10,
+            storage_engine: "memory",
+            lsm: None,
         };
         let text = render_stats_lines(&snapshot);
         let lines: Vec<&str> = text.lines().collect();
@@ -1094,6 +1173,7 @@ mod tests {
         for expected in [
             "role=primary",
             "durability=fsync",
+            "storage_engine=memory",
             "wal_entries=10",
             "read_latency_p50_us=2",
             "read_latency_p95_us=9",
@@ -1112,6 +1192,6 @@ mod tests {
             assert!(lines.contains(&expected), "missing {expected}");
         }
         // Bounded: a small fixed number of lines.
-        assert_eq!(lines.len(), 32);
+        assert_eq!(lines.len(), 33);
     }
 }

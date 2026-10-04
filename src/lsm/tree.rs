@@ -436,6 +436,71 @@ impl<F: FileSystem + Clone> LsmTree<F> {
         self.tables.iter().map(|live| live.record.file_len).sum()
     }
 
+    /// The tree's configuration.
+    pub fn config(&self) -> LsmConfig {
+        self.config
+    }
+
+    /// Every live key and value held by the installed tables only, in key
+    /// order. This is exactly the state at [`LsmTree::flushed_lsn`]: the
+    /// memtables hold only later mutations.
+    pub fn table_pairs(&self) -> LsmResult<Vec<(Vec<u8>, Vec<u8>)>> {
+        let sources: Vec<Source<'_>> = self
+            .tables
+            .iter()
+            .map(|live| Box::new(live.table.iter(&self.fs)) as Source<'_>)
+            .collect();
+        let mut pairs = Vec::new();
+        for item in MergeIter::new(sources)? {
+            if let (key, Some(value)) = item? {
+                pairs.push((key, value));
+            }
+        }
+        Ok(pairs)
+    }
+
+    /// Load a complete image into an empty tree and install it as the state
+    /// at WAL boundary `lsn` with record hash `hash`. A replica uses this when
+    /// it installs a snapshot.
+    pub fn ingest(&mut self, pairs: Vec<(Vec<u8>, Vec<u8>)>, lsn: u64, hash: u64) -> LsmResult<()> {
+        if !self.tables.is_empty() || !self.memtable.is_empty() || self.immutable.is_some() {
+            return Err(LsmError::Usage("ingest requires an empty tree"));
+        }
+        for (key, value) in pairs {
+            self.memtable.apply(Mutation::Set { key, value });
+        }
+        if self.flush(lsn, hash)? {
+            return Ok(());
+        }
+        // An empty image still moves the boundary.
+        let mut manifest = self.manifest.clone();
+        manifest.flushed_lsn = lsn;
+        manifest.flushed_hash = hash;
+        write_manifest(
+            &self.fs,
+            &self.dir,
+            &self.tmp_dir,
+            &manifest,
+            self.config.durable,
+        )?;
+        self.manifest = manifest;
+        Ok(())
+    }
+
+    /// An upper bound on the number of live keys, without reading any table:
+    /// table entries plus memtable entries, counting each version and
+    /// tombstone that compaction has not yet merged away.
+    pub fn approx_key_count(&self) -> u64 {
+        let frozen = self.immutable.as_ref().map_or(0, |memtable| memtable.len());
+        let tables: u64 = self.tables.iter().map(|live| live.record.entry_count).sum();
+        tables + (self.memtable.len() + frozen) as u64
+    }
+
+    /// Number of level-0 tables.
+    pub fn level_zero_tables(&self) -> usize {
+        self.level_zero_count()
+    }
+
     fn level_zero_count(&self) -> usize {
         self.tables
             .iter()
@@ -994,5 +1059,36 @@ mod tests {
         tree.abort_compaction();
         assert!(tree.compact().unwrap());
         assert_eq!(tree.tables().count(), 1);
+    }
+
+    #[test]
+    fn ingest_and_table_pairs_reflect_the_flushed_state() {
+        let fs = SimFs::new(SimConfig::new(12));
+        let mut tree = open_small(&fs);
+        let pairs = vec![
+            (b"b".to_vec(), b"2".to_vec()),
+            (b"a".to_vec(), b"1".to_vec()),
+        ];
+        tree.ingest(pairs, 40, 400).unwrap();
+        assert_eq!(tree.flushed_lsn(), 40);
+        assert_eq!(get(&tree, "a").as_deref(), Some("1"));
+        tree.apply(set("c", "3"));
+        tree.apply(delete("a"));
+        let at_boundary = tree.table_pairs().unwrap();
+        assert_eq!(
+            at_boundary,
+            vec![
+                (b"a".to_vec(), b"1".to_vec()),
+                (b"b".to_vec(), b"2".to_vec())
+            ]
+        );
+        assert_eq!(tree.approx_key_count(), 4);
+        assert!(tree.ingest(Vec::new(), 50, 0).is_err());
+
+        let fs = SimFs::new(SimConfig::new(13));
+        let mut empty = open_small(&fs);
+        empty.ingest(Vec::new(), 7, 70).unwrap();
+        assert_eq!(empty.flushed_lsn(), 7);
+        assert_eq!(open_small(&fs).flushed_hash(), 70);
     }
 }
