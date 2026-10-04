@@ -27,7 +27,7 @@ flowchart LR
     R -->|durable ACK and WAL catch-up| P
 ```
 
-The server uses one mutation sequencer and a bounded write queue. In `fsync` mode, a write is appended with a group footer, synced, and applied before the server returns `OK`. Reads use the current applied map. The sequencer currently holds the database write lock during the sync, so read latency can include a WAL flush; this is a known performance trade-off to measure in Phase 7. The local in-memory REPL does not persist data.
+The server uses one mutation sequencer and a bounded write queue. In `fsync` mode, a write is appended with a group footer, synced, and applied before the server returns `OK`. Reads use the current applied map. The sequencer releases the database lock while a group syncs, so reads do not wait for a WAL flush; see the [performance analysis](docs/performance.md) for the measured effect. The local in-memory REPL does not persist data.
 
 Asynchronous replication sends only locally durable records. A primary `OK` means **local** durability, not replica durability. A disconnected replica may lag. If a connection drops before a client receives `OK`, the write outcome is unknown and the client must reconcile before retrying an operation whose repetition matters. A replica behind the retained WAL can install a snapshot only if it was explicitly provisioned to permit rebootstrap; see [replication and recovery](docs/replication.md) for limits.
 
@@ -84,12 +84,12 @@ For a reproducible three-node Docker demo, use [the local cluster guide](docs/do
 | 4 — Snapshots | Local publication, reload validation, WAL reclamation, and recovery tests implemented. |
 | 5 — Replication | Static identity, ordered stream, durable ACKs, and connected replica lag implemented; integration tests cover two replicas. |
 | 6 — Failure recovery | WAL reconnect, explicit snapshot catch-up, recovery-generation garbage collection, and a process kill/restart test implemented. |
-| 7 — Performance engineering | Client benchmark harness, 90/10, 50/50, 10/90 runner and CI-runner results published; profiling, lock-contention analysis and measured optimizations remain. |
+| 7 — Performance engineering | Benchmark harness, published results, lock-contention metrics, and a measured lock-scope change ([analysis](docs/performance.md)) implemented. |
 | 8 — Advanced storage | Optional after core acceptance. |
 
 CI runs formatting, Clippy, Rust tests, and documentation checks. Passing these checks supports the tested scenarios; it does not prove power-loss durability on physical hardware. The workload mixes are 90/10, 50/50, and 10/90 GET/SET; [published results](benchmarks/results/README.md) come from a shared CI runner and are for comparing revisions, not a hardware performance claim.
 
-See [development setup](docs/Development-Setup.md), [recovery notes](docs/recovery.md), [failure testing](docs/failure-testing.md), [benchmark method](docs/benchmarks.md), and [`STATS` fields](docs/observability.md) for test and operator details.
+See [development setup](docs/Development-Setup.md), [recovery notes](docs/recovery.md), [failure testing](docs/failure-testing.md), [benchmark method](docs/benchmarks.md), [`STATS` fields](docs/observability.md), and [performance analysis](docs/performance.md) for test and operator details.
 
 ## License
 

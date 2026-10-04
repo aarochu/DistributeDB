@@ -55,3 +55,7 @@ The table reports the median of three rows per cell. Throughput parentheses give
 | Primary + 2 replicas, `fsync` | 10/90 | 23,350 (22,774–24,068) | 1,402 | 1,946 | 2,240 | 238 |
 
 Each measured interval lasted less than a second. Configuration order was fixed, and each data directory accumulated WAL through its nine runs. Server CPU above 100% means more than one core was busy. Peak RSS, data bytes, and WAL bytes are in the individual CSV rows. These short CI-runner measurements identify a repeatable comparison procedure, not a general throughput or durability guarantee; `os` mode has no restart-durability promise.
+
+## 2026-10-04 — lock-scope comparison
+
+[`20261004T072003Z-compare-base.csv`](20261004T072003Z-compare-base.csv) and [`20261004T072003Z-compare-head.csv`](20261004T072003Z-compare-head.csv) compare the server before and after it stopped holding the database lock during WAL syncs. Each mix ran five trials per revision against a fresh single `fsync` primary, on one GitHub-hosted runner, with the order alternating. The analysis, including which differences exceed run-to-run variation, is in [performance engineering](../../docs/performance.md).
