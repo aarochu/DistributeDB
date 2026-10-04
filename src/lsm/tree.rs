@@ -463,7 +463,8 @@ impl<F: FileSystem + Clone> LsmTree<F> {
             .tables
             .iter()
             .filter(|live| {
-                live.record.level == 0 || (live.record.max_key >= *min && live.record.min_key <= *max)
+                live.record.level == 0
+                    || (live.record.max_key >= *min && live.record.min_key <= *max)
             })
             .cloned()
             .collect();
