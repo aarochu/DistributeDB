@@ -119,11 +119,11 @@ fn u16_at(bytes: &[u8], at: usize) -> u16 {
     u16::from_le_bytes(bytes[at..at + 2].try_into().expect("two bytes"))
 }
 
-fn u32_at(bytes: &[u8], at: usize) -> u32 {
+pub(super) fn u32_at(bytes: &[u8], at: usize) -> u32 {
     u32::from_le_bytes(bytes[at..at + 4].try_into().expect("four bytes"))
 }
 
-fn u64_at(bytes: &[u8], at: usize) -> u64 {
+pub(super) fn u64_at(bytes: &[u8], at: usize) -> u64 {
     u64::from_le_bytes(bytes[at..at + 8].try_into().expect("eight bytes"))
 }
 
@@ -314,13 +314,13 @@ impl SsTableBuilder {
 }
 
 /// Bounds-checked sequential reader over a byte slice.
-struct Reader<'a> {
-    bytes: &'a [u8],
-    at: usize,
+pub(super) struct Reader<'a> {
+    pub(super) bytes: &'a [u8],
+    pub(super) at: usize,
 }
 
 impl<'a> Reader<'a> {
-    fn take(&mut self, len: usize) -> Result<&'a [u8], String> {
+    pub(super) fn take(&mut self, len: usize) -> Result<&'a [u8], String> {
         let end = self
             .at
             .checked_add(len)
@@ -331,15 +331,15 @@ impl<'a> Reader<'a> {
         Ok(slice)
     }
 
-    fn u32(&mut self) -> Result<u32, String> {
+    pub(super) fn u32(&mut self) -> Result<u32, String> {
         Ok(u32_at(self.take(4)?, 0))
     }
 
-    fn u64(&mut self) -> Result<u64, String> {
+    pub(super) fn u64(&mut self) -> Result<u64, String> {
         Ok(u64_at(self.take(8)?, 0))
     }
 
-    fn done(&self) -> bool {
+    pub(super) fn done(&self) -> bool {
         self.at == self.bytes.len()
     }
 }
