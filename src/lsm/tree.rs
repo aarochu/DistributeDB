@@ -19,7 +19,22 @@
 //! next [`LsmTree::open`] deletes it. The tree does not write a WAL: the
 //! caller logs mutations first and, after a restart, replays records above
 //! [`LsmTree::flushed_lsn`].
+//!
+//! # Levels and compaction
+//!
+//! Flushed tables form level 0. They may overlap, so all are searched, newest
+//! first. Level 1 is the bottom level: a run of disjoint tables in key order.
+//! Once level 0 holds [`LsmConfig::l0_compaction_trigger`] tables, compaction
+//! merges all of them with the level-1 tables their key range overlaps into
+//! new level-1 tables of about [`LsmConfig::target_table_bytes`] each.
+//! Because every older version of those keys is among the inputs, tombstones
+//! and shadowed versions are dropped. Compaction uses the same three steps as
+//! a flush ([`LsmTree::plan_compaction`], [`CompactionJob::write`],
+//! [`LsmTree::install_compaction`]); a flush may run while it writes, and the
+//! table ids it may use are reserved when it is planned. Input files are
+//! deleted only after the new manifest is durable.
 
+use std::cmp::Ordering;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -40,6 +55,10 @@ pub const MANIFEST_FILE: &str = "MANIFEST";
 pub struct LsmConfig {
     /// Flush once the memtable holds about this many bytes.
     pub memtable_bytes: usize,
+    /// Compact once level 0 holds this many tables.
+    pub l0_compaction_trigger: usize,
+    /// Split compaction output into tables of about this many bytes.
+    pub target_table_bytes: usize,
     /// Sync files and directories. `false` only for disposable data.
     pub durable: bool,
 }
@@ -48,6 +67,8 @@ impl Default for LsmConfig {
     fn default() -> Self {
         Self {
             memtable_bytes: 4 * 1024 * 1024,
+            l0_compaction_trigger: 4,
+            target_table_bytes: 8 * 1024 * 1024,
             durable: true,
         }
     }
@@ -82,8 +103,31 @@ pub struct LsmTree<F: FileSystem + Clone> {
     memtable: MemTable,
     immutable: Option<Arc<MemTable>>,
     frozen: Option<Frozen>,
+    compacting: bool,
     manifest: Manifest,
     tables: Vec<LiveTable>,
+}
+
+/// Work to merge level 0 into level 1, independent of the tree.
+#[derive(Debug)]
+pub struct CompactionJob<F: FileSystem> {
+    fs: F,
+    dir: PathBuf,
+    tmp_dir: PathBuf,
+    durable: bool,
+    target_table_bytes: usize,
+    /// Inputs in search order: level 0 newest first, then level 1.
+    inputs: Vec<LiveTable>,
+    first_id: u64,
+    reserved_ids: u64,
+}
+
+/// Published, verified compaction output waiting for
+/// [`LsmTree::install_compaction`].
+#[derive(Debug)]
+pub struct CompactedTables {
+    input_ids: Vec<u64>,
+    outputs: Vec<LiveTable>,
 }
 
 /// Work to write one flushed SSTable, independent of the tree.
@@ -147,6 +191,23 @@ impl<F: FileSystem + Clone> LsmTree<F> {
             manifest
         };
 
+        // Level 0 precedes level 1, whose tables are disjoint and ascending.
+        let mut previous_max: Option<&[u8]> = None;
+        for record in &manifest.tables {
+            match record.level {
+                0 if previous_max.is_none() => {}
+                1 if previous_max.is_none_or(|max| max < record.min_key.as_slice()) => {
+                    previous_max = Some(record.max_key.as_slice());
+                }
+                _ => {
+                    return Err(LsmError::Corrupt(format!(
+                        "{}: table levels or level-1 ranges are out of order",
+                        manifest_path.display()
+                    )));
+                }
+            }
+        }
+
         let mut tables = Vec::with_capacity(manifest.tables.len());
         for record in &manifest.tables {
             let path = dir.join(table_name(record.id));
@@ -191,6 +252,7 @@ impl<F: FileSystem + Clone> LsmTree<F> {
             memtable: MemTable::new(),
             immutable: None,
             frozen: None,
+            compacting: false,
             manifest,
             tables,
         })
@@ -372,6 +434,196 @@ impl<F: FileSystem + Clone> LsmTree<F> {
     /// Total bytes of installed table files.
     pub fn table_bytes(&self) -> u64 {
         self.tables.iter().map(|live| live.record.file_len).sum()
+    }
+
+    fn level_zero_count(&self) -> usize {
+        self.tables
+            .iter()
+            .filter(|live| live.record.level == 0)
+            .count()
+    }
+
+    /// Whether level 0 has reached the compaction trigger and no compaction
+    /// is already in progress.
+    pub fn should_compact(&self) -> bool {
+        !self.compacting && self.level_zero_count() >= self.config.l0_compaction_trigger
+    }
+
+    /// Plan a compaction of all level-0 tables and the level-1 tables their
+    /// key range overlaps, reserving table ids for the output. Returns `None`
+    /// below the trigger or while another compaction is in progress.
+    pub fn plan_compaction(&mut self) -> Option<CompactionJob<F>> {
+        if !self.should_compact() {
+            return None;
+        }
+        let level_zero = self.tables.iter().filter(|live| live.record.level == 0);
+        let min = level_zero.clone().map(|live| &live.record.min_key).min()?;
+        let max = level_zero.map(|live| &live.record.max_key).max()?;
+        let inputs: Vec<LiveTable> = self
+            .tables
+            .iter()
+            .filter(|live| {
+                live.record.level == 0 || (live.record.max_key >= *min && live.record.min_key <= *max)
+            })
+            .cloned()
+            .collect();
+        let input_bytes: u64 = inputs.iter().map(|live| live.record.file_len).sum();
+        let target = self.config.target_table_bytes.max(1) as u64;
+        let reserved_ids = input_bytes / target + inputs.len() as u64 + 2;
+        let first_id = self.manifest.next_table_id;
+        self.manifest.next_table_id += reserved_ids;
+        self.compacting = true;
+        Some(CompactionJob {
+            fs: self.fs.clone(),
+            dir: self.dir.clone(),
+            tmp_dir: self.tmp_dir.clone(),
+            durable: self.config.durable,
+            target_table_bytes: self.config.target_table_bytes,
+            inputs,
+            first_id,
+            reserved_ids,
+        })
+    }
+
+    /// Give up a planned compaction, for example after its write failed.
+    /// Any outputs it published are unlisted and are deleted on the next
+    /// open.
+    pub fn abort_compaction(&mut self) {
+        self.compacting = false;
+    }
+
+    /// Replace a compaction's inputs with its outputs in a new manifest, then
+    /// delete the input files. Tables flushed while the compaction ran stay
+    /// ahead of its output in search order.
+    pub fn install_compaction(&mut self, compacted: CompactedTables) -> LsmResult<()> {
+        if !self.compacting {
+            return Err(LsmError::Usage("no compaction is in progress"));
+        }
+        let inputs: HashSet<u64> = compacted.input_ids.iter().copied().collect();
+        let mut tables: Vec<LiveTable> = self
+            .tables
+            .iter()
+            .filter(|live| !inputs.contains(&live.record.id))
+            .cloned()
+            .collect();
+        tables.extend(compacted.outputs);
+        // Stable: level 0 keeps its newest-first order ahead of level 1,
+        // and level 1 is ordered by key.
+        tables.sort_by(|a, b| match (a.record.level, b.record.level) {
+            (0, 0) => Ordering::Equal,
+            (0, _) => Ordering::Less,
+            (_, 0) => Ordering::Greater,
+            _ => a.record.min_key.cmp(&b.record.min_key),
+        });
+        let mut manifest = self.manifest.clone();
+        manifest.tables = tables.iter().map(|live| live.record.clone()).collect();
+        write_manifest(
+            &self.fs,
+            &self.dir,
+            &self.tmp_dir,
+            &manifest,
+            self.config.durable,
+        )?;
+        self.manifest = manifest;
+        self.tables = tables;
+        self.compacting = false;
+        // The inputs are no longer listed. A crash before these deletions
+        // leaves unlisted files that the next open removes.
+        for id in inputs {
+            let path = self.dir.join(table_name(id));
+            if self.fs.exists(&path) {
+                self.fs.remove_file(&path)?;
+            }
+        }
+        if self.config.durable {
+            self.fs.sync_dir(&self.dir)?;
+        }
+        Ok(())
+    }
+
+    /// Plan, write, and install a compaction in one call. Returns whether one
+    /// ran.
+    pub fn compact(&mut self) -> LsmResult<bool> {
+        let Some(job) = self.plan_compaction() else {
+            return Ok(false);
+        };
+        let installed = job
+            .write()
+            .and_then(|compacted| self.install_compaction(compacted));
+        if let Err(error) = installed {
+            self.abort_compaction();
+            return Err(error);
+        }
+        Ok(true)
+    }
+}
+
+impl<F: FileSystem> CompactionJob<F> {
+    /// Merge the inputs, dropping tombstones and shadowed versions, and
+    /// publish level-1 tables of about the target size. Safe to run without
+    /// the tree's lock.
+    pub fn write(&self) -> LsmResult<CompactedTables> {
+        let sources: Vec<Source<'_>> = self
+            .inputs
+            .iter()
+            .map(|live| Box::new(live.table.iter(&self.fs)) as Source<'_>)
+            .collect();
+        let mut outputs = Vec::new();
+        let mut builder = SsTableBuilder::new();
+        for item in MergeIter::new(sources)? {
+            let (key, entry) = item?;
+            // Level 1 is the bottom level: nothing older can be hidden.
+            let Some(value) = entry else {
+                continue;
+            };
+            builder.add(&key, Some(&value))?;
+            if builder.approx_len() >= self.target_table_bytes {
+                let full = std::mem::take(&mut builder);
+                outputs.push(self.write_table(full, outputs.len())?);
+            }
+        }
+        if !builder.is_empty() {
+            outputs.push(self.write_table(builder, outputs.len())?);
+        }
+        Ok(CompactedTables {
+            input_ids: self.inputs.iter().map(|live| live.record.id).collect(),
+            outputs,
+        })
+    }
+
+    fn write_table(&self, builder: SsTableBuilder, index: usize) -> LsmResult<LiveTable> {
+        if index as u64 >= self.reserved_ids {
+            return Err(LsmError::Usage(
+                "compaction produced more tables than it reserved",
+            ));
+        }
+        let id = self.first_id + index as u64;
+        let min_key = builder.first_key().expect("output is not empty").to_vec();
+        let max_key = builder.last_key().expect("output is not empty").to_vec();
+        let entry_count = builder.entry_count();
+        let bytes = builder.finish();
+        let name = table_name(id);
+        let path = self.dir.join(&name);
+        let tmp_path = self.tmp_dir.join(format!("lsm-{name}.tmp"));
+        let file_len = sstable::publish(&self.fs, &tmp_path, &path, &bytes, self.durable)?;
+        let table = SsTable::open(&self.fs, &path, file_len)?;
+        if table.entry_count() != entry_count {
+            return Err(LsmError::Corrupt(format!(
+                "{} reloaded with the wrong entry count",
+                path.display()
+            )));
+        }
+        Ok(LiveTable {
+            record: TableRecord {
+                id,
+                level: 1,
+                file_len,
+                entry_count,
+                min_key,
+                max_key,
+            },
+            table,
+        })
     }
 }
 
@@ -570,7 +822,7 @@ mod tests {
             Path::new("/db/tmp"),
             LsmConfig {
                 memtable_bytes: 200,
-                durable: true,
+                ..LsmConfig::default()
             },
         )
         .unwrap();
@@ -584,5 +836,162 @@ mod tests {
         assert!(!tree.should_flush());
         assert_eq!(tree.memtable_bytes(), 0);
         assert!(tree.table_bytes() > 0);
+    }
+
+    fn small() -> LsmConfig {
+        LsmConfig {
+            memtable_bytes: usize::MAX,
+            l0_compaction_trigger: 3,
+            target_table_bytes: 1024,
+            durable: true,
+        }
+    }
+
+    fn open_small(fs: &SimFs) -> LsmTree<SimFs> {
+        LsmTree::open(
+            fs.clone(),
+            Path::new("/db/lsm"),
+            Path::new("/db/tmp"),
+            small(),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn compaction_merges_level_zero_into_sorted_level_one() {
+        let fs = SimFs::new(SimConfig::new(7));
+        let mut tree = open_small(&fs);
+        let mut lsn = 0u64;
+        // Three overlapping flushes: values, overwrites, then deletes.
+        for round in 0..3u32 {
+            for index in 0..200u32 {
+                let key = format!("key-{index:04}");
+                if round == 2 && index % 3 == 0 {
+                    tree.apply(Mutation::Delete {
+                        key: key.into_bytes(),
+                    });
+                } else {
+                    tree.apply(set(&key, &format!("{round}-{index}")));
+                }
+                lsn += 1;
+            }
+            tree.flush(lsn, lsn * 10).unwrap();
+        }
+        assert!(tree.should_compact());
+        let inputs: Vec<u64> = tree.tables().map(|table| table.id).collect();
+        assert!(tree.compact().unwrap());
+
+        assert!(tree.tables().all(|table| table.level == 1));
+        let records: Vec<TableRecord> = tree.tables().cloned().collect();
+        assert!(records.len() > 1, "output is split at the target size");
+        for pair in records.windows(2) {
+            assert!(pair[0].max_key < pair[1].min_key);
+        }
+        for id in inputs {
+            assert!(!fs.exists(&Path::new("/db/lsm").join(table_name(id))));
+        }
+        let check = |tree: &LsmTree<SimFs>| {
+            for index in 0..200u32 {
+                let expected = (index % 3 != 0).then(|| format!("2-{index}"));
+                assert_eq!(get(tree, &format!("key-{index:04}")), expected);
+            }
+            let entries: u64 = tree.tables().map(|table| table.entry_count).sum();
+            assert_eq!(entries, 133, "tombstones and shadowed versions are gone");
+        };
+        check(&tree);
+        assert_eq!(tree.flushed_lsn(), 600);
+        drop(tree);
+        fs.crash();
+        check(&open_small(&fs));
+    }
+
+    #[test]
+    fn flush_during_compaction_stays_newer() {
+        let fs = SimFs::new(SimConfig::new(8));
+        let mut tree = open_small(&fs);
+        for round in 0..3u64 {
+            tree.apply(set("k", &format!("old-{round}")));
+            tree.apply(set(&format!("only-{round}"), "x"));
+            tree.flush(round + 1, 0).unwrap();
+        }
+        let job = tree.plan_compaction().unwrap();
+        assert!(tree.plan_compaction().is_none(), "one compaction at a time");
+        tree.apply(set("k", "newest"));
+        tree.flush(4, 0).unwrap();
+        tree.install_compaction(job.write().unwrap()).unwrap();
+
+        assert_eq!(get(&tree, "k").as_deref(), Some("newest"));
+        assert_eq!(get(&tree, "only-1").as_deref(), Some("x"));
+        assert_eq!(tree.tables().next().unwrap().level, 0);
+        drop(tree);
+        fs.crash();
+        assert_eq!(get(&open_small(&fs), "k").as_deref(), Some("newest"));
+    }
+
+    #[test]
+    fn crash_before_compaction_install_keeps_the_inputs() {
+        let fs = SimFs::new(SimConfig::new(9));
+        let mut tree = open_small(&fs);
+        for round in 0..3u64 {
+            tree.apply(set(&format!("k{round}"), "v"));
+            tree.flush(round + 1, 0).unwrap();
+        }
+        let written = tree.plan_compaction().unwrap().write().unwrap();
+        let outputs: Vec<PathBuf> = written
+            .outputs
+            .iter()
+            .map(|output| output.table.path().to_path_buf())
+            .collect();
+        assert!(!outputs.is_empty());
+        drop(written);
+        drop(tree);
+        fs.crash();
+
+        let tree = open_small(&fs);
+        assert!(outputs.iter().all(|path| !fs.exists(path)));
+        assert_eq!(tree.tables().count(), 3);
+        for round in 0..3 {
+            assert_eq!(get(&tree, &format!("k{round}")).as_deref(), Some("v"));
+        }
+    }
+
+    #[test]
+    fn later_compaction_rewrites_overlapping_level_one() {
+        let fs = SimFs::new(SimConfig::new(10));
+        let mut tree = open_small(&fs);
+        let mut lsn = 0u64;
+        for round in 0..3 {
+            tree.apply(set("k", &format!("v{round}")));
+            lsn += 1;
+            tree.flush(lsn, 0).unwrap();
+        }
+        tree.compact().unwrap();
+        assert_eq!(get(&tree, "k").as_deref(), Some("v2"));
+
+        tree.apply(delete("k"));
+        for round in 0..3 {
+            tree.apply(set(&format!("z{round}"), "z"));
+            lsn += 1;
+            tree.flush(lsn, 0).unwrap();
+        }
+        tree.compact().unwrap();
+        assert_eq!(get(&tree, "k"), None);
+        let entries: u64 = tree.tables().map(|table| table.entry_count).sum();
+        assert_eq!(entries, 3, "the tombstone and the old value are both gone");
+    }
+
+    #[test]
+    fn aborted_compaction_can_be_planned_again() {
+        let fs = SimFs::new(SimConfig::new(11));
+        let mut tree = open_small(&fs);
+        for round in 0..3u64 {
+            tree.apply(set(&format!("k{round}"), "v"));
+            tree.flush(round + 1, 0).unwrap();
+        }
+        let first = tree.plan_compaction().unwrap();
+        drop(first);
+        tree.abort_compaction();
+        assert!(tree.compact().unwrap());
+        assert_eq!(tree.tables().count(), 1);
     }
 }
