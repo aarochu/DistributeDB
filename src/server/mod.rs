@@ -97,7 +97,9 @@ use crate::protocol::{
 };
 use crate::replication::{PeerProgress, ReplicationStats};
 use crate::storage::{GetResult, Mutation};
-use crate::wal::{Db, DurabilityMode, LsmStats, WalSyncStats, MAX_GROUP_BYTES, MAX_GROUP_RECORDS};
+use crate::wal::{
+    Db, DurabilityMode, LsmFlush, LsmStats, WalSyncStats, MAX_GROUP_BYTES, MAX_GROUP_RECORDS,
+};
 
 mod latency;
 use latency::LatencyHistogram;
@@ -379,9 +381,12 @@ struct Shared<F: FileSystem + Clone + Send + 'static> {
     /// Successful mutations answer `OK_VOLATILE` because the database runs in
     /// benchmark-only `os` durability mode (Technical-Design §6.1).
     volatile: bool,
-    /// The database uses the LSM engine; the sequencer wakes the flush and
-    /// compaction threads after each group.
+    /// The database uses the LSM engine; the sequencer freezes the memtable
+    /// when a flush is due and hands it to the flush thread.
     lsm: bool,
+    /// A frozen memtable waiting for the flush thread. At most one exists,
+    /// because a memtable is not frozen while another flush is pending.
+    frozen: Mutex<Option<LsmFlush<F>>>,
     flush_signal: Arc<Signal>,
     compaction_signal: Arc<Signal>,
 }
@@ -475,6 +480,7 @@ impl Server {
             shutdown: Arc::clone(&shutdown),
             volatile,
             lsm,
+            frozen: Mutex::new(None),
             flush_signal: Arc::new(Signal::default()),
             compaction_signal: Arc::new(Signal::default()),
         });
@@ -903,7 +909,7 @@ where
         // apply under the write lock. Readers keep using the pre-group map
         // during the sync, which is correct because none of these writes has
         // been acknowledged yet (Phase 7 lock-scope change).
-        let mut flush_due = false;
+        let mut frozen = None;
         let (begun, first_hold) = {
             let mut db = shared.db.write().expect("db write lock poisoned");
             let held = Instant::now();
@@ -919,8 +925,13 @@ where
                 let mut db = shared.db.write().expect("db write lock poisoned");
                 let held = Instant::now();
                 let result = db.finish_group(pending, &muts, synced);
+                // Freeze here, where no group is between append and apply,
+                // so the WAL can rotate. Only the table write is left to the
+                // flush thread. An error leaves the node fail-closed.
                 if shared.lsm {
-                    flush_due = db.lsm_flush_due();
+                    if let Ok(Some(flush)) = db.begin_lsm_flush() {
+                        frozen = Some(flush);
+                    }
                     stalled = db.lsm_write_stall();
                 }
                 shared
@@ -949,57 +960,34 @@ where
                 }
             }
         }
-        // Wake the flush thread only when a flush is due, so it does not
-        // take the write lock after every group.
-        if flush_due {
+        if let Some(flush) = frozen {
+            *shared.frozen.lock().expect("frozen flush poisoned") = Some(flush);
             shared.flush_signal.notify();
         }
     }
 }
 
-/// Background LSM flushes. Freezing and installing take the write lock;
-/// writing the table does not, so the sequencer keeps committing groups and
-/// reads continue. A failure makes the node fail closed (see
-/// [`Db::finish_lsm_flush`]), which clients see as `UNAVAILABLE` on their
-/// next write.
+/// Background LSM flushes. The sequencer freezes the memtable under the
+/// write lock; this thread writes the table with no lock held, so groups keep
+/// committing and reads continue, then installs it under the write lock. A
+/// failure makes the node fail closed (see [`Db::finish_lsm_flush`]), which
+/// clients see as `UNAVAILABLE` on their next write.
 fn flush_loop<F>(shared: Arc<Shared<F>>)
 where
     F: FileSystem + Clone + Send + Sync + 'static,
 {
     while shared.flush_signal.wait() {
-        while !shared.flush_signal.stopped() {
-            let begun = shared
-                .db
-                .write()
-                .expect("db write lock poisoned")
-                .begin_lsm_flush();
-            match begun {
-                Ok(Some(flush)) => {
-                    let written = flush.write();
-                    // An error is recorded as the fail-closed state.
-                    let _ = shared
-                        .db
-                        .write()
-                        .expect("db write lock poisoned")
-                        .finish_lsm_flush(written);
-                    shared.compaction_signal.notify();
-                }
-                // Not due, or deferred because a group was between append and
-                // apply: retry shortly only in the second case.
-                Ok(None) => {
-                    let due = shared
-                        .db
-                        .read()
-                        .expect("db read lock poisoned")
-                        .lsm_flush_due();
-                    if !due {
-                        break;
-                    }
-                    thread::sleep(Duration::from_millis(1));
-                }
-                Err(_) => break,
-            }
-        }
+        let Some(flush) = shared.frozen.lock().expect("frozen flush poisoned").take() else {
+            continue;
+        };
+        let written = flush.write();
+        // An error is recorded as the fail-closed state.
+        let _ = shared
+            .db
+            .write()
+            .expect("db write lock poisoned")
+            .finish_lsm_flush(written);
+        shared.compaction_signal.notify();
     }
 }
 
