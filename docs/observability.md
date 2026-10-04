@@ -14,6 +14,8 @@
 | `wal_entries` | WAL records after the snapshot boundary: the records a restart would replay. |
 | `read_latency_p50_us`, `_p95_us`, `_p99_us` | Server-side service time of `GET` and `EXISTS`, in microseconds. |
 | `write_latency_p50_us`, `_p95_us`, `_p99_us` | Server-side service time of `SET` and `DELETE`, including sequencer queueing and the group commit. |
+| `read_lock_wait_p50_us`, `_p95_us`, `_p99_us` | Time a `GET` or `EXISTS` waited for the database read lock. A high tail here means reads are queued behind the sequencer's write lock. |
+| `write_lock_hold_p50_us`, `_p95_us`, `_p99_us` | Time the sequencer held the database write lock for one group commit. |
 | `wal_syncs_total`, `wal_sync_errors_total` | Group-commit syncs completed and failed since startup. The first failure makes the node fail closed. |
 | `wal_sync_avg_us`, `wal_sync_max_us` | Mean and longest group-commit sync time. |
 | `recovery_us` | Time the last startup spent recovering: from taking the data-directory lock through loading the snapshot and replaying the WAL tail. |
