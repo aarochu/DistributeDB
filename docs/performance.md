@@ -48,6 +48,8 @@ Client-observed, median of five (range):
 
 These differences are within run-to-run variation on this runner. The base and head throughput ranges overlap in every mix, and one head trial at 90/10 ran at a quarter of the others' throughput. The client p99 covers all operations, so it is dominated by writes, which still wait for their own sync. Client, server and benchmark share the runner's cores, and each measured window lasted under a second. This run does not show a client-visible throughput gain or loss. It does show that reads no longer queue behind disk flushes.
 
+A second run on a fresh runner allocation ([workflow run 37185684419](https://github.com/aarochu/DistributeDB/actions/runs/37185684419), same method) reproduced the server-side result: read-lock wait p99 fell 82%, 85% and 89% at 90/10, 50/50 and 10/90. Median throughput changed by +18%, +7% and +1%. The first run's −18% at 10/90 did not recur, which is consistent with run-to-run noise.
+
 ## Conclusions and next steps
 
 - The read path no longer depends on `fsync` latency. On storage with slow or variable syncs, where the base server's read tail would grow with the disk's, this matters more than on a CI runner's disk.
