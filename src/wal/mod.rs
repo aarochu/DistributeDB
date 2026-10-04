@@ -935,6 +935,9 @@ pub struct Db<F: FileSystem> {
     /// Wall time [`Db::open`] spent from acquiring the data-directory lock
     /// through rebuilding the map (SOW §17 "recovery time").
     recovery_duration: Duration,
+    /// Stale recovery generations this process has removed (see
+    /// [`Db::remove_stale_generations`]).
+    generations_removed: u64,
     /// Bounded disk budget for retained recovery data (snapshots + retained
     /// WAL). Reaching it pauses new snapshots' reclamation with
     /// [`WalError::ResourceExhausted`] (Technical-Design §7).
@@ -1114,6 +1117,13 @@ impl<F: FileSystem + Clone> Db<F> {
             0
         };
 
+        // Recovery read only the generation CURRENT selects; every other
+        // generation is garbage. Removal is best effort so a stray file in an
+        // old generation cannot stop the node from opening; the next open
+        // retries whatever remains.
+        let generations_removed =
+            Self::remove_stale_generations(&fs, &paths.root, generation_id, mode).unwrap_or(0);
+
         let snapshot_hash = outcome
             .records
             .first()
@@ -1144,6 +1154,7 @@ impl<F: FileSystem + Clone> Db<F> {
             snapshot_lsn: outcome.snapshot_lsn,
             records_replayed: outcome.records.len() as u64,
             recovery_duration: recovery_started.elapsed(),
+            generations_removed,
             retention_budget_bytes: config.retention_budget_bytes,
             allow_snapshot_rebootstrap,
             _lock: lock,
@@ -1752,7 +1763,67 @@ impl<F: FileSystem + Clone> Db<F> {
         self.snapshot_hash = expected_hash;
         self.retained_records.clear();
         self.records_replayed = 0;
+        // CURRENT now durably selects the new generation, so the one it
+        // replaced (and any earlier leftovers) are garbage. Best effort: a
+        // failure here leaves old files that the next open removes.
+        let root = self.wal.paths.root.clone();
+        let mode = self.wal.mode;
+        if let Ok(removed) = Self::remove_stale_generations(&self.wal.fs, &root, generation, mode) {
+            self.generations_removed += removed;
+        }
         Ok(expected_lsn)
+    }
+
+    /// Remove every recovery generation except `current`: older generations
+    /// superseded by a published CURRENT, and newer ones left by a snapshot
+    /// install that stopped before publishing CURRENT. Recovery reads only the
+    /// generation CURRENT selects, so a crash part-way through leaves a partial
+    /// directory that is never read and that a later call finishes removing.
+    ///
+    /// Generation IDs are assigned upward from 1, and an install takes the
+    /// first free ID above the current one, so leftovers above `current` are
+    /// contiguous. This probes each ID below `current`, one existence check
+    /// per past generation. Returns the number of generations removed.
+    fn remove_stale_generations(
+        fs: &F,
+        root: &Path,
+        current: u64,
+        mode: DurabilityMode,
+    ) -> WalResult<u64> {
+        let mut stale: Vec<DataPaths> = (1..current)
+            .map(|id| DataPaths::with_generation(root, id))
+            .filter(|paths| fs.exists(&paths.generation()))
+            .collect();
+        let mut above = current;
+        while let Some(id) = above.checked_add(1) {
+            let paths = DataPaths::with_generation(root, id);
+            if !fs.exists(&paths.generation()) {
+                break;
+            }
+            stale.push(paths);
+            above = id;
+        }
+        for paths in &stale {
+            for dir in [paths.wal_dir(), paths.snapshots_dir()] {
+                for name in fs.list_dir(&dir)? {
+                    fs.remove_file(&dir.join(name))?;
+                }
+                if fs.exists(&dir) {
+                    fs.remove_dir(&dir)?;
+                }
+            }
+            fs.remove_dir(&paths.generation())?;
+        }
+        if !stale.is_empty() && mode == DurabilityMode::Fsync {
+            fs.sync_dir(&root.join("generations"))?;
+        }
+        Ok(stale.len() as u64)
+    }
+
+    /// Stale recovery generations removed by this process, at open and after
+    /// snapshot installs.
+    pub fn generations_removed(&self) -> u64 {
+        self.generations_removed
     }
 
     /// Accept one validated primary record on a replica. The local WAL may
@@ -2234,6 +2305,56 @@ mod tests {
 
     fn root() -> PathBuf {
         PathBuf::from("/data")
+    }
+
+    fn generation_dir(id: u64) -> PathBuf {
+        root().join("generations").join(format!("{id:016x}"))
+    }
+
+    #[test]
+    fn open_removes_generations_left_by_interrupted_install() {
+        let fs = sim();
+        {
+            let mut db = Db::open(fs.clone(), &root(), DurabilityMode::Fsync).unwrap();
+            db.set(b"k".to_vec(), b"v".to_vec()).unwrap();
+        }
+        // An install that stopped before publishing CURRENT leaves a complete
+        // generation 2 and a partial generation 3 that recovery never reads.
+        let segment = generation_dir(2).join("wal").join("00000000000000000002.wal");
+        fs.create_dir_all(segment.parent().unwrap()).unwrap();
+        fs.create_file(&segment).unwrap();
+        fs.append(&segment, b"unpublished").unwrap();
+        fs.create_dir_all(&generation_dir(3).join("snapshots"))
+            .unwrap();
+
+        let db = Db::open(fs.clone(), &root(), DurabilityMode::Fsync).unwrap();
+        assert_eq!(db.generation_id(), 1);
+        assert_eq!(db.generations_removed(), 2);
+        assert!(!fs.exists(&generation_dir(2)));
+        assert!(!fs.exists(&generation_dir(3)));
+        assert_eq!(db.get(b"k"), GetResult::Found(b"v".to_vec()));
+        drop(db);
+
+        // The removal was synced: a crash does not bring the directories back.
+        fs.crash();
+        let db = Db::open(fs.clone(), &root(), DurabilityMode::Fsync).unwrap();
+        assert_eq!(db.generations_removed(), 0);
+        assert!(!fs.exists(&generation_dir(2)));
+        assert_eq!(db.get(b"k"), GetResult::Found(b"v".to_vec()));
+    }
+
+    #[test]
+    fn unexpected_content_in_stale_generation_does_not_block_open() {
+        let fs = sim();
+        drop(Db::open(fs.clone(), &root(), DurabilityMode::Fsync).unwrap());
+        let stray = generation_dir(2).join("operator-notes").join("keep.txt");
+        fs.create_dir_all(stray.parent().unwrap()).unwrap();
+        fs.create_file(&stray).unwrap();
+
+        let db = Db::open(fs.clone(), &root(), DurabilityMode::Fsync).unwrap();
+        assert_eq!(db.generation_id(), 1);
+        assert_eq!(db.generations_removed(), 0);
+        assert!(fs.exists(&stray));
     }
 
     #[test]

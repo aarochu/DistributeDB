@@ -6,8 +6,8 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use distributedb::{
-    Client, Db, DurabilityMode, GetResult, NodeRole, OpenConfig, PrimaryListener, ReplicaRunner,
-    ReplicationStats, Server, ServerConfig, SimConfig, SimFs, Status,
+    Client, Db, DurabilityMode, FileSystem, GetResult, NodeRole, OpenConfig, PrimaryListener,
+    ReplicaRunner, ReplicationStats, Server, ServerConfig, SimConfig, SimFs, Status,
 };
 
 fn wait_until(mut condition: impl FnMut() -> bool) {
@@ -238,6 +238,10 @@ fn snapshot_rebootstrap_is_explicit_and_recovers_after_crash() {
     wait_until(|| replica.read().unwrap().last_applied_lsn() == 30);
     assert!(runner.fatal_error().is_none());
     assert_eq!(replica.read().unwrap().generation_id(), 2);
+    // The generation replaced by the installed snapshot is garbage collected.
+    let old_generation = Path::new("/replica/generations/0000000000000001");
+    assert_eq!(replica.read().unwrap().generations_removed(), 1);
+    assert!(!replica_fs.exists(old_generation));
     assert_eq!(
         replica.read().unwrap().get(b"key-29"),
         GetResult::Found(vec![29])
@@ -245,6 +249,7 @@ fn snapshot_rebootstrap_is_explicit_and_recovers_after_crash() {
     runner.shutdown();
     drop(replica);
     replica_fs.crash();
+    assert!(!replica_fs.exists(old_generation));
     let reopened = Db::open_configured(
         replica_fs,
         Path::new("/replica"),

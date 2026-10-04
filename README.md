@@ -83,7 +83,7 @@ For a reproducible three-node Docker demo, use [the local cluster guide](docs/do
 | 3 — Networking | TCP server/client and concurrent request tests implemented. |
 | 4 — Snapshots | Local publication, reload validation, WAL reclamation, and recovery tests implemented. |
 | 5 — Replication | Static identity, ordered stream, durable ACKs, and connected replica lag implemented; integration tests cover two replicas. |
-| 6 — Failure recovery | WAL reconnect, explicit snapshot catch-up, and a process kill/restart test implemented; recovery-generation garbage collection remains. |
+| 6 — Failure recovery | WAL reconnect, explicit snapshot catch-up, recovery-generation garbage collection, and a process kill/restart test implemented. |
 | 7 — Performance engineering | Client benchmark harness, 90/10, 50/50, 10/90 runner and CI-runner results published; profiling, lock-contention analysis and measured optimizations remain. |
 | 8 — Advanced storage | Optional after core acceptance. |
 
