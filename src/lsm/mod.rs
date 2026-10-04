@@ -7,14 +7,16 @@
 //! versions of the key. [`merge::MergeIter`] combines sorted components for
 //! compaction and full scans.
 //!
-//! This module provides the building blocks. The engine that flushes,
-//! compacts, and recovers them is layered on top.
+//! [`tree::LsmTree`] combines them: it flushes the memtable to SSTables and
+//! records the live tables in a [`manifest`].
 //!
 //! [`MemTable`]: memtable::MemTable
 
+pub mod manifest;
 pub mod memtable;
 pub mod merge;
 pub mod sstable;
+pub mod tree;
 
 use crate::fileio::FsError;
 
