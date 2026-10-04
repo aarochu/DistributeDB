@@ -341,7 +341,12 @@ fn run(config: Config) -> Result<(), String> {
         combined.latencies_ns.extend(worker.latencies_ns);
     }
     let elapsed = started.elapsed();
+    // Time for every replica to apply the run's writes after the last client
+    // finished: how far replication trailed the measured workload.
+    let catch_up_started = Instant::now();
     let caught_up = wait_replicas(&mut setup, config.replicas).is_ok();
+    let replica_catch_up_ms = (config.replicas > 0 && caught_up)
+        .then(|| format!("{:.1}", catch_up_started.elapsed().as_secs_f64() * 1000.0));
     // Server-side percentiles are cumulative since the server started, so
     // they describe this run only when each run uses a fresh server.
     let server_stats = setup.stats().unwrap_or_default();
@@ -387,7 +392,7 @@ fn run(config: Config) -> Result<(), String> {
         .duration_since(UNIX_EPOCH)
         .map_err(|error| error.to_string())?
         .as_millis();
-    let header = "timestamp_ms,revision,build_mode,os,arch,kernel,filesystem,storage_medium,topology,durability,replicas_configured,replicas_caught_up,clients,operations_requested,warmup_requested,read_ratio,keys,value_bytes,seed,elapsed_seconds,successful_ops,failed_ops,skipped_ops,read_ops,write_ops,read_misses,ops_per_second,avg_latency_ns,p50_latency_ns,p95_latency_ns,p99_latency_ns,server_cpu_percent,server_peak_rss_kib,data_bytes,wal_bytes,server_read_p99_us,server_read_lock_wait_p99_us,server_write_lock_hold_p99_us,server_wal_sync_avg_us";
+    let header = "timestamp_ms,revision,build_mode,os,arch,kernel,filesystem,storage_medium,topology,durability,replicas_configured,replicas_caught_up,clients,operations_requested,warmup_requested,read_ratio,keys,value_bytes,seed,elapsed_seconds,successful_ops,failed_ops,skipped_ops,read_ops,write_ops,read_misses,ops_per_second,avg_latency_ns,p50_latency_ns,p95_latency_ns,p99_latency_ns,server_cpu_percent,server_peak_rss_kib,data_bytes,wal_bytes,server_read_p99_us,server_read_lock_wait_p99_us,server_write_lock_hold_p99_us,server_wal_sync_avg_us,replica_catch_up_ms";
     let fields = vec![
         timestamp_ms.to_string(),
         csv_field(&revision),
@@ -438,6 +443,7 @@ fn run(config: Config) -> Result<(), String> {
         server_stat("read_lock_wait_p99_us"),
         server_stat("write_lock_hold_p99_us"),
         server_stat("wal_sync_avg_us"),
+        replica_catch_up_ms.unwrap_or_default(),
     ];
     let row = fields.join(",");
     if let Some(path) = config.output.as_deref() {
