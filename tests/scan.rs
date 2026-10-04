@@ -11,6 +11,8 @@ use distributedb::{
 };
 
 type Pairs = Vec<(Vec<u8>, Vec<u8>)>;
+/// Start bound, optional end bound, and limit.
+type ScanCase = (&'static [u8], Option<&'static [u8]>, usize);
 
 fn lsm() -> OpenConfig {
     OpenConfig {
@@ -154,7 +156,7 @@ fn both_engines_return_ordered_live_ranges() {
             let stats = db.lsm_stats().unwrap();
             assert!(stats.tables >= 2 && stats.compactions >= 1, "{stats:?}");
         }
-        let cases: [(&[u8], Option<&[u8]>, usize); 6] = [
+        let cases: [ScanCase; 6] = [
             (b"", None, 10_000),
             (b"", None, 7),
             (b"key-00100", Some(b"key-00200"), 1_000),
