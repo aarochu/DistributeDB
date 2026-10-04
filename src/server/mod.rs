@@ -853,6 +853,10 @@ where
     F: FileSystem + Clone + Send + Sync + 'static,
 {
     let queue = &shared.queue;
+    // Whether the last group left the LSM memtable at its stall size. Read
+    // under the write lock the group already holds, so the common case costs
+    // no extra lock acquisition.
+    let mut stalled = false;
     loop {
         // Wait for at least one job (or shutdown-drain).
         let batch = {
@@ -882,7 +886,7 @@ where
 
         // Back-pressure: while the memtable is far past its flush size and
         // the previous one is still being written, wait for that flush.
-        if shared.lsm {
+        if stalled {
             while shared
                 .db
                 .read()
@@ -899,6 +903,7 @@ where
         // apply under the write lock. Readers keep using the pre-group map
         // during the sync, which is correct because none of these writes has
         // been acknowledged yet (Phase 7 lock-scope change).
+        let mut flush_due = false;
         let (begun, first_hold) = {
             let mut db = shared.db.write().expect("db write lock poisoned");
             let held = Instant::now();
@@ -914,6 +919,10 @@ where
                 let mut db = shared.db.write().expect("db write lock poisoned");
                 let held = Instant::now();
                 let result = db.finish_group(pending, &muts, synced);
+                if shared.lsm {
+                    flush_due = db.lsm_flush_due();
+                    stalled = db.lsm_write_stall();
+                }
                 shared
                     .metrics
                     .write_lock_hold
@@ -940,7 +949,9 @@ where
                 }
             }
         }
-        if shared.lsm {
+        // Wake the flush thread only when a flush is due, so it does not
+        // take the write lock after every group.
+        if flush_due {
             shared.flush_signal.notify();
         }
     }
