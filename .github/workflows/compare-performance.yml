@@ -1,0 +1,45 @@
+name: Performance comparison
+
+on:
+  pull_request:
+    paths:
+      - "src/server/**"
+      - "src/wal/**"
+      - "src/storage/**"
+      - "benchmarks/compare_revisions.sh"
+      - "benchmarks/summarize_comparison.py"
+      - ".github/workflows/compare-performance.yml"
+  workflow_dispatch:
+    inputs:
+      base:
+        description: Base revision
+        required: true
+      head:
+        description: Head revision
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  compare:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Toolchain
+        run: rustc --version && cargo --version
+      - name: Compare base and head on this runner
+        env:
+          BASE: ${{ github.event.pull_request.base.sha || inputs.base }}
+          HEAD: ${{ github.event.pull_request.head.sha || inputs.head }}
+          DDB_STORAGE_MEDIUM: ci-runner-disk
+        run: bash benchmarks/compare_revisions.sh "$BASE" "$HEAD" compare-out
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: performance-comparison
+          path: compare-out/
