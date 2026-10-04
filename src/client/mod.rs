@@ -136,6 +136,27 @@ impl Client {
         }
     }
 
+    /// `SCAN`: up to `limit` pairs with `start <= key < end` in key order,
+    /// and whether more remain. An empty `start` begins at the first key and
+    /// `end: None` is unbounded. A page may hold fewer than `limit` pairs
+    /// when the response would exceed one frame; continue from the last key
+    /// with a `0` byte appended.
+    pub fn scan(
+        &mut self,
+        start: Vec<u8>,
+        end: Option<Vec<u8>>,
+        limit: u32,
+    ) -> ClientResult<protocol::ScanPage> {
+        let resp = self.round_trip(&Request::Scan { start, end, limit })?;
+        match resp.status {
+            Status::Ok => Ok(protocol::decode_scan_page(&resp.data)?),
+            status => Err(ClientError::UnexpectedStatus {
+                status,
+                data: resp.data,
+            }),
+        }
+    }
+
     /// `STATS`. Returns the server's operational statistics as text
     /// (`name=value` lines, version first).
     pub fn stats(&mut self) -> ClientResult<String> {

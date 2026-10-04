@@ -70,6 +70,12 @@ impl MemTable {
     pub fn iter(&self) -> impl Iterator<Item = (&Vec<u8>, &Entry)> + '_ {
         self.entries.iter()
     }
+
+    /// Entries with keys at or after `start`, in ascending order.
+    pub fn range_from(&self, start: &[u8]) -> std::collections::btree_map::Range<'_, Vec<u8>, Entry> {
+        self.entries
+            .range::<[u8], _>((std::ops::Bound::Included(start), std::ops::Bound::Unbounded))
+    }
 }
 
 #[cfg(test)]

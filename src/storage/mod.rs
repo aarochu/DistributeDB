@@ -112,6 +112,30 @@ impl StorageEngine {
         self.map.is_empty()
     }
 
+    /// Up to `limit` pairs with `start <= key < end` in key order, and
+    /// whether more remain. The hash map is unordered, so this sorts the
+    /// keys in range: `O(n log n)` over the whole map.
+    pub fn scan(
+        &self,
+        start: &[u8],
+        end: Option<&[u8]>,
+        limit: usize,
+    ) -> (Vec<(Vec<u8>, Vec<u8>)>, bool) {
+        let mut keys: Vec<&Vec<u8>> = self
+            .map
+            .keys()
+            .filter(|key| key.as_slice() >= start && end.is_none_or(|end| key.as_slice() < end))
+            .collect();
+        keys.sort_unstable();
+        let more = keys.len() > limit;
+        let pairs = keys
+            .into_iter()
+            .take(limit)
+            .map(|key| (key.clone(), self.map[key].clone()))
+            .collect();
+        (pairs, more)
+    }
+
     /// Return an immutable clone of every current key/value pair.
     ///
     /// This is what the mutation sequencer clones under the map lock at a

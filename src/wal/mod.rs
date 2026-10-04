@@ -2320,6 +2320,21 @@ impl<F: FileSystem + Clone> Db<F> {
         }
     }
 
+    /// Up to `limit` pairs with `start <= key < end` in key order, and
+    /// whether more remain. Sorted merge for the LSM engine; a sort of the
+    /// keys in range for the in-memory map.
+    pub fn scan(
+        &self,
+        start: &[u8],
+        end: Option<&[u8]>,
+        limit: usize,
+    ) -> WalResult<(Vec<(Vec<u8>, Vec<u8>)>, bool)> {
+        match &self.engine {
+            Engine::Memory(engine) => Ok(engine.scan(start, end, limit)),
+            Engine::Lsm(tree) => Ok(tree.scan(start, end, limit)?),
+        }
+    }
+
     /// Whether `key` exists; fallible like [`Db::try_get`].
     pub fn try_exists(&self, key: &[u8]) -> WalResult<bool> {
         match &self.engine {

@@ -81,5 +81,5 @@ Against the in-memory engine on a CI runner with 100,000 keys, the LSM server us
 - **Two levels:** level 1 is a single sorted run, and each compaction rewrites the level-1 tables overlapping level 0. For large datasets that is much more write amplification than a multi-level design.
 - **Flushes and compactions run one at a time,** on the sequencer thread. New writes wait while a table is written, then commit in the next groups.
 - **Replica image cap:** a replica image is held in memory and capped at the 256 MiB snapshot-transfer limit. A larger dataset requires reprovisioning a replica that falls that far behind.
-- **No range scans:** the engine has no `SCAN` command, although tables are sorted.
+- **Scans merge every overlapping source:** `SCAN` merges the memtables with every table whose key range overlaps the scan, starting each table at its first block at or after the start key. Tombstones are skipped, so a range of mostly deleted keys costs reads that return nothing until compaction removes them.
 - **Snapshots are in-memory only:** the offline `snapshot` command refuses LSM directories; flushes are the LSM engine's checkpoints.

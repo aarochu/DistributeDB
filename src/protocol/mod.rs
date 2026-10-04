@@ -17,7 +17,8 @@
 //! ```
 //!
 //! `body_len` is `2..=1_048_576` bytes inclusive in v1 and `version = 1`.
-//! Request `kind`: `1=SET`, `2=GET`, `3=DELETE`, `4=EXISTS`, `5=STATS`. In a
+//! Request `kind`: `1=SET`, `2=GET`, `3=DELETE`, `4=EXISTS`, `5=STATS`,
+//! `6=SCAN`. In a
 //! response `kind` echoes the request kind and the payload is
 //! `status:u16 | data_len:u32 | data[data_len]`.
 //!
@@ -30,7 +31,9 @@
 
 use std::io::{Read, Write};
 
-use crate::command::{MAX_KEY_LEN, MAX_MUTATION_ENCODED_LEN, MIN_KEY_LEN, SET_FIXED_OVERHEAD};
+use crate::command::{
+    MAX_KEY_LEN, MAX_MUTATION_ENCODED_LEN, MAX_SCAN_LIMIT, MIN_KEY_LEN, SET_FIXED_OVERHEAD,
+};
 
 /// Protocol version encoded in every frame body (Technical-Design §4.1).
 pub const PROTOCOL_VERSION: u8 = 1;
@@ -50,6 +53,11 @@ pub const KIND_DELETE: u8 = 3;
 pub const KIND_EXISTS: u8 = 4;
 /// `kind` byte for a `STATS` request.
 pub const KIND_STATS: u8 = 5;
+/// `kind` byte for a `SCAN` request.
+pub const KIND_SCAN: u8 = 6;
+/// Largest `SCAN OK` data the server sends: a response body is
+/// `version:u8 | kind:u8 | status:u16 | data_len:u32 | data`.
+pub const MAX_SCAN_DATA_LEN: usize = MAX_BODY_LEN - 8;
 
 /// A request kind on the wire (Technical-Design §4.1).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -64,6 +72,8 @@ pub enum RequestKind {
     Exists,
     /// `STATS` (operational extension).
     Stats,
+    /// `SCAN start end limit` (ordered range read).
+    Scan,
 }
 
 impl RequestKind {
@@ -75,6 +85,7 @@ impl RequestKind {
             RequestKind::Delete => KIND_DELETE,
             RequestKind::Exists => KIND_EXISTS,
             RequestKind::Stats => KIND_STATS,
+            RequestKind::Scan => KIND_SCAN,
         }
     }
 
@@ -86,6 +97,7 @@ impl RequestKind {
             KIND_DELETE => Ok(RequestKind::Delete),
             KIND_EXISTS => Ok(RequestKind::Exists),
             KIND_STATS => Ok(RequestKind::Stats),
+            KIND_SCAN => Ok(RequestKind::Scan),
             other => Err(ProtocolError::UnknownKind(other)),
         }
     }
@@ -174,6 +186,16 @@ pub enum Request {
     },
     /// `STATS` — request operational statistics.
     Stats,
+    /// `SCAN` — up to `limit` pairs with `start <= key < end`, in key order.
+    /// An empty `start` begins at the first key; `end: None` is unbounded.
+    Scan {
+        /// Inclusive lower bound; may be empty.
+        start: Vec<u8>,
+        /// Exclusive upper bound.
+        end: Option<Vec<u8>>,
+        /// Maximum pairs, `1..=MAX_SCAN_LIMIT`.
+        limit: u32,
+    },
 }
 
 impl Request {
@@ -185,6 +207,7 @@ impl Request {
             Request::Delete { .. } => RequestKind::Delete,
             Request::Exists { .. } => RequestKind::Exists,
             Request::Stats => RequestKind::Stats,
+            Request::Scan { .. } => RequestKind::Scan,
         }
     }
 
@@ -206,6 +229,14 @@ impl Request {
                 body.extend_from_slice(key);
             }
             Request::Stats => {}
+            Request::Scan { start, end, limit } => {
+                let end = end.as_deref().unwrap_or_default();
+                body.extend_from_slice(&(start.len() as u32).to_le_bytes());
+                body.extend_from_slice(&(end.len() as u32).to_le_bytes());
+                body.extend_from_slice(&limit.to_le_bytes());
+                body.extend_from_slice(start);
+                body.extend_from_slice(end);
+            }
         }
         frame_from_body(&body)
     }
@@ -540,7 +571,99 @@ pub fn decode_request_body(body: &[u8]) -> Result<Request, ProtocolError> {
             }
             Ok(Request::Stats)
         }
+        RequestKind::Scan => {
+            let start_len = take_len_field(payload, 0, "start")? as usize;
+            let end_len = take_len_field(payload, 4, "end")? as usize;
+            let limit = take_len_field(payload, 8, "limit")?;
+            let fields_len = start_len
+                .checked_add(end_len)
+                .and_then(|len| len.checked_add(12))
+                .ok_or_else(|| ProtocolError::MalformedPayload("bound length overflow".into()))?;
+            if payload.len() < fields_len {
+                return Err(ProtocolError::MalformedPayload(
+                    "SCAN payload shorter than declared bounds".to_string(),
+                ));
+            }
+            if payload.len() > fields_len {
+                return Err(ProtocolError::TrailingBytes);
+            }
+            for len in [start_len, end_len] {
+                if len > MAX_KEY_LEN {
+                    return Err(ProtocolError::KeyLength(len));
+                }
+            }
+            if !(1..=MAX_SCAN_LIMIT as u32).contains(&limit) {
+                return Err(ProtocolError::MalformedPayload(format!(
+                    "SCAN limit {limit} outside 1..={MAX_SCAN_LIMIT}"
+                )));
+            }
+            let start = payload[12..12 + start_len].to_vec();
+            let end = payload[12 + start_len..fields_len].to_vec();
+            Ok(Request::Scan {
+                start,
+                end: (!end.is_empty()).then_some(end),
+                limit,
+            })
+        }
     }
+}
+
+/// Encode a `SCAN OK` page: `count:u32 | more:u8 | (key_len:u32 |
+/// value_len:u32 | key | value)*`. `more` tells the client to continue after
+/// the last key.
+pub fn encode_scan_page(pairs: &[(Vec<u8>, Vec<u8>)], more: bool) -> Vec<u8> {
+    let mut data = Vec::new();
+    data.extend_from_slice(&(pairs.len() as u32).to_le_bytes());
+    data.push(u8::from(more));
+    for (key, value) in pairs {
+        data.extend_from_slice(&(key.len() as u32).to_le_bytes());
+        data.extend_from_slice(&(value.len() as u32).to_le_bytes());
+        data.extend_from_slice(key);
+        data.extend_from_slice(value);
+    }
+    data
+}
+
+/// Encoded size of one pair in a `SCAN OK` page.
+pub fn scan_pair_len(key: &[u8], value: &[u8]) -> usize {
+    8 + key.len() + value.len()
+}
+
+/// A decoded `SCAN OK` page: pairs in key order, and whether more remain.
+pub type ScanPage = (Vec<(Vec<u8>, Vec<u8>)>, bool);
+
+/// Decode a `SCAN OK` page, rejecting truncation, trailing bytes, and an
+/// invalid `more` flag.
+pub fn decode_scan_page(data: &[u8]) -> Result<ScanPage, ProtocolError> {
+    let malformed = |why: &str| ProtocolError::MalformedPayload(format!("SCAN page: {why}"));
+    if data.len() < 5 {
+        return Err(malformed("shorter than its header"));
+    }
+    let count = read_u32(data, 0) as usize;
+    let more = match data[4] {
+        0 => false,
+        1 => true,
+        _ => return Err(malformed("invalid more flag")),
+    };
+    let mut pairs = Vec::new();
+    let mut at = 5;
+    for _ in 0..count {
+        let key_len = take_len_field(data, at, "key")? as usize;
+        let value_len = take_len_field(data, at + 4, "value")? as usize;
+        let end = (at + 8)
+            .checked_add(key_len)
+            .and_then(|len| len.checked_add(value_len))
+            .filter(|&end| end <= data.len())
+            .ok_or_else(|| malformed("pair overruns the page"))?;
+        let key = data[at + 8..at + 8 + key_len].to_vec();
+        let value = data[at + 8 + key_len..end].to_vec();
+        pairs.push((key, value));
+        at = end;
+    }
+    if at != data.len() {
+        return Err(ProtocolError::TrailingBytes);
+    }
+    Ok((pairs, more))
 }
 
 /// Decode a response body (`version:u8 | kind:u8 | status:u16 | data_len:u32 |

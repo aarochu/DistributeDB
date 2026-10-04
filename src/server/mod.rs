@@ -92,8 +92,8 @@ use std::time::{Duration, Instant};
 
 use crate::fileio::FileSystem;
 use crate::protocol::{
-    self, Request, Response, Status, KIND_DELETE, KIND_EXISTS, KIND_GET, KIND_SET, KIND_STATS,
-    PROTOCOL_VERSION,
+    self, Request, Response, Status, KIND_DELETE, KIND_EXISTS, KIND_GET, KIND_SCAN, KIND_SET,
+    KIND_STATS, PROTOCOL_VERSION,
 };
 use crate::replication::{PeerProgress, ReplicationStats};
 use crate::storage::{GetResult, Mutation};
@@ -569,7 +569,9 @@ where
                 let started = Instant::now();
                 let (response, keep_open) = dispatch(&body, shared);
                 match response.kind {
-                    KIND_GET | KIND_EXISTS => shared.metrics.read_latency.record(started.elapsed()),
+                    KIND_GET | KIND_EXISTS | KIND_SCAN => {
+                        shared.metrics.read_latency.record(started.elapsed())
+                    }
                     KIND_SET | KIND_DELETE => {
                         shared.metrics.write_latency.record(started.elapsed())
                     }
@@ -639,6 +641,29 @@ where
                     true,
                 ),
                 Err(error) => (read_failure(KIND_EXISTS, &error), true),
+            }
+        }
+        Request::Scan { start, end, limit } => {
+            shared.metrics.reads_total.fetch_add(1, Ordering::Relaxed);
+            let waiting = Instant::now();
+            let db = shared.db.read().expect("db read lock poisoned");
+            shared.metrics.read_lock_wait.record(waiting.elapsed());
+            match db.scan(&start, end.as_deref(), limit as usize) {
+                Ok((mut pairs, mut more)) => {
+                    // Cut the page where it would exceed one response frame;
+                    // the client continues after the last key it received.
+                    let mut len = 5;
+                    if let Some(fit) = pairs.iter().position(|(key, value)| {
+                        len += protocol::scan_pair_len(key, value);
+                        len > protocol::MAX_SCAN_DATA_LEN
+                    }) {
+                        pairs.truncate(fit);
+                        more = true;
+                    }
+                    let data = protocol::encode_scan_page(&pairs, more);
+                    (Response::new(KIND_SCAN, Status::Ok, data), true)
+                }
+                Err(error) => (read_failure(KIND_SCAN, &error), true),
             }
         }
         Request::Stats => {
