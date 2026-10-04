@@ -17,6 +17,10 @@
 
 use std::collections::HashMap;
 
+/// Pairs in key order from a range scan, and whether more remain past the
+/// last one.
+pub type ScanPage = (Vec<(Vec<u8>, Vec<u8>)>, bool);
+
 /// Result of a [`StorageEngine::get`] lookup.
 ///
 /// Per Technical-Design §2.1, a missing key ([`GetResult::NotFound`]) is
@@ -120,7 +124,7 @@ impl StorageEngine {
         start: &[u8],
         end: Option<&[u8]>,
         limit: usize,
-    ) -> (Vec<(Vec<u8>, Vec<u8>)>, bool) {
+    ) -> ScanPage {
         let mut keys: Vec<&Vec<u8>> = self
             .map
             .keys()

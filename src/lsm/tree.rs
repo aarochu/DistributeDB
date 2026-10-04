@@ -45,7 +45,7 @@ use super::merge::{MergeIter, Source};
 use super::sstable::{self, SsTable, SsTableBuilder};
 use super::{Lookup, LsmError, LsmResult};
 use crate::fileio::FileSystem;
-use crate::storage::Mutation;
+use crate::storage::{Mutation, ScanPage};
 
 /// Name of the manifest file inside the LSM directory.
 pub const MANIFEST_FILE: &str = "MANIFEST";
@@ -325,7 +325,7 @@ impl<F: FileSystem + Clone> LsmTree<F> {
         start: &[u8],
         end: Option<&[u8]>,
         limit: usize,
-    ) -> LsmResult<(Vec<(Vec<u8>, Vec<u8>)>, bool)> {
+    ) -> LsmResult<ScanPage> {
         let mut sources: Vec<Source<'_>> = Vec::new();
         sources.push(Box::new(
             self.memtable

@@ -53,7 +53,7 @@ use crate::lsm::tree::{
     CompactedTables, CompactionJob, FlushJob, LsmConfig, LsmTree, WrittenTable,
 };
 use crate::lsm::{LsmError, LsmResult};
-use crate::storage::{GetResult, Mutation, StorageEngine};
+use crate::storage::{GetResult, Mutation, ScanPage, StorageEngine};
 use current::Current;
 use format::{
     DecodedRecord, FormatError, GroupFooter, MutationRecord, RecordType, SegmentHeader,
@@ -2328,7 +2328,7 @@ impl<F: FileSystem + Clone> Db<F> {
         start: &[u8],
         end: Option<&[u8]>,
         limit: usize,
-    ) -> WalResult<(Vec<(Vec<u8>, Vec<u8>)>, bool)> {
+    ) -> WalResult<ScanPage> {
         match &self.engine {
             Engine::Memory(engine) => Ok(engine.scan(start, end, limit)),
             Engine::Lsm(tree) => Ok(tree.scan(start, end, limit)?),

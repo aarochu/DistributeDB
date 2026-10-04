@@ -630,7 +630,7 @@ pub fn scan_pair_len(key: &[u8], value: &[u8]) -> usize {
 }
 
 /// A decoded `SCAN OK` page: pairs in key order, and whether more remain.
-pub type ScanPage = (Vec<(Vec<u8>, Vec<u8>)>, bool);
+pub use crate::storage::ScanPage;
 
 /// Decode a `SCAN OK` page, rejecting truncation, trailing bytes, and an
 /// invalid `more` flag.
