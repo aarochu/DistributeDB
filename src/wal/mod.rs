@@ -60,6 +60,7 @@ use format::{
     GROUP_FOOTER_LEN, GROUP_MAGIC, MAX_RECORD_ENCODED_LEN, SEGMENT_HEADER_LEN,
 };
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 /// Maximum records per group (Technical-Design §6.1).
@@ -1070,6 +1071,14 @@ impl<F: FileSystem + Clone> Engine<F> {
     }
 }
 
+/// Reports the lowest LSN a connected replica has acknowledged, if any.
+pub type ReplicationFloor = Arc<dyn Fn() -> Option<u64> + Send + Sync>;
+
+/// Records the LSM engine keeps beyond its flush boundary for a slow
+/// connected replica. A replica further behind is offered a table image when
+/// it reconnects.
+const MAX_PINNED_RECORDS: u64 = 1_000_000;
+
 /// LSM counters reported by `STATS`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LsmStats {
@@ -1152,6 +1161,9 @@ pub struct Db<F: FileSystem + Clone> {
     /// Stale recovery generations this process has removed (see
     /// [`Db::remove_stale_generations`]).
     generations_removed: u64,
+    /// Lowest LSN connected replicas still need; set by the replication
+    /// listener.
+    replication_floor: Option<ReplicationFloor>,
     /// LSM flushes and compactions installed by this process.
     lsm_flushes: u64,
     lsm_compactions: u64,
@@ -1421,6 +1433,7 @@ impl<F: FileSystem + Clone> Db<F> {
             records_replayed: outcome.records.len() as u64,
             recovery_duration: recovery_started.elapsed(),
             generations_removed,
+            replication_floor: None,
             lsm_flushes: 0,
             lsm_compactions: 0,
             retention_budget_bytes: config.retention_budget_bytes,
@@ -2007,26 +2020,26 @@ impl<F: FileSystem + Clone> Db<F> {
     /// Clone the verified active snapshot for a replica that cannot verify a
     /// reclaimed WAL prefix. The transfer layer bounds the offered size.
     pub fn replication_snapshot(&self) -> WalResult<Option<ReplicationSnapshot>> {
-        if self.snapshot_lsn == 0 {
-            return Ok(None);
-        }
         if let Engine::Lsm(tree) = &self.engine {
-            // The LSM base is its installed tables, which hold exactly the
-            // state at the flush boundary; encode them as a snapshot image.
+            // The installed tables hold exactly the state at their flush
+            // boundary, which is at or after the history base, so the records
+            // after it are retained. Encode them as a snapshot image.
+            let (lsn, record_hash) = (tree.flushed_lsn(), tree.flushed_hash());
+            if lsn == 0 {
+                return Ok(None);
+            }
             let pairs = tree.table_pairs()?;
-            let bytes = snapshot::encode(
-                self.wal.identity.cluster_id,
-                self.snapshot_lsn,
-                self.snapshot_hash,
-                &pairs,
-            );
+            let bytes = snapshot::encode(self.wal.identity.cluster_id, lsn, record_hash, &pairs);
             let crc64 = u64::from_le_bytes(bytes[bytes.len() - 8..].try_into().unwrap());
             return Ok(Some(ReplicationSnapshot {
                 bytes,
-                lsn: self.snapshot_lsn,
-                record_hash: self.snapshot_hash,
+                lsn,
+                record_hash,
                 crc64,
             }));
+        }
+        if self.snapshot_lsn == 0 {
+            return Ok(None);
         }
         let bytes = self
             .wal
@@ -2396,12 +2409,29 @@ impl<F: FileSystem + Clone> Db<F> {
         }
         let (base, hash) = (tree.flushed_lsn(), tree.flushed_hash());
         self.lsm_flushes += 1;
-        self.advance_history_base(base, hash);
+        // Replication history follows the flush boundary, but stays at the
+        // slowest connected replica within a bounded distance. The WAL files
+        // are not needed for that: history is served from memory.
+        let floor = self.replication_floor.as_ref().and_then(|floor| floor());
+        let history_base = match floor {
+            Some(floor) if floor < base && base - floor <= MAX_PINNED_RECORDS => {
+                floor.max(self.snapshot_lsn)
+            }
+            _ => base,
+        };
+        let history_hash = self.record_hash_at(history_base).unwrap_or(hash);
+        self.advance_history_base(history_base, history_hash);
         let reclaimed = self.reclaim_wal_through(base);
         if reclaimed.is_err() {
             self.wal.failed = true;
         }
         reclaimed
+    }
+
+    /// Let a primary's replication listener report the lowest LSN connected
+    /// replicas still need, so LSM flushes keep that history.
+    pub fn set_replication_floor(&mut self, floor: ReplicationFloor) {
+        self.replication_floor = Some(floor);
     }
 
     /// Start a compaction if level 0 has reached its trigger.

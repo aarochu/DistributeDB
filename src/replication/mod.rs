@@ -80,6 +80,16 @@ impl ReplicationStats {
         }
     }
 
+    /// The lowest acknowledged LSN among connected replicas, if any.
+    pub fn min_connected_applied(&self) -> Option<u64> {
+        let peers = self.peers.lock().expect("replication stats poisoned");
+        peers
+            .values()
+            .filter(|progress| progress.connected)
+            .map(|progress| progress.applied_lsn)
+            .min()
+    }
+
     pub fn snapshot(&self) -> Vec<([u8; 16], PeerProgress)> {
         let peers = self.peers.lock().expect("replication stats poisoned");
         let mut snapshot: Vec<_> = peers
@@ -136,7 +146,7 @@ impl PrimaryListener {
         F: FileSystem + Clone + Send + Sync + 'static,
     {
         {
-            let guard = db.read().expect("db lock poisoned");
+            let mut guard = db.write().expect("db lock poisoned");
             if guard.identity().role != "primary"
                 || guard.durability_mode() != DurabilityMode::Fsync
             {
@@ -145,6 +155,10 @@ impl PrimaryListener {
                     "replication requires an fsync primary",
                 ));
             }
+            // Keep history that connected replicas still need when the LSM
+            // engine flushes.
+            let floor_stats = Arc::clone(&stats);
+            guard.set_replication_floor(Arc::new(move || floor_stats.min_connected_applied()));
         }
         let listener = TcpListener::bind(addr)?;
         let local_addr = listener.local_addr()?;
@@ -399,12 +413,11 @@ where
             let guard = db.read().expect("db lock poisoned");
             guard.durable_records_after(cursor, MAX_GROUP_RECORDS)
         };
+        // History before the cursor was released (a snapshot, or an LSM flush
+        // past the pinned floor). Close the connection rather than failing the
+        // replica: its reconnect handshake offers an image when the replica
+        // is provisioned for rebootstrap, and refuses it otherwise.
         let Some(records) = next else {
-            send_error(
-                &mut stream,
-                protocol::ERROR_REBOOTSTRAP_REQUIRED,
-                "required WAL was reclaimed",
-            );
             return Err(protocol::Error::Invalid("required WAL was reclaimed"));
         };
         if !records.is_empty() {
