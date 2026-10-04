@@ -20,3 +20,32 @@ The CSV includes revision, build mode, operating system, architecture, kernel, s
 `benchmarks/ci_benchmark.sh` starts each configuration locally (fsync primary, disposable `os` primary, fsync primary with one asynchronous replica, and fsync primary with two asynchronous replicas) and runs the three mixes against it; the **Benchmarks** GitHub workflow runs it and uploads the CSV. Client, server, and replicas share one runner, so these rows measure the whole stack on that runner rather than a networked deployment.
 
 Publish individual CSV rows and a summary of median and variability for each configuration only after the runs have been executed. State the host, storage device, filesystem and mount options, node placement, and whether any result was excluded. A CI runner result is useful for regression comparison on that runner class but is not a hardware-independent performance claim.
+
+## Snapshot and WAL recovery comparison
+
+`benchmarks/run_recovery_benchmark.sh` measures the SOW §9 claim that a
+snapshot reduces WAL replay work. It creates two temporary `fsync` data
+directories and applies the same ordered SET mutations to both. One keeps a
+full WAL; the other publishes a snapshot after the initial records. Both then
+receive the same short tail. The benchmark verifies every final key/value,
+the final LSN, and the expected replay count before writing its CSV. Temporary
+data is removed; the CSV and context file remain.
+
+```sh
+DDB_RECOVERY_RECORDS=10000 DDB_RECOVERY_TAIL=500 \
+  DDB_RECOVERY_KEYS=2000 DDB_RECOVERY_TRIALS=7 \
+  bash benchmarks/run_recovery_benchmark.sh
+```
+
+Each path is opened once to warm the filesystem cache. The seven measured
+opens alternate which path goes first. CSV rows contain the internal recovery
+duration, whole `Db::open` duration, replayed records, snapshot LSN, and data
+size. The companion context file records revision, UTC time, Rust version,
+kernel, reported filesystem, and runner. The GitHub recovery benchmark workflow
+runs this procedure and uploads both files. The two directories have distinct
+node identities but identical mutations and final key/value state. A snapshot
+adds a separate file and changes the disk layout, so elapsed times compare
+these two recovery strategies rather than isolating the cost of replay alone.
+The replay counts are the direct evidence for the bounded-work claim. Timing
+on a shared runner is a diagnostic sample, not a fixed restart-time guarantee
+or evidence of power-loss durability.

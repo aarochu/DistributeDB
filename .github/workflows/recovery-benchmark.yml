@@ -1,0 +1,29 @@
+name: Recovery benchmark
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - "src/bin/ddb_recovery_bench.rs"
+      - "benchmarks/run_recovery_benchmark.sh"
+      - ".github/workflows/recovery-benchmark.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  recovery:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Toolchain
+        run: rustc --version && cargo --version
+      - name: Compare full WAL and snapshot-tail recovery
+        run: DDB_RECOVERY_OUTPUT=bench-out/recovery.csv DDB_STORAGE_MEDIUM=ci-runner-disk bash benchmarks/run_recovery_benchmark.sh
+      - name: Upload measurements
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: recovery-benchmark-results
+          path: bench-out/

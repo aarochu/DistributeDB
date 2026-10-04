@@ -1,6 +1,6 @@
 # Benchmark results
 
-Each CSV in this directory holds one row per `ddb_bench` run, in the format described in [the benchmark method](../../docs/benchmarks.md). Summaries below are computed from those rows; nothing has been excluded.
+Most CSVs in this directory hold one row per `ddb_bench` workload run, in the format described in [the benchmark method](../../docs/benchmarks.md). The recovery CSV uses its own schema, described below. Summaries are computed from the linked rows; nothing has been excluded.
 
 ## 2026-10-01 — GitHub Actions runner
 
@@ -67,3 +67,14 @@ Each measured interval lasted less than a second. Configuration order was fixed,
 ## 2026-10-04 — LSM and in-memory engine comparison
 
 [`20261004T183724Z-engine-memory.csv`](20261004T183724Z-engine-memory.csv) and [`20261004T183724Z-engine-lsm.csv`](20261004T183724Z-engine-lsm.csv) compare the two storage engines from one build: 100,000 keys of 128 bytes, three trials per mix, a fresh fsync primary per run. See [performance engineering](../../docs/performance.md#phase-8-lsm-engine-compared-with-the-in-memory-engine).
+
+## 2026-10-04 — snapshot recovery versus full WAL
+
+[`20261004T235715Z-recovery.csv`](20261004T235715Z-recovery.csv) and its [run context](20261004T235715Z-recovery.context.txt) came from [workflow run 37245574714](https://github.com/aarochu/DistributeDB/actions/runs/37245574714). The two `fsync` directories received the same 10,500 SET mutations over 2,000 keys with 128-byte values. One published a snapshot after LSN 10,000, then both received the same 500-record tail. The benchmark verified every final key/value and the final LSN before publishing the rows. Seven measured opens per path followed one warm-up open, with path order alternating; no rows were excluded.
+
+| Recovery base | WAL records replayed | Internal recovery time, median (range) | Whole open time, median (range) |
+|---|---:|---:|---:|
+| Full WAL | 10,500 | 12.03 ms (11.98–12.73) | 12.38 ms (12.35–13.08) |
+| Snapshot + tail | 500 | 2.13 ms (2.12–2.15) | 2.22 ms (2.21–2.24) |
+
+The snapshot path replayed 10,000 fewer records and was faster in this run. These are warm-cache timings on one GitHub-hosted `ubuntu-24.04` runner with ext4 reported by `df -T`; the storage device and mount options were not captured. The snapshot changes disk layout and retained bytes (383,043 versus 1,823,251), so the timing difference cannot be attributed solely to replay. This small, shared-runner experiment demonstrates reduced replay work; it does not establish a fixed recovery-time bound or hardware power-loss behavior.
