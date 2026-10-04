@@ -74,7 +74,7 @@ For a reproducible three-node Docker demo, use [the local cluster guide](docs/do
 
 CI runs formatting, Clippy, Rust tests, and documentation checks. Passing these checks supports the tested scenarios; it does not prove power-loss durability on physical hardware. The workload mixes are 90/10, 50/50, and 10/90 GET/SET; [published results](benchmarks/results/README.md) come from a shared CI runner and are for comparing revisions, not a hardware performance claim.
 
-See [development setup](docs/Development-Setup.md), [recovery notes](docs/recovery.md), [failure testing](docs/failure-testing.md), and [benchmark method](docs/benchmarks.md) for test and operator details.
+See [development setup](docs/Development-Setup.md), [recovery notes](docs/recovery.md), [failure testing](docs/failure-testing.md), [benchmark method](docs/benchmarks.md), and [`STATS` fields](docs/observability.md) for test and operator details.
 
 ## License
 
