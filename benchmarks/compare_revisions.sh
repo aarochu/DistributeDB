@@ -19,12 +19,16 @@ out_dir=${3:-benchmarks/results}
 : "${DDB_VALUE_BYTES:=128}"
 : "${DDB_FILESYSTEM:=$(df -T . | awk 'NR==2 {print $2}')}"
 : "${DDB_STORAGE_MEDIUM:=unspecified}"
+# 0 or 1: attach one asynchronous replica from the same build to each run.
+: "${DDB_REPLICAS:=0}"
 
 repo=$(pwd)
 work=$(mktemp -d)
 server_pid=''
+replica_pid=''
 cleanup() {
   if [[ -n "$server_pid" ]]; then kill "$server_pid" 2>/dev/null || true; fi
+  if [[ -n "$replica_pid" ]]; then kill "$replica_pid" 2>/dev/null || true; fi
   for label in base head; do
     git -C "$repo" worktree remove --force "$work/$label" 2>/dev/null || true
   done
@@ -66,16 +70,28 @@ for trial in $(seq 1 "$DDB_TRIALS"); do
         < <(sleep infinity) >"$data.log" 2>&1 &
       server_pid=$!
       wait_port "$port"
+      if [[ "$DDB_REPLICAS" -gt 0 ]]; then
+        cluster=$(awk -F': ' '/^cluster ID:/ {print $2}' "$data.log")
+        "$build/distributedb" replica --primary-addr "127.0.0.1:$((port + 1))" \
+          --cluster-id "$cluster" --data "$data-replica" \
+          < <(sleep infinity) >"$data-replica.log" 2>&1 &
+        replica_pid=$!
+      fi
       printf '%s trial %s, GET ratio %s: ' "$label" "$trial" "$ratio" >&2
       # Run from the worktree so the CSV records that revision.
       (cd "$work/$label" && timeout 300 "$build/ddb_bench" --addr "127.0.0.1:$port" \
         --clients "$DDB_CLIENTS" --operations "$DDB_OPERATIONS" \
         --warmup "$DDB_WARMUP" --keys "$DDB_KEYS" \
         --value-bytes "$DDB_VALUE_BYTES" --read-ratio "$ratio" \
-        --seed "$trial" --topology "compare-$label" \
+        --seed "$trial" --topology "compare-$label" --replicas "$DDB_REPLICAS" \
         --filesystem "$DDB_FILESYSTEM" --storage-medium "$DDB_STORAGE_MEDIUM" \
         --server-pid "$server_pid" --data-dir "$data" \
         --output "$repo/$out_dir/$stamp-compare-$label.csv")
+      if [[ -n "$replica_pid" ]]; then
+        kill "$replica_pid"
+        wait "$replica_pid" 2>/dev/null || true
+        replica_pid=''
+      fi
       kill "$server_pid"
       wait "$server_pid" 2>/dev/null || true
       server_pid=''

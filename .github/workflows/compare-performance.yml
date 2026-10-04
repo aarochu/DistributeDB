@@ -6,6 +6,7 @@ on:
       - "src/server/**"
       - "src/wal/**"
       - "src/storage/**"
+      - "src/replication/**"
       - "benchmarks/compare_revisions.sh"
       - "benchmarks/summarize_comparison.py"
       - ".github/workflows/compare-performance.yml"
@@ -37,6 +38,14 @@ jobs:
           HEAD: ${{ github.event.pull_request.head.sha || inputs.head }}
           DDB_STORAGE_MEDIUM: ci-runner-disk
         run: bash benchmarks/compare_revisions.sh "$BASE" "$HEAD" compare-out
+      - name: Compare base and head with one replica attached
+        env:
+          BASE: ${{ github.event.pull_request.base.sha || inputs.base }}
+          HEAD: ${{ github.event.pull_request.head.sha || inputs.head }}
+          DDB_STORAGE_MEDIUM: ci-runner-disk
+          DDB_REPLICAS: "1"
+          DDB_TRIALS: "3"
+        run: bash benchmarks/compare_revisions.sh "$BASE" "$HEAD" compare-out/replica
       - name: Upload results
         if: always()
         uses: actions/upload-artifact@v4

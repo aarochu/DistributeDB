@@ -17,6 +17,7 @@ METRICS = [
     ("server_read_p99_us", "server read p99 µs", 1.0),
     ("server_read_lock_wait_p99_us", "read-lock wait p99 µs", 1.0),
     ("server_write_lock_hold_p99_us", "write-lock hold p99 µs", 1.0),
+    ("replica_catch_up_ms", "replica catch-up ms", 1.0),
 ]
 
 
@@ -57,6 +58,8 @@ def main():
         for column, label, scale in METRICS:
             before = median(base[mix], column, scale)
             after = median(head.get(mix, []), column, scale)
+            if before is None and after is None:
+                continue
             change = "n/a"
             if before and after is not None:
                 change = f"{(after - before) / before * 100:+.0f}%"
