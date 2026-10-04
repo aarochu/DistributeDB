@@ -31,6 +31,21 @@ The server uses one mutation sequencer and a bounded write queue. In `fsync` mod
 
 Asynchronous replication sends only locally durable records. A primary `OK` means **local** durability, not replica durability. A disconnected replica may lag. If a connection drops before a client receives `OK`, the write outcome is unknown and the client must reconcile before retrying an operation whose repetition matters. A replica behind the retained WAL can install a snapshot only if it was explicitly provisioned to permit rebootstrap; see [replication and recovery](docs/replication.md) for limits.
 
+### Asynchronous versus synchronous replication
+
+DistributeDB implements asynchronous replication. SOW §11 allows a later synchronous mode, which is not implemented. The two approaches differ in what an `OK` promises:
+
+| | Asynchronous (implemented) | Synchronous (not implemented) |
+|---|---|---|
+| When the client gets `OK` | After the primary's own WAL group is synced and applied | After at least one replica has also synced the record |
+| Acknowledged write survives loss of the primary's disk | Only if replication had already delivered it | Yes, if an acknowledging replica survives |
+| Write latency | One local sync | One local sync plus a network round trip and the replica's sync |
+| Primary with no reachable replica | Keeps accepting writes; replicas catch up later | Blocks writes or must fall back to async, a policy that has to be specified |
+
+Asynchronous mode therefore leaves a window of acknowledged writes that exist only on the primary. That window is the replica's lag in `STATS`. A replica restart or network gap loses nothing, because the primary still holds those records and the replica catches up from them. Losing or destroying the primary's storage before catch-up loses the writes in the window. Process crashes do not: the primary recovers acknowledged writes from its own WAL.
+
+Synchronous acknowledgment would close that window at the cost of latency and availability. On its own it would not give safe automatic failover. That also needs a commit protocol, fencing of a stale primary, and an election (SOW §24 stretch goals; [technical design](docs/Technical-Design.md) §8). For the cost of the asynchronous stream itself, compare the one- and two-replica rows with the single-primary `fsync` rows in the [published benchmark results](benchmarks/results/README.md).
+
 ## Run the current server
 
 Use Rust 1.92 or newer on the [supported filesystem profile](docs/ADR-001-Language-and-Filesystem.md). Each server needs its own data directory. The demo listener is unauthenticated and should remain on loopback.
