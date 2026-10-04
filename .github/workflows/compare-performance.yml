@@ -7,6 +7,9 @@ on:
       - "src/wal/**"
       - "src/storage/**"
       - "src/replication/**"
+      - "src/lsm/**"
+      - "src/bin/ddb_bench.rs"
+      - "benchmarks/compare_engines.sh"
       - "benchmarks/compare_revisions.sh"
       - "benchmarks/summarize_comparison.py"
       - ".github/workflows/compare-performance.yml"
@@ -46,6 +49,10 @@ jobs:
           DDB_REPLICAS: "1"
           DDB_TRIALS: "3"
         run: bash benchmarks/compare_revisions.sh "$BASE" "$HEAD" compare-out/replica
+      - name: Compare the in-memory and LSM engines
+        env:
+          DDB_STORAGE_MEDIUM: ci-runner-disk
+        run: bash benchmarks/compare_engines.sh compare-out/engines
       - name: Upload results
         if: always()
         uses: actions/upload-artifact@v4

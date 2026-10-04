@@ -89,6 +89,28 @@ fn flag_value(args: &[String], flag: &str) -> Option<String> {
     None
 }
 
+/// `--storage memory|lsm` (default `memory`) and, for `lsm`, an optional
+/// `--memtable-bytes N` flush threshold.
+fn storage_flag(args: &[String]) -> Result<distributedb::StorageKind, Box<dyn std::error::Error>> {
+    use distributedb::{LsmConfig, StorageKind};
+
+    match flag_value(args, "--storage").as_deref() {
+        None | Some("memory") => Ok(StorageKind::Memory),
+        Some("lsm") => {
+            let mut config = LsmConfig::default();
+            if let Some(bytes) = flag_value(args, "--memtable-bytes") {
+                config.memtable_bytes = bytes
+                    .parse()
+                    .ok()
+                    .filter(|&bytes| bytes > 0)
+                    .ok_or("--memtable-bytes must be a positive integer")?;
+            }
+            Ok(StorageKind::Lsm(config))
+        }
+        Some(_) => Err("--storage must be memory or lsm".into()),
+    }
+}
+
 /// Publish a local snapshot while the primary is stopped. `Db::open` holds
 /// the exclusive data-directory lock, so a concurrent server makes this fail
 /// before any snapshot files are changed.
@@ -130,8 +152,18 @@ fn serve_command(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
             .into_owned()
     });
 
-    let db = Db::open(RealFs, std::path::Path::new(&data_dir), durability)?;
+    let storage = storage_flag(args)?;
+    let db = Db::open_configured(
+        RealFs,
+        std::path::Path::new(&data_dir),
+        durability,
+        OpenConfig {
+            storage,
+            ..OpenConfig::default()
+        },
+    )?;
     let cluster_id = distributedb::replication::format_id(&db.identity().cluster_id);
+    println!("storage engine: {}", db.storage_engine());
     let shared = Arc::new(RwLock::new(db));
     let stats = Arc::new(ReplicationStats::default());
     let allow_non_loopback = args
@@ -235,6 +267,7 @@ fn replica_command(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
             role: NodeRole::Replica,
             cluster_id: Some(cluster_id),
             allow_snapshot_rebootstrap: provision_rebootstrap,
+            storage: storage_flag(args)?,
             ..OpenConfig::default()
         },
     )?;
