@@ -97,7 +97,10 @@ use crate::protocol::{
 };
 use crate::replication::{PeerProgress, ReplicationStats};
 use crate::storage::{GetResult, Mutation};
-use crate::wal::{Db, DurabilityMode, MAX_GROUP_BYTES, MAX_GROUP_RECORDS};
+use crate::wal::{Db, DurabilityMode, WalSyncStats, MAX_GROUP_BYTES, MAX_GROUP_RECORDS};
+
+mod latency;
+use latency::LatencyHistogram;
 
 /// Default maximum number of concurrent connections (Technical-Design §16, §5).
 pub const DEFAULT_MAX_CONNECTIONS: usize = 128;
@@ -165,6 +168,12 @@ struct Metrics {
     reads_total: AtomicU64,
     writes_total: AtomicU64,
     connected_clients: AtomicUsize,
+    /// Server-side service time of `GET`/`EXISTS`, from a decoded frame to
+    /// its encoded response. Network transit is excluded.
+    read_latency: LatencyHistogram,
+    /// Server-side service time of `SET`/`DELETE`, including sequencer queueing
+    /// and the group commit that made the write durable.
+    write_latency: LatencyHistogram,
 }
 
 /// The outcome the sequencer returns for a submitted write: the assigned LSN on
@@ -493,7 +502,17 @@ where
                     .metrics
                     .requests_total
                     .fetch_add(1, Ordering::Relaxed);
+                let started = Instant::now();
                 let (response, keep_open) = dispatch(&body, shared);
+                match response.kind {
+                    KIND_GET | KIND_EXISTS => {
+                        shared.metrics.read_latency.record(started.elapsed())
+                    }
+                    KIND_SET | KIND_DELETE => {
+                        shared.metrics.write_latency.record(started.elapsed())
+                    }
+                    _ => {}
+                }
                 if writer.write_all(&response.encode()).is_err() {
                     break;
                 }
@@ -725,14 +744,25 @@ fn render_stats<F>(shared: &Arc<Shared<F>>) -> String
 where
     F: FileSystem + Clone + Send + Sync + 'static,
 {
-    let (keys, current_lsn, durable_lsn, snapshot_lsn) = {
+    let (keys, current_lsn, durable_lsn, snapshot_lsn, role, durability, wal_sync, recovery) = {
         let db = shared.db.read().expect("db read lock poisoned");
+        let durability = match db.durability_mode() {
+            DurabilityMode::Fsync => "fsync",
+            DurabilityMode::Os => "os",
+        };
         (
             db.len(),
             db.last_applied_lsn(),
             db.last_durable_lsn(),
             db.snapshot_lsn(),
+            db.identity().role.clone(),
+            durability,
+            db.wal_sync_stats(),
+            (db.recovery_duration(), db.records_replayed()),
         )
+    };
+    let percentiles = |histogram: &LatencyHistogram| {
+        [500, 950, 990].map(|per_mille| histogram.percentile_nanos(per_mille))
     };
     let replicas = shared
         .config
@@ -751,6 +781,13 @@ where
         snapshot_lsn,
         connected_clients: shared.metrics.connected_clients.load(Ordering::Relaxed),
         replicas,
+        role,
+        durability,
+        read_latency: percentiles(&shared.metrics.read_latency),
+        write_latency: percentiles(&shared.metrics.write_latency),
+        wal_sync,
+        recovery_duration: recovery.0,
+        records_replayed: recovery.1,
     };
     render_stats_lines(&snapshot)
 }
@@ -770,6 +807,23 @@ struct StatsSnapshot {
     snapshot_lsn: u64,
     connected_clients: usize,
     replicas: Vec<([u8; 16], PeerProgress)>,
+    role: String,
+    durability: &'static str,
+    /// p50/p95/p99 in nanoseconds; `None` before the first sample.
+    read_latency: [Option<u64>; 3],
+    write_latency: [Option<u64>; 3],
+    wal_sync: WalSyncStats,
+    recovery_duration: Duration,
+    records_replayed: u64,
+}
+
+/// Render nanoseconds as whole microseconds, rounded up so a nonzero latency
+/// never reads as zero; `unknown` before the first sample.
+fn micros(nanos: Option<u64>) -> String {
+    match nanos {
+        Some(nanos) => nanos.div_ceil(1000).to_string(),
+        None => "unknown".to_string(),
+    }
 }
 
 /// Render a [`StatsSnapshot`] as bounded UTF-8 `name=value` lines with
@@ -787,6 +841,29 @@ fn render_stats_lines(s: &StatsSnapshot) -> String {
     out.push_str(&format!("durable_lsn={}\n", s.durable_lsn));
     out.push_str(&format!("snapshot_lsn={}\n", s.snapshot_lsn));
     out.push_str(&format!("connected_clients={}\n", s.connected_clients));
+    out.push_str(&format!("role={}\n", s.role));
+    out.push_str(&format!("durability={}\n", s.durability));
+    // Records recovery would replay after the snapshot boundary.
+    let wal_entries = s.current_lsn.saturating_sub(s.snapshot_lsn);
+    out.push_str(&format!("wal_entries={wal_entries}\n"));
+    for (class, values) in [("read", s.read_latency), ("write", s.write_latency)] {
+        for (name, value) in ["p50", "p95", "p99"].into_iter().zip(values) {
+            out.push_str(&format!("{class}_latency_{name}_us={}\n", micros(value)));
+        }
+    }
+    let sync = &s.wal_sync;
+    out.push_str(&format!("wal_syncs_total={}\n", sync.syncs));
+    out.push_str(&format!("wal_sync_errors_total={}\n", sync.errors));
+    let syncs = u128::from(sync.syncs);
+    let average = sync.total.as_nanos().checked_div(syncs);
+    let average = micros(average.map(|nanos| nanos as u64));
+    out.push_str(&format!("wal_sync_avg_us={average}\n"));
+    let max = (sync.syncs > 0).then(|| sync.max.as_nanos() as u64);
+    out.push_str(&format!("wal_sync_max_us={}\n", micros(max)));
+    let recovery_us = micros(Some(s.recovery_duration.as_nanos() as u64));
+    out.push_str(&format!("recovery_us={recovery_us}\n"));
+    let replayed = s.records_replayed;
+    out.push_str(&format!("recovery_records_replayed={replayed}\n"));
     let connected = s.replicas.iter().filter(|(_, peer)| peer.connected).count();
     out.push_str(&format!("replicas_connected={connected}\n"));
     for (id, peer) in &s.replicas {
@@ -888,6 +965,18 @@ mod tests {
             snapshot_lsn: 20,
             connected_clients: 2,
             replicas: Vec::new(),
+            role: "primary".into(),
+            durability: "fsync",
+            read_latency: [Some(1_500), Some(9_000), None],
+            write_latency: [None; 3],
+            wal_sync: WalSyncStats {
+                syncs: 4,
+                errors: 0,
+                total: Duration::from_micros(400),
+                max: Duration::from_micros(250),
+            },
+            recovery_duration: Duration::from_millis(12),
+            records_replayed: 10,
         };
         let text = render_stats_lines(&snapshot);
         let lines: Vec<&str> = text.lines().collect();
@@ -907,7 +996,24 @@ mod tests {
         assert!(text.contains("snapshot_lsn=20"));
         assert!(text.contains("connected_clients=2"));
         assert!(text.contains("replicas_connected=0"));
+        for expected in [
+            "role=primary",
+            "durability=fsync",
+            "wal_entries=10",
+            "read_latency_p50_us=2",
+            "read_latency_p95_us=9",
+            "read_latency_p99_us=unknown",
+            "write_latency_p50_us=unknown",
+            "wal_syncs_total=4",
+            "wal_sync_errors_total=0",
+            "wal_sync_avg_us=100",
+            "wal_sync_max_us=250",
+            "recovery_us=12000",
+            "recovery_records_replayed=10",
+        ] {
+            assert!(lines.contains(&expected), "missing {expected}");
+        }
         // Bounded: a small fixed number of lines.
-        assert_eq!(lines.len(), 11);
+        assert_eq!(lines.len(), 26);
     }
 }

@@ -56,6 +56,6 @@ pub use wal::snapshot::{
     SnapshotHeader,
 };
 pub use wal::{
-    Db, DurabilityMode, Identity, NodeRole, OpenConfig, Wal, WalError, WalResult,
+    Db, DurabilityMode, Identity, NodeRole, OpenConfig, Wal, WalError, WalResult, WalSyncStats,
     DEFAULT_RETENTION_BUDGET_BYTES,
 };

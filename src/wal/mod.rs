@@ -56,7 +56,7 @@ use format::{
     GROUP_FOOTER_LEN, GROUP_MAGIC, MAX_RECORD_ENCODED_LEN, SEGMENT_HEADER_LEN,
 };
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 /// Maximum records per group (Technical-Design §6.1).
 pub const MAX_GROUP_RECORDS: usize = 64;
@@ -618,9 +618,30 @@ pub struct Wal<F: FileSystem> {
     active_len: u64,
     /// Fail-closed flag: once set, all mutations are rejected.
     failed: bool,
+    /// Group-commit sync counters since this process opened the WAL.
+    sync_stats: WalSyncStats,
+}
+
+/// Group-commit `fsync` counters since the WAL was opened (SOW §17 "WAL flush
+/// latency"; Technical-Design §10). Counters reset on process restart.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct WalSyncStats {
+    /// Successful group syncs.
+    pub syncs: u64,
+    /// Failed group syncs. The first failure makes the WAL fail closed.
+    pub errors: u64,
+    /// Total time spent in successful group syncs.
+    pub total: Duration,
+    /// Longest successful group sync.
+    pub max: Duration,
 }
 
 impl<F: FileSystem> Wal<F> {
+    /// Group-commit sync counters since this WAL was opened.
+    pub fn sync_stats(&self) -> WalSyncStats {
+        self.sync_stats
+    }
+
     /// The durability mode this writer was opened with.
     pub fn mode(&self) -> DurabilityMode {
         self.mode
@@ -707,10 +728,16 @@ impl<F: FileSystem> Wal<F> {
             return Err(WalError::Io(e));
         }
         if self.mode == DurabilityMode::Fsync {
+            let started = Instant::now();
             if let Err(e) = self.fs.sync_file(&seg_path) {
+                self.sync_stats.errors += 1;
                 self.failed = true;
                 return Err(WalError::Io(e));
             }
+            let elapsed = started.elapsed();
+            self.sync_stats.syncs += 1;
+            self.sync_stats.total += elapsed;
+            self.sync_stats.max = self.sync_stats.max.max(elapsed);
             self.durable_lsn = last_lsn;
         }
 
@@ -905,6 +932,9 @@ pub struct Db<F: FileSystem> {
     /// `last_applied_lsn - snapshot_lsn` (Technical-Design §7 claim boundary;
     /// SOW §22 recovery-work-reduction acceptance goal).
     records_replayed: u64,
+    /// Wall time [`Db::open`] spent from acquiring the data-directory lock
+    /// through rebuilding the map (SOW §17 "recovery time").
+    recovery_duration: Duration,
     /// Bounded disk budget for retained recovery data (snapshots + retained
     /// WAL). Reaching it pauses new snapshots' reclamation with
     /// [`WalError::ResourceExhausted`] (Technical-Design §7).
@@ -997,6 +1027,7 @@ impl<F: FileSystem + Clone> Db<F> {
         // The parent directory must exist to create the LOCK file.
         fs.create_dir_all(&paths.root)?;
         let lock = fs.acquire_lock(&paths.lock())?;
+        let recovery_started = Instant::now();
 
         let identity = if fs.exists(&paths.identity()) {
             let bytes = fs.read(&paths.identity())?;
@@ -1100,6 +1131,7 @@ impl<F: FileSystem + Clone> Db<F> {
             active_first_lsn: outcome.active_segment_first_lsn,
             active_len: outcome.active_segment_valid_len,
             failed: false,
+            sync_stats: WalSyncStats::default(),
         };
 
         Ok(Db {
@@ -1111,6 +1143,7 @@ impl<F: FileSystem + Clone> Db<F> {
             tail_truncated: outcome.tail_truncated,
             snapshot_lsn: outcome.snapshot_lsn,
             records_replayed: outcome.records.len() as u64,
+            recovery_duration: recovery_started.elapsed(),
             retention_budget_bytes: config.retention_budget_bytes,
             allow_snapshot_rebootstrap,
             _lock: lock,
@@ -1813,6 +1846,18 @@ impl<F: FileSystem + Clone> Db<F> {
     /// reclaimed and never read during recovery.
     pub fn records_replayed(&self) -> u64 {
         self.records_replayed
+    }
+
+    /// Time the most recent [`Db::open`] spent recovering: from acquiring the
+    /// data-directory lock through loading the snapshot and replaying the WAL
+    /// tail (SOW §17, §26 "recovery time").
+    pub fn recovery_duration(&self) -> Duration {
+        self.recovery_duration
+    }
+
+    /// Group-commit sync counters since this process opened the database.
+    pub fn wal_sync_stats(&self) -> WalSyncStats {
+        self.wal.sync_stats()
     }
 
     /// The configured bounded disk budget for retained recovery data in bytes

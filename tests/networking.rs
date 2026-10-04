@@ -787,3 +787,44 @@ fn connection_cap_rejects_excess_with_unavailable() {
 
     server.shutdown();
 }
+
+#[test]
+fn stats_report_latency_wal_sync_and_recovery() {
+    let temp = TempDir::new("stats");
+    {
+        let db = Db::open(RealFs::new(), temp.path(), DurabilityMode::Fsync).expect("open Db");
+        let mut server = Server::start("127.0.0.1:0", db, ServerConfig::default()).unwrap();
+        let mut client = Client::connect(server.local_addr()).unwrap();
+        let stats = client.stats().unwrap();
+        assert!(stats.lines().any(|line| line == "read_latency_p50_us=unknown"));
+        assert!(stats.lines().any(|line| line == "wal_sync_avg_us=unknown"));
+        for index in 0..5u8 {
+            assert_eq!(client.set(vec![index], vec![index]).unwrap(), Status::Ok);
+            assert_eq!(client.get(vec![index]).unwrap(), Some(vec![index]));
+        }
+        let stats = client.stats().unwrap();
+        assert!(stats.lines().any(|line| line == "role=primary"));
+        assert!(stats.lines().any(|line| line == "durability=fsync"));
+        assert_eq!(parse_stat(&stats, "wal_entries"), 5);
+        assert!(parse_stat(&stats, "wal_syncs_total") >= 1);
+        assert_eq!(parse_stat(&stats, "wal_sync_errors_total"), 0);
+        let p50 = parse_stat(&stats, "write_latency_p50_us");
+        let p99 = parse_stat(&stats, "write_latency_p99_us");
+        assert!(p50 >= 1 && p50 <= p99, "write p50 {p50} p99 {p99}");
+        assert!(parse_stat(&stats, "read_latency_p99_us") >= 1);
+        assert_eq!(parse_stat(&stats, "recovery_records_replayed"), 0);
+        drop(client);
+        server.shutdown();
+    }
+    // A restarted node reports the WAL records it replayed and how long that
+    // took (SOW §17, §26 "recovery time").
+    let db = reopen_with_retry(temp.path());
+    let mut server = Server::start("127.0.0.1:0", db, ServerConfig::default()).unwrap();
+    let mut client = Client::connect(server.local_addr()).unwrap();
+    let stats = client.stats().unwrap();
+    assert_eq!(parse_stat(&stats, "recovery_records_replayed"), 5);
+    assert!(parse_stat(&stats, "recovery_us") >= 1);
+    assert_eq!(parse_stat(&stats, "wal_syncs_total"), 0);
+    drop(client);
+    server.shutdown();
+}
