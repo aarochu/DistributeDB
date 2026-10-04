@@ -59,3 +59,8 @@ Each measured interval lasted less than a second. Configuration order was fixed,
 ## 2026-10-04 — lock-scope comparison
 
 [`20261004T072003Z-compare-base.csv`](20261004T072003Z-compare-base.csv) and [`20261004T072003Z-compare-head.csv`](20261004T072003Z-compare-head.csv) compare the server before and after it stopped holding the database lock during WAL syncs. Each mix ran five trials per revision against a fresh single `fsync` primary, on one GitHub-hosted runner, with the order alternating. The analysis, including which differences exceed run-to-run variation, is in [performance engineering](../../docs/performance.md).
+
+## 2026-10-04 — replication pipelining comparison
+
+[`20261004T074644Z-compare-replica-base.csv`](20261004T074644Z-compare-replica-base.csv) and [`20261004T074644Z-compare-replica-head.csv`](20261004T074644Z-compare-replica-head.csv) compare replica catch-up time before and after replication was pipelined and replica syncs were grouped. Each run used a fresh primary with one replica, three trials per mix and revision. See [performance engineering](../../docs/performance.md#replication-pipelined-records-and-grouped-replica-syncs).
+

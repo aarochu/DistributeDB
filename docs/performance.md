@@ -55,4 +55,26 @@ A second run on a fresh runner allocation ([workflow run 37185684419](https://gi
 - The read path no longer depends on `fsync` latency. On storage with slow or variable syncs, where the base server's read tail would grow with the disk's, this matters more than on a CI runner's disk.
 - Read-lock wait p99 is now about 0.1 ms. Finer-grained locking such as lock striping, the next step in the SOW's optimization path, is not justified by these measurements.
 - Longer measurement windows and dedicated hardware are needed before making client-visible throughput claims.
-- The 100,000-write failure test showed that replica apply, at one sync per record with stop-and-wait acknowledgement, limits replication throughput. That is the next measured change.
+- The 100,000-write failure test showed that replica apply, at one sync per record with stop-and-wait acknowledgement, limited replication throughput. The next section measures the change that addressed it.
+
+## Replication: pipelined records and grouped replica syncs
+
+### Bottleneck
+
+The primary sent one record and waited for its ACK before sending the next, and the replica synced each record as its own WAL group. Replication therefore ran at one network round trip plus one replica `fsync` per record, while the primary commits up to 64 writes per sync. The 100,000-write failure test saw a replica about 10,000 records behind.
+
+### Change
+
+The primary now sends up to one group (64 records) back to back and accepts ACKs that cover part of the batch. The replica buffers its reads and applies the records already delivered as local groups, one sync each (`Db::apply_replicated_records`).
+
+### Result
+
+`replica_catch_up_ms` is the time from the end of a benchmark's measured window until the replica has applied every write. This comparison ran `d77a9ca` (base) against `a5c431b` (head) with one replica attached, three trials per mix, on the same runner ([`20261004T074644Z-compare-replica-base.csv`](../benchmarks/results/20261004T074644Z-compare-replica-base.csv), [`20261004T074644Z-compare-replica-head.csv`](../benchmarks/results/20261004T074644Z-compare-replica-head.csv)):
+
+| GET/SET | Catch-up, base (ms, range) | Catch-up, head (ms, range) |
+|---|---|---|
+| 90/10 | 553–703 | 0.1–50 |
+| 50/50 | 3,164–3,314 | 50–51 |
+| 10/90 | 5,976 | 50–51 |
+
+The benchmark polls for catch-up every 50 ms, so the head values mean the replica had already caught up at the first or second check: it kept pace with the primary instead of trailing it by seconds. Every run ended with the replica caught up. Primary throughput with and without the replica was unchanged within run-to-run variation (median changes of −2% to +1%).
