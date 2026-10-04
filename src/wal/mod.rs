@@ -1079,6 +1079,9 @@ pub type ReplicationFloor = Arc<dyn Fn() -> Option<u64> + Send + Sync>;
 /// it reconnects.
 const MAX_PINNED_RECORDS: u64 = 1_000_000;
 
+/// See [`Db::lsm_write_stall`].
+pub const LSM_STALL_FACTOR: usize = 4;
+
 /// LSM counters reported by `STATS`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LsmStats {
@@ -2382,12 +2385,10 @@ impl<F: FileSystem + Clone> Db<F> {
         let Engine::Lsm(tree) = &mut self.engine else {
             return Ok(None);
         };
-        if self.wal.failed || !tree.should_flush() {
+        // A group between append and apply holds bytes the WAL bookkeeping
+        // does not yet cover, so the WAL cannot rotate now; try again later.
+        if self.wal.failed || self.wal.group_pending || !tree.should_flush() {
             return Ok(None);
-        }
-        if let Err(error) = self.wal.ensure_idle() {
-            self.wal.failed = true;
-            return Err(error);
         }
         if self.wal.next_lsn != self.wal.active_first_lsn {
             if let Err(error) = self.wal.rotate() {
@@ -2442,6 +2443,29 @@ impl<F: FileSystem + Clone> Db<F> {
     /// replicas still need, so LSM flushes keep that history.
     pub fn set_replication_floor(&mut self, floor: ReplicationFloor) {
         self.replication_floor = Some(floor);
+    }
+
+    /// Whether an LSM flush is due and the node is not fail-closed.
+    pub fn lsm_flush_due(&self) -> bool {
+        matches!(&self.engine, Engine::Lsm(tree) if tree.should_flush()) && !self.wal.failed
+    }
+
+    /// Whether an LSM compaction is due and the node is not fail-closed.
+    pub fn lsm_compaction_due(&self) -> bool {
+        matches!(&self.engine, Engine::Lsm(tree) if tree.should_compact()) && !self.wal.failed
+    }
+
+    /// Whether new writes should wait for the flush in progress: the
+    /// memtable has grown to [`LSM_STALL_FACTOR`] times its flush size while
+    /// the previous memtable is still being written. Without this, a slow
+    /// disk would let memory grow without bound.
+    pub fn lsm_write_stall(&self) -> bool {
+        let Engine::Lsm(tree) = &self.engine else {
+            return false;
+        };
+        !self.wal.failed
+            && tree.flush_pending()
+            && tree.memtable_bytes() >= tree.config().memtable_bytes.saturating_mul(LSM_STALL_FACTOR)
     }
 
     /// Start a compaction if level 0 has reached its trigger.

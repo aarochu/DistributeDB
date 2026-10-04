@@ -21,6 +21,11 @@ out_dir=${3:-benchmarks/results}
 : "${DDB_STORAGE_MEDIUM:=unspecified}"
 # 0 or 1: attach one asynchronous replica from the same build to each run.
 : "${DDB_REPLICAS:=0}"
+# memory or lsm. Only passed to `serve` for lsm, so older revisions without
+# the flag still run with the default.
+: "${DDB_STORAGE:=memory}"
+storage_args=()
+if [[ "$DDB_STORAGE" != memory ]]; then storage_args=(--storage "$DDB_STORAGE"); fi
 
 repo=$(pwd)
 work=$(mktemp -d)
@@ -67,7 +72,7 @@ for trial in $(seq 1 "$DDB_TRIALS"); do
       # so $! is the server alone and `wait` returns when it exits.
       "$build/distributedb" serve --addr "127.0.0.1:$port" \
         --replication-addr "127.0.0.1:$((port + 1))" --data "$data" \
-        < <(sleep infinity) >"$data.log" 2>&1 &
+        "${storage_args[@]+"${storage_args[@]}"}" < <(sleep infinity) >"$data.log" 2>&1 &
       server_pid=$!
       wait_port "$port"
       if [[ "$DDB_REPLICAS" -gt 0 ]]; then

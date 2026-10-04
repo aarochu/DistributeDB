@@ -276,6 +276,8 @@ pub struct Server {
     shutdown: Arc<AtomicBool>,
     acceptor: Option<JoinHandle<Vec<ConnectionWorker>>>,
     sequencer: Option<JoinHandle<()>>,
+    /// LSM flush and compaction threads, with the signals that stop them.
+    maintenance: Vec<(Arc<Signal>, JoinHandle<()>)>,
     queue: Arc<WriteQueue>,
     /// Listener address used to prompt the acceptor during shutdown.
     listener_addr: std::net::SocketAddr,
@@ -320,6 +322,14 @@ impl Server {
         // so the sequencer drains the remainder and exits.
         self.queue.close();
         if let Some(handle) = self.sequencer.take() {
+            let _ = handle.join();
+        }
+        // No more groups will be committed. Let maintenance finish the job it
+        // is on, if any, and stop. An unflushed memtable stays in the WAL.
+        for (signal, _) in &self.maintenance {
+            signal.stop();
+        }
+        for (_, handle) in self.maintenance.drain(..) {
             let _ = handle.join();
         }
         // Once durable writes have drained, disconnect clients to release
@@ -369,9 +379,51 @@ struct Shared<F: FileSystem + Clone + Send + 'static> {
     /// Successful mutations answer `OK_VOLATILE` because the database runs in
     /// benchmark-only `os` durability mode (Technical-Design §6.1).
     volatile: bool,
-    /// The database uses the LSM engine, so the sequencer flushes and
-    /// compacts between groups.
+    /// The database uses the LSM engine; the sequencer wakes the flush and
+    /// compaction threads after each group.
     lsm: bool,
+    flush_signal: Arc<Signal>,
+    compaction_signal: Arc<Signal>,
+}
+
+/// Wakes a background maintenance thread. Notifications coalesce: one wake-up
+/// covers every notify since the thread last woke.
+#[derive(Debug, Default)]
+struct Signal {
+    state: Mutex<SignalState>,
+    wake: Condvar,
+}
+
+#[derive(Debug, Default)]
+struct SignalState {
+    pending: bool,
+    stopped: bool,
+}
+
+impl Signal {
+    fn notify(&self) {
+        self.state.lock().expect("signal poisoned").pending = true;
+        self.wake.notify_one();
+    }
+
+    fn stop(&self) {
+        self.state.lock().expect("signal poisoned").stopped = true;
+        self.wake.notify_all();
+    }
+
+    fn stopped(&self) -> bool {
+        self.state.lock().expect("signal poisoned").stopped
+    }
+
+    /// Block until notified; `false` once stopped.
+    fn wait(&self) -> bool {
+        let mut state = self.state.lock().expect("signal poisoned");
+        while !state.pending && !state.stopped {
+            state = self.wake.wait(state).expect("signal poisoned");
+        }
+        state.pending = false;
+        !state.stopped
+    }
 }
 
 impl Server {
@@ -423,6 +475,8 @@ impl Server {
             shutdown: Arc::clone(&shutdown),
             volatile,
             lsm,
+            flush_signal: Arc::new(Signal::default()),
+            compaction_signal: Arc::new(Signal::default()),
         });
 
         // Sequencer thread: single owner of the WAL append + group sync + apply.
@@ -439,11 +493,28 @@ impl Server {
             .spawn(move || acceptor_loop(listener, acc_shared))
             .expect("spawn acceptor");
 
+        let mut maintenance = Vec::new();
+        if lsm {
+            let flush_shared = Arc::clone(&shared);
+            let flush = thread::Builder::new()
+                .name("ddb-lsm-flush".to_string())
+                .spawn(move || flush_loop(flush_shared))
+                .expect("spawn flush thread");
+            maintenance.push((Arc::clone(&shared.flush_signal), flush));
+            let compaction_shared = Arc::clone(&shared);
+            let compaction = thread::Builder::new()
+                .name("ddb-lsm-compaction".to_string())
+                .spawn(move || compaction_loop(compaction_shared))
+                .expect("spawn compaction thread");
+            maintenance.push((Arc::clone(&shared.compaction_signal), compaction));
+        }
+
         Ok(Server {
             local_addr,
             shutdown,
             acceptor: Some(acceptor),
             sequencer: Some(sequencer),
+            maintenance,
             queue,
             listener_addr: local_addr,
         })
@@ -809,6 +880,19 @@ where
             continue;
         }
 
+        // Back-pressure: while the memtable is far past its flush size and
+        // the previous one is still being written, wait for that flush.
+        if shared.lsm {
+            while shared
+                .db
+                .read()
+                .expect("db read lock poisoned")
+                .lsm_write_stall()
+            {
+                thread::sleep(Duration::from_millis(1));
+            }
+        }
+
         // Apply the whole batch as one durable group commit (one fsync).
         let muts: Vec<Mutation> = batch.iter().map(|j| j.mutation.clone()).collect();
         // Append under the write lock, sync with no database lock held, then
@@ -857,47 +941,80 @@ where
             }
         }
         if shared.lsm {
-            run_lsm_maintenance(&shared);
+            shared.flush_signal.notify();
         }
     }
 }
 
-/// Flush and compact the LSM tree after a group's responses are released.
-/// Only freezing and installing take the write lock; writing tables happens
-/// without it, so reads continue. Writes arriving meanwhile wait in the
-/// queue and commit together as the next group. A failure makes the node
-/// fail closed (see [`Db::finish_lsm_flush`]), so it reaches clients as
-/// `UNAVAILABLE` on their next write.
-fn run_lsm_maintenance<F>(shared: &Arc<Shared<F>>)
+/// Background LSM flushes. Freezing and installing take the write lock;
+/// writing the table does not, so the sequencer keeps committing groups and
+/// reads continue. A failure makes the node fail closed (see
+/// [`Db::finish_lsm_flush`]), which clients see as `UNAVAILABLE` on their
+/// next write.
+fn flush_loop<F>(shared: Arc<Shared<F>>)
 where
     F: FileSystem + Clone + Send + Sync + 'static,
 {
-    let begun = shared
-        .db
-        .write()
-        .expect("db write lock poisoned")
-        .begin_lsm_flush();
-    if let Ok(Some(flush)) = begun {
-        let written = flush.write();
-        // An error is recorded as the fail-closed state.
-        let _ = shared
-            .db
-            .write()
-            .expect("db write lock poisoned")
-            .finish_lsm_flush(written);
+    while shared.flush_signal.wait() {
+        while !shared.flush_signal.stopped() {
+            let begun = shared
+                .db
+                .write()
+                .expect("db write lock poisoned")
+                .begin_lsm_flush();
+            match begun {
+                Ok(Some(flush)) => {
+                    let written = flush.write();
+                    // An error is recorded as the fail-closed state.
+                    let _ = shared
+                        .db
+                        .write()
+                        .expect("db write lock poisoned")
+                        .finish_lsm_flush(written);
+                    shared.compaction_signal.notify();
+                }
+                // Not due, or deferred because a group was between append and
+                // apply: retry shortly only in the second case.
+                Ok(None) => {
+                    let due = shared
+                        .db
+                        .read()
+                        .expect("db read lock poisoned")
+                        .lsm_flush_due();
+                    if !due {
+                        break;
+                    }
+                    thread::sleep(Duration::from_millis(1));
+                }
+                Err(_) => break,
+            }
+        }
     }
-    let planned = shared
-        .db
-        .write()
-        .expect("db write lock poisoned")
-        .begin_lsm_compaction();
-    if let Some(compaction) = planned {
-        let compacted = compaction.write();
-        let _ = shared
-            .db
-            .write()
-            .expect("db write lock poisoned")
-            .finish_lsm_compaction(compacted);
+}
+
+/// Background LSM compactions, run beside flushes so a long merge does not
+/// delay the next flush.
+fn compaction_loop<F>(shared: Arc<Shared<F>>)
+where
+    F: FileSystem + Clone + Send + Sync + 'static,
+{
+    while shared.compaction_signal.wait() {
+        while !shared.compaction_signal.stopped() {
+            let planned = shared
+                .db
+                .write()
+                .expect("db write lock poisoned")
+                .begin_lsm_compaction();
+            let Some(compaction) = planned else {
+                break;
+            };
+            let compacted = compaction.write();
+            let _ = shared
+                .db
+                .write()
+                .expect("db write lock poisoned")
+                .finish_lsm_compaction(compacted);
+        }
     }
 }
 

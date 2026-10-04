@@ -44,7 +44,7 @@ A flush runs once the memtable reaches its threshold:
 
 Once level 0 holds four tables, a compaction merges all of them with the overlapping level-1 tables into new level-1 tables of about 8 MiB. The inputs include every older version of those keys, so tombstones and overwritten values are dropped. Compaction uses the same three steps, and a flush may run while it writes. The table ids it may use are reserved when it is planned, and input files are deleted only after the new manifest is durable.
 
-The server runs maintenance in its sequencer after each group's responses are sent. Reads continue while tables are written; writes arriving meanwhile wait in the queue and commit in the next groups. Library callers and replicas run maintenance synchronously after their writes.
+The server runs flushes and compactions on two background threads, so a long compaction never delays a flush. The sequencer wakes them after each group. Only freezing and installing take the database write lock, and a flush that finds a group between append and apply waits for it, so writes and reads continue while tables are written. If the memtable reaches four times its flush size while the previous one is still being written, new writes wait for that flush; this bounds memory on a slow disk. Library callers and replicas run maintenance synchronously after their writes.
 
 ## Recovery and crashes
 
@@ -79,7 +79,7 @@ Against the in-memory engine on a CI runner with 100,000 keys, the LSM server us
 ## Limits
 
 - **Two levels:** level 1 is a single sorted run, and each compaction rewrites the level-1 tables overlapping level 0. For large datasets that is much more write amplification than a multi-level design.
-- **Flushes and compactions run one at a time,** on the sequencer thread. New writes wait while a table is written, then commit in the next groups.
+- **One flush and one compaction at a time:** each runs on its own background thread; a burst that outruns a slow flush is held back at four memtables' worth of data.
 - **Replica image cap:** a replica image is held in memory and capped at the 256 MiB snapshot-transfer limit. A larger dataset requires reprovisioning a replica that falls that far behind.
 - **Scans merge every overlapping source:** `SCAN` merges the memtables with every table whose key range overlaps the scan, starting each table at its first block at or after the start key. Tombstones are skipped, so a range of mostly deleted keys costs reads that return nothing until compaction removes them.
 - **Snapshots are in-memory only:** the offline `snapshot` command refuses LSM directories; flushes are the LSM engine's checkpoints.
