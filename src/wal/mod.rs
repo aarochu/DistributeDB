@@ -1125,6 +1125,11 @@ impl<F: FileSystem> LsmCompaction<F> {
     pub fn write(&self) -> LsmResult<CompactedTables> {
         self.job.write()
     }
+
+    /// [`LsmCompaction::write`] at no more than `bytes_per_sec`.
+    pub fn write_paced(&self, bytes_per_sec: u64) -> LsmResult<CompactedTables> {
+        self.job.write_paced(Some(bytes_per_sec))
+    }
 }
 
 // ---------------------------------------------------------------------------

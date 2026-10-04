@@ -670,11 +670,24 @@ impl<F: FileSystem + Clone> LsmTree<F> {
     }
 }
 
+/// How often a paced compaction compares its progress with its rate.
+const PACE_CHECK_BYTES: u64 = 64 * 1024;
+
 impl<F: FileSystem> CompactionJob<F> {
     /// Merge the inputs, dropping tombstones and shadowed versions, and
     /// publish level-1 tables of about the target size. Safe to run without
     /// the tree's lock.
     pub fn write(&self) -> LsmResult<CompactedTables> {
+        self.write_paced(None)
+    }
+
+    /// [`CompactionJob::write`], sleeping as needed to merge at most
+    /// `bytes_per_sec` of live key and value bytes, so a background
+    /// compaction takes CPU and disk in small slices.
+    pub fn write_paced(&self, bytes_per_sec: Option<u64>) -> LsmResult<CompactedTables> {
+        let started = std::time::Instant::now();
+        let mut merged: u64 = 0;
+        let mut next_check: u64 = PACE_CHECK_BYTES;
         let sources: Vec<Source<'_>> = self
             .inputs
             .iter()
@@ -689,6 +702,14 @@ impl<F: FileSystem> CompactionJob<F> {
                 continue;
             };
             builder.add(&key, Some(&value))?;
+            merged += (key.len() + value.len()) as u64;
+            if let Some(rate) = bytes_per_sec.filter(|_| merged >= next_check) {
+                next_check = merged + PACE_CHECK_BYTES;
+                let due = std::time::Duration::from_secs_f64(merged as f64 / rate.max(1) as f64);
+                if let Some(ahead) = due.checked_sub(started.elapsed()) {
+                    std::thread::sleep(ahead);
+                }
+            }
             if builder.approx_len() >= self.target_table_bytes {
                 let full = std::mem::take(&mut builder);
                 outputs.push(self.write_table(full, outputs.len())?);

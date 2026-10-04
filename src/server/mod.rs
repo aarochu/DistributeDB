@@ -991,6 +991,10 @@ where
     }
 }
 
+/// Merge rate for background compactions, so a merge takes CPU and disk in
+/// small slices rather than competing with requests in one burst.
+const COMPACTION_BYTES_PER_SEC: u64 = 32 * 1024 * 1024;
+
 /// Background LSM compactions, run beside flushes so a long merge does not
 /// delay the next flush.
 fn compaction_loop<F>(shared: Arc<Shared<F>>)
@@ -1007,7 +1011,7 @@ where
             let Some(compaction) = planned else {
                 break;
             };
-            let compacted = compaction.write();
+            let compacted = compaction.write_paced(COMPACTION_BYTES_PER_SEC);
             let _ = shared
                 .db
                 .write()
