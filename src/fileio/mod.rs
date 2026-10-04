@@ -133,6 +133,12 @@ pub trait FileSystem {
     /// A missing file is an error ([`FsError::NotFound`]).
     fn remove_file(&self, path: &Path) -> FsResult<()>;
 
+    /// Remove the empty directory at `path`. A directory that still holds a
+    /// file or subdirectory is an error, as is a missing one. Like
+    /// [`remove_file`](FileSystem::remove_file), the removal is only durable
+    /// after a [`sync_dir`](FileSystem::sync_dir) of the parent.
+    fn remove_dir(&self, path: &Path) -> FsResult<()>;
+
     /// Truncate (or extend) `path` to exactly `len` bytes.
     fn truncate(&self, path: &Path, len: u64) -> FsResult<()>;
 
@@ -278,6 +284,11 @@ impl FileSystem for RealFs {
 
     fn remove_file(&self, path: &Path) -> FsResult<()> {
         std::fs::remove_file(path)?;
+        Ok(())
+    }
+
+    fn remove_dir(&self, path: &Path) -> FsResult<()> {
+        std::fs::remove_dir(path)?;
         Ok(())
     }
 
@@ -708,6 +719,28 @@ impl FileSystem for SimFs {
             }
             _ => return Err(FsError::NotFound(key)),
         }
+        g.dirs_volatile.remove(&key);
+        Ok(())
+    }
+
+    fn remove_dir(&self, path: &Path) -> FsResult<()> {
+        let mut g = self.inner.lock().expect("sim lock");
+        let key = path.to_path_buf();
+        if !g.dirs_volatile.contains(&key) {
+            return Err(FsError::NotFound(key));
+        }
+        let has_file = g
+            .files
+            .iter()
+            .any(|(file, f)| !f.removed_volatile && file.parent() == Some(path));
+        let has_dir = g.dirs_volatile.iter().any(|dir| dir.parent() == Some(path));
+        if has_file || has_dir {
+            return Err(FsError::Io(io::Error::other(format!(
+                "directory not empty: {}",
+                path.display()
+            ))));
+        }
+        // Volatile until a directory sync copies the namespace to stable.
         g.dirs_volatile.remove(&key);
         Ok(())
     }
