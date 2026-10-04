@@ -796,7 +796,9 @@ fn stats_report_latency_wal_sync_and_recovery() {
         let mut server = Server::start("127.0.0.1:0", db, ServerConfig::default()).unwrap();
         let mut client = Client::connect(server.local_addr()).unwrap();
         let stats = client.stats().unwrap();
-        assert!(stats.lines().any(|line| line == "read_latency_p50_us=unknown"));
+        assert!(stats
+            .lines()
+            .any(|line| line == "read_latency_p50_us=unknown"));
         assert!(stats.lines().any(|line| line == "wal_sync_avg_us=unknown"));
         for index in 0..5u8 {
             assert_eq!(client.set(vec![index], vec![index]).unwrap(), Status::Ok);

@@ -505,9 +505,7 @@ where
                 let started = Instant::now();
                 let (response, keep_open) = dispatch(&body, shared);
                 match response.kind {
-                    KIND_GET | KIND_EXISTS => {
-                        shared.metrics.read_latency.record(started.elapsed())
-                    }
+                    KIND_GET | KIND_EXISTS => shared.metrics.read_latency.record(started.elapsed()),
                     KIND_SET | KIND_DELETE => {
                         shared.metrics.write_latency.record(started.elapsed())
                     }
