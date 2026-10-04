@@ -290,8 +290,8 @@ fn replica_and_primary_process_kill_restart_converges() {
     let primary_args = cluster.primary_args.as_slice();
     let replica_args = cluster.replica_args.as_slice();
 
-    let mut primary = Process::spawn(&primary_args, &primary_log);
-    let mut replica = Process::spawn(&replica_args, &replica_log);
+    let mut primary = Process::spawn(primary_args, primary_log);
+    let mut replica = Process::spawn(replica_args, replica_log);
     let mut client = wait_client(client_addr);
     write_range(&mut client, 0, first);
     wait_replica(&mut client, &mut replica, first);
@@ -303,7 +303,7 @@ fn replica_and_primary_process_kill_restart_converges() {
     replica.kill();
     writer.join().expect("writer thread");
     assert_eq!(acked.load(Ordering::SeqCst), second);
-    replica = Process::spawn(&replica_args, &replica_log);
+    replica = Process::spawn(replica_args, replica_log);
     wait_replica(&mut client, &mut replica, second);
 
     // Kill the primary while a client is writing. The write in flight at the
@@ -315,7 +315,7 @@ fn replica_and_primary_process_kill_restart_converges() {
     writer.join().expect("writer thread");
     let acknowledged = acked.load(Ordering::SeqCst);
 
-    primary = Process::spawn(&primary_args, &primary_log);
+    primary = Process::spawn(primary_args, primary_log);
     client = wait_client(client_addr);
     let stats = client.stats().expect("primary STATS");
     let recovered: usize = stat(&stats, "current_lsn").unwrap().parse().unwrap();
