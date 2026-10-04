@@ -404,7 +404,10 @@ fn primary_killed_during_100k_concurrent_writes_keeps_every_ack() {
             .collect()
     };
     let acknowledged = |progress: &[Arc<AtomicUsize>]| -> usize {
-        progress.iter().map(|done| done.load(Ordering::SeqCst)).sum()
+        progress
+            .iter()
+            .map(|done| done.load(Ordering::SeqCst))
+            .sum()
     };
 
     let writers = run_writers(&progress);
@@ -467,11 +470,20 @@ fn primary_killed_during_100k_concurrent_writes_keeps_every_ack() {
     assert_eq!(replica_db.len(), RECORDS);
     assert_eq!(replica_db.last_applied_lsn(), primary_db.last_applied_lsn());
     let last = primary_db.last_applied_lsn();
-    assert_eq!(replica_db.record_hash_at(last), primary_db.record_hash_at(last));
+    assert_eq!(
+        replica_db.record_hash_at(last),
+        primary_db.record_hash_at(last)
+    );
     for index in 0..RECORDS {
         let key = format!("key-{index}");
-        assert_eq!(primary_db.get(key.as_bytes()), GetResult::Found(value(index)));
-        assert_eq!(replica_db.get(key.as_bytes()), GetResult::Found(value(index)));
+        assert_eq!(
+            primary_db.get(key.as_bytes()),
+            GetResult::Found(value(index))
+        );
+        assert_eq!(
+            replica_db.get(key.as_bytes()),
+            GetResult::Found(value(index))
+        );
     }
     drop(primary_db);
     drop(replica_db);
