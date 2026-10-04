@@ -2696,6 +2696,79 @@ mod tests {
     }
 
     #[test]
+    fn replica_applies_a_run_of_records_as_local_groups() {
+        let cluster = [7u8; 16];
+        let mut primary = Db::open_configured(
+            sim(),
+            Path::new("/primary"),
+            DurabilityMode::Fsync,
+            OpenConfig {
+                cluster_id: Some(cluster),
+                ..OpenConfig::default()
+            },
+        )
+        .unwrap();
+        for index in 0..100u32 {
+            primary
+                .set(index.to_le_bytes().to_vec(), vec![index as u8])
+                .unwrap();
+        }
+        let records = primary.durable_records_after(0, 200).unwrap();
+        assert_eq!(records.len(), 100);
+        let replica_config = OpenConfig {
+            role: NodeRole::Replica,
+            cluster_id: Some(cluster),
+            ..OpenConfig::default()
+        };
+
+        // A gap anywhere in the run rejects the whole run before any write.
+        let mut gapped = Db::open_configured(
+            sim(),
+            Path::new("/gapped"),
+            DurabilityMode::Fsync,
+            replica_config,
+        )
+        .unwrap();
+        let gap = [records[0].clone(), records[2].clone()];
+        assert!(matches!(
+            gapped.apply_replicated_records(&gap),
+            Err(WalError::Corruption(_))
+        ));
+        assert_eq!(gapped.last_applied_lsn(), 0);
+        assert_eq!(gapped.wal_sync_stats().syncs, 0);
+
+        let replica_fs = sim();
+        let mut replica = Db::open_configured(
+            replica_fs.clone(),
+            Path::new("/replica"),
+            DurabilityMode::Fsync,
+            replica_config,
+        )
+        .unwrap();
+        assert_eq!(replica.apply_replicated_records(&records[..1]).unwrap(), 1);
+        // The already-applied first record is skipped; the other 99 become
+        // groups of 64 and 35 records, one sync each.
+        assert_eq!(replica.apply_replicated_records(&records).unwrap(), 100);
+        assert_eq!(replica.wal_sync_stats().syncs, 3);
+        assert_eq!(replica.record_hash_at(100), primary.record_hash_at(100));
+        assert_eq!(
+            replica.get(&99u32.to_le_bytes()),
+            crate::storage::GetResult::Found(vec![99])
+        );
+        drop(replica);
+        replica_fs.crash();
+        let reopened = Db::open_configured(
+            replica_fs,
+            Path::new("/replica"),
+            DurabilityMode::Fsync,
+            replica_config,
+        )
+        .unwrap();
+        assert_eq!(reopened.last_applied_lsn(), 100);
+        assert_eq!(reopened.record_hash_at(100), primary.record_hash_at(100));
+    }
+
+    #[test]
     fn replica_applies_only_contiguous_primary_history() {
         let fs = sim();
         let replica_fs = sim();

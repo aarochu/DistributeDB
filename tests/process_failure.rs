@@ -468,8 +468,8 @@ fn primary_killed_during_100k_concurrent_writes_keeps_every_ack() {
     assert_eq!(acknowledged(&progress), RECORDS);
     let stats = client.stats().unwrap();
     let final_lsn: usize = stat(&stats, "current_lsn").unwrap().parse().unwrap();
-    // The replica applies one record per sync, so it trails 16 writers and
-    // can need well over 30 seconds to drain its lag on a CI runner.
+    // The replica trails 16 concurrent writers; allow a slow CI runner ample
+    // time to drain the remaining lag.
     wait_replica_within(
         &mut client,
         &mut replica,
