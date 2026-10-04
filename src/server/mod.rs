@@ -856,7 +856,7 @@ fn render_stats_lines(s: &StatsSnapshot) -> String {
     let average = sync.total.as_nanos().checked_div(syncs);
     let average = micros(average.map(|nanos| nanos as u64));
     out.push_str(&format!("wal_sync_avg_us={average}\n"));
-    let max = (sync.syncs > 0).then(|| sync.max.as_nanos() as u64);
+    let max = (sync.syncs > 0).then_some(sync.max.as_nanos() as u64);
     out.push_str(&format!("wal_sync_max_us={}\n", micros(max)));
     let recovery_us = micros(Some(s.recovery_duration.as_nanos() as u64));
     out.push_str(&format!("recovery_us={recovery_us}\n"));
