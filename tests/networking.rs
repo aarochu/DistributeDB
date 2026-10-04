@@ -485,9 +485,7 @@ fn graceful_shutdown_stops_accepting_and_joins_cleanly() {
     let t = thread::spawn(move || handle.shutdown());
     t.join().expect("join shutdown trigger");
 
-    // shutdown() stops accepting and joins the acceptor + sequencer threads
-    // without panicking. If a thread had panicked, join() inside shutdown()
-    // would have surfaced it; reaching here means a clean join.
+    // shutdown() stops accepting and joins the sequencer and client workers.
     server.shutdown();
 
     // After shutdown the server no longer accepts new connections. Connecting
@@ -505,6 +503,32 @@ fn graceful_shutdown_stops_accepting_and_joins_cleanly() {
             );
         }
     }
+}
+
+#[test]
+fn shutdown_releases_directory_lock_with_idle_and_partial_frame_clients() {
+    let temp = TempDir::new("shutdown-lock");
+    let db = Db::open(RealFs::new(), temp.path(), DurabilityMode::Fsync).unwrap();
+    let mut server = Server::start("127.0.0.1:0", db, ServerConfig::default()).unwrap();
+
+    // Keep one connection idle after a successful mutation and another
+    // blocked midway through a frame. Neither client closes before shutdown.
+    let mut idle = Client::connect(server.local_addr()).unwrap();
+    assert_eq!(
+        idle.set(b"key".to_vec(), b"value".to_vec()).unwrap(),
+        Status::Ok
+    );
+    let mut partial = raw_connect(&server);
+    partial.write_all(&8u32.to_le_bytes()).unwrap();
+    partial.write_all(&[PROTOCOL_VERSION]).unwrap();
+
+    server.shutdown();
+    drop(server);
+
+    // No retry is needed: shutdown has joined every worker holding the Db.
+    let reopened = Db::open(RealFs::new(), temp.path(), DurabilityMode::Fsync)
+        .expect("shutdown must release the data-directory lock");
+    assert_eq!(reopened.get(b"key"), GetResult::Found(b"value".to_vec()));
 }
 
 // ---------------------------------------------------------------------------
@@ -536,23 +560,18 @@ fn durability_through_the_server_survives_restart() {
                 "SET over TCP should report OK (durable)"
             );
         }
-        // Drop the client first so its connection worker sees EOF and exits,
-        // releasing its Arc<Shared>. Then shut the server down (joins the
-        // acceptor + sequencer) and drop it: dropping the Server releases the
-        // last Arc to the shared Db, which drops the Db and releases the LOCK
-        // so we can reopen the same data directory below.
-        drop(client);
+        // Shutdown joins the connection worker even while the client remains
+        // connected, so the data-directory lock is released on server drop.
         server.shutdown();
         drop(server);
     }
 
     // Phase 2: reopen a Db on the SAME data directory and assert every key
     // recovered with the correct value, proving the writes went through the
-    // Phase 2 WAL group-commit durable path and survive restart. A lingering
-    // connection worker may hold its Arc<Shared> (and thus the Db LOCK) for a
-    // brief moment after shutdown; retry the open until the LOCK is released.
+    // Phase 2 WAL group-commit durable path and survive restart.
     {
-        let db = reopen_with_retry(temp.path());
+        let db = Db::open(RealFs::new(), temp.path(), DurabilityMode::Fsync)
+            .expect("reopen durable Db immediately after shutdown");
         for (k, v) in keys {
             assert_eq!(
                 db.get(k),
@@ -568,22 +587,6 @@ fn durability_through_the_server_survives_restart() {
     }
 
     // `temp` is dropped here, removing the temp directory (test hygiene).
-}
-
-/// Reopen a RealFs-backed [`Db`] on `path`, retrying briefly while a lingering
-/// connection worker still holds the data-directory LOCK after shutdown.
-fn reopen_with_retry(path: &Path) -> Db<RealFs> {
-    let mut last_err = None;
-    for _ in 0..100 {
-        match Db::open(RealFs::new(), path, DurabilityMode::Fsync) {
-            Ok(db) => return db,
-            Err(e) => {
-                last_err = Some(e);
-                thread::sleep(Duration::from_millis(20));
-            }
-        }
-    }
-    panic!("reopen durable Db never succeeded: {last_err:?}");
 }
 
 // ---------------------------------------------------------------------------
@@ -820,7 +823,8 @@ fn stats_report_latency_wal_sync_and_recovery() {
     }
     // A restarted node reports the WAL records it replayed and how long that
     // took (SOW §17, §26 "recovery time").
-    let db = reopen_with_retry(temp.path());
+    let db = Db::open(RealFs::new(), temp.path(), DurabilityMode::Fsync)
+        .expect("reopen Db immediately after shutdown");
     let mut server = Server::start("127.0.0.1:0", db, ServerConfig::default()).unwrap();
     let mut client = Client::connect(server.local_addr()).unwrap();
     let stats = client.stats().unwrap();

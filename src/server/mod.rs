@@ -83,7 +83,7 @@
 
 use std::collections::VecDeque;
 use std::io::Write;
-use std::net::{TcpListener, TcpStream};
+use std::net::{Shutdown, TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Condvar, Mutex, RwLock};
@@ -274,12 +274,18 @@ fn drain_group(jobs: &mut VecDeque<WriteJob>) -> Vec<WriteJob> {
 pub struct Server {
     local_addr: std::net::SocketAddr,
     shutdown: Arc<AtomicBool>,
-    acceptor: Option<JoinHandle<()>>,
+    acceptor: Option<JoinHandle<Vec<ConnectionWorker>>>,
     sequencer: Option<JoinHandle<()>>,
     queue: Arc<WriteQueue>,
-    /// A clone of the listener address we can self-connect to in order to
-    /// unblock the blocking `accept()` during shutdown.
+    /// Listener address used to prompt the acceptor during shutdown.
     listener_addr: std::net::SocketAddr,
+}
+
+/// Keep a socket handle so shutdown can interrupt a worker blocked in a read
+/// or write, then join it before releasing the database's directory lock.
+struct ConnectionWorker {
+    socket: TcpStream,
+    handle: JoinHandle<()>,
 }
 
 impl Server {
@@ -298,22 +304,33 @@ impl Server {
         }
     }
 
-    /// Gracefully shut down: stop accepting, close the write queue so the
-    /// sequencer drains and exits, and join the acceptor and sequencer.
-    /// In-flight connection workers finish their current request; the acceptor
-    /// stops spawning new ones. Idempotent.
+    /// Stop accepting, drain queued writes, and join the sequencer and all
+    /// connection workers before releasing the database. Idempotent.
     pub fn shutdown(&mut self) {
         self.shutdown.store(true, Ordering::SeqCst);
-        // Unblock the blocking accept() by self-connecting to the listener.
+        // Prompt the acceptor to observe the stop flag without waiting for its
+        // next poll interval.
         let _ = TcpStream::connect(self.listener_addr);
-        if let Some(handle) = self.acceptor.take() {
-            let _ = handle.join();
-        }
+        let workers = self
+            .acceptor
+            .take()
+            .and_then(|handle| handle.join().ok())
+            .unwrap_or_default();
         // With the acceptor stopped, no new writes are queued; close the queue
         // so the sequencer drains the remainder and exits.
         self.queue.close();
         if let Some(handle) = self.sequencer.take() {
             let _ = handle.join();
+        }
+        // Once durable writes have drained, disconnect clients to release
+        // workers blocked on idle or partial frames (or on socket writes).
+        // A lost response after a durable write has an unknown outcome to the
+        // client, as specified by the protocol.
+        for worker in &workers {
+            let _ = worker.socket.shutdown(Shutdown::Both);
+        }
+        for worker in workers {
+            let _ = worker.handle.join();
         }
     }
 }
@@ -333,7 +350,7 @@ pub struct ShutdownHandle {
 }
 
 impl ShutdownHandle {
-    /// Signal the acceptor to stop and unblock its `accept()`.
+    /// Signal the acceptor to stop promptly.
     pub fn shutdown(&self) {
         self.shutdown.store(true, Ordering::SeqCst);
         let _ = TcpStream::connect(self.addr);
@@ -384,6 +401,7 @@ impl Server {
     {
         let listener = TcpListener::bind(addr)?;
         let local_addr = listener.local_addr()?;
+        listener.set_nonblocking(true)?;
         let shutdown = Arc::new(AtomicBool::new(false));
         let queue = Arc::new(WriteQueue::new(config.max_queue_depth));
 
@@ -426,18 +444,35 @@ impl Server {
 }
 
 /// The acceptor loop: accept connections, enforce the connection cap, and spawn
-/// one worker thread per accepted connection (Technical-Design §5).
-fn acceptor_loop<F>(listener: TcpListener, shared: Arc<Shared<F>>)
+/// one worker thread per accepted connection (Technical-Design §5). Polling
+/// also reaps finished workers promptly so their control sockets do not keep
+/// closed client connections alive.
+fn acceptor_loop<F>(listener: TcpListener, shared: Arc<Shared<F>>) -> Vec<ConnectionWorker>
 where
     F: FileSystem + Clone + Send + Sync + 'static,
 {
-    for incoming in listener.incoming() {
+    let mut workers: Vec<ConnectionWorker> = Vec::new();
+    loop {
+        // Reap disconnected clients during normal operation so the handle
+        // registry does not grow with the lifetime connection count.
+        let mut index = 0;
+        while index < workers.len() {
+            if workers[index].handle.is_finished() {
+                let worker: ConnectionWorker = workers.swap_remove(index);
+                let _ = worker.handle.join();
+            } else {
+                index += 1;
+            }
+        }
         if shared.shutdown.load(Ordering::SeqCst) {
             break;
         }
-        let stream = match incoming {
-            Ok(s) => s,
-            Err(_) => continue,
+        let stream = match listener.accept() {
+            Ok((stream, _)) => stream,
+            Err(_) => {
+                thread::sleep(Duration::from_millis(10));
+                continue;
+            }
         };
 
         // Enforce the connection cap: the acceptor rejects the excess (§5).
@@ -447,6 +482,14 @@ where
             reject_overflow(stream);
             continue;
         }
+
+        let socket = match stream.try_clone() {
+            Ok(socket) => socket,
+            Err(_) => {
+                shared.live_connections.fetch_sub(1, Ordering::SeqCst);
+                continue;
+            }
+        };
 
         let worker_shared = Arc::clone(&shared);
         let spawned = thread::Builder::new()
@@ -465,11 +508,15 @@ where
                     .live_connections
                     .fetch_sub(1, Ordering::SeqCst);
             });
-        if spawned.is_err() {
-            // Could not spawn: release the reserved slot.
-            shared.live_connections.fetch_sub(1, Ordering::SeqCst);
+        match spawned {
+            Ok(handle) => workers.push(ConnectionWorker { socket, handle }),
+            Err(_) => {
+                // Could not spawn: release the reserved slot.
+                shared.live_connections.fetch_sub(1, Ordering::SeqCst);
+            }
         }
     }
+    workers
 }
 
 /// Reject a connection that exceeds the cap by sending one `UNAVAILABLE`
