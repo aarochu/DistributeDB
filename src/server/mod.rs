@@ -889,7 +889,17 @@ fn render_stats<F>(shared: &Arc<Shared<F>>) -> String
 where
     F: FileSystem + Clone + Send + Sync + 'static,
 {
-    let (keys, current_lsn, durable_lsn, snapshot_lsn, role, durability, wal_sync, recovery, storage) = {
+    let (
+        keys,
+        current_lsn,
+        durable_lsn,
+        snapshot_lsn,
+        role,
+        durability,
+        wal_sync,
+        recovery,
+        storage,
+    ) = {
         let db = shared.db.read().expect("db read lock poisoned");
         let durability = match db.durability_mode() {
             DurabilityMode::Fsync => "fsync",

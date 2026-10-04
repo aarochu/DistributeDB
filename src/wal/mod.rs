@@ -1552,13 +1552,20 @@ impl<F: FileSystem + Clone> Db<F> {
         base_hash: u64,
     ) -> WalResult<RecoveryOutcome> {
         let segment_lsns = Self::segment_first_lsns(fs, paths)?;
-        let tail =
-            Self::scan_wal_tail(fs, paths, identity, &segment_lsns, mode, base_lsn, base_hash)?
-                .ok_or_else(|| {
-                    WalError::Corruption(format!(
-                        "the WAL does not continue from the LSM flush boundary {base_lsn}"
-                    ))
-                })?;
+        let tail = Self::scan_wal_tail(
+            fs,
+            paths,
+            identity,
+            &segment_lsns,
+            mode,
+            base_lsn,
+            base_hash,
+        )?
+        .ok_or_else(|| {
+            WalError::Corruption(format!(
+                "the WAL does not continue from the LSM flush boundary {base_lsn}"
+            ))
+        })?;
         let last_record_hash = if tail.records.is_empty() {
             base_hash
         } else {
@@ -2409,9 +2416,14 @@ impl<F: FileSystem + Clone> Db<F> {
     }
 
     /// Install a written compaction. Any error makes the node fail closed.
-    pub fn finish_lsm_compaction(&mut self, compacted: LsmResult<CompactedTables>) -> WalResult<()> {
+    pub fn finish_lsm_compaction(
+        &mut self,
+        compacted: LsmResult<CompactedTables>,
+    ) -> WalResult<()> {
         let Engine::Lsm(tree) = &mut self.engine else {
-            return Err(WalError::Corruption("no LSM compaction is in progress".into()));
+            return Err(WalError::Corruption(
+                "no LSM compaction is in progress".into(),
+            ));
         };
         match compacted.and_then(|tables| tree.install_compaction(tables)) {
             Ok(()) => {
@@ -2459,7 +2471,9 @@ impl<F: FileSystem + Clone> Db<F> {
         let mut removed = false;
         for first_lsn in Self::segment_first_lsns(&self.wal.fs, &self.wal.paths)? {
             if first_lsn <= base && first_lsn != self.wal.active_first_lsn {
-                self.wal.fs.remove_file(&self.wal.paths.segment(first_lsn))?;
+                self.wal
+                    .fs
+                    .remove_file(&self.wal.paths.segment(first_lsn))?;
                 removed = true;
             }
         }

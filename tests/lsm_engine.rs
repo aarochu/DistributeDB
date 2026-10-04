@@ -111,8 +111,8 @@ fn recovers_from_tables_and_the_wal_tail_and_reclaims_wal() {
 #[test]
 fn engine_choice_is_persisted_and_snapshots_are_memory_only() {
     let fs = SimFs::new(SimConfig::new(2));
-    let mut db = Db::open_configured(fs.clone(), Path::new("/a"), DurabilityMode::Fsync, lsm())
-        .unwrap();
+    let mut db =
+        Db::open_configured(fs.clone(), Path::new("/a"), DurabilityMode::Fsync, lsm()).unwrap();
     db.set(b"k".to_vec(), b"v".to_vec()).unwrap();
     assert!(matches!(db.publish_snapshot(), Err(WalError::Identity(_))));
     drop(db);
@@ -131,9 +131,13 @@ fn engine_choice_is_persisted_and_snapshots_are_memory_only() {
 #[test]
 fn replicas_behind_the_flush_boundary_catch_up_from_a_table_image() {
     let primary_fs = SimFs::new(SimConfig::new(3));
-    let mut primary =
-        Db::open_configured(primary_fs, Path::new("/primary"), DurabilityMode::Fsync, lsm())
-            .unwrap();
+    let mut primary = Db::open_configured(
+        primary_fs,
+        Path::new("/primary"),
+        DurabilityMode::Fsync,
+        lsm(),
+    )
+    .unwrap();
     let cluster_id = primary.identity().cluster_id;
     let model = workload(&mut primary);
     assert!(primary.snapshot_lsn() > 0, "history was trimmed by flushes");
@@ -161,8 +165,7 @@ fn replicas_behind_the_flush_boundary_catch_up_from_a_table_image() {
             )
             .unwrap(),
         ));
-        let mut runner =
-            ReplicaRunner::start(listener.local_addr(), Arc::clone(&replica)).unwrap();
+        let mut runner = ReplicaRunner::start(listener.local_addr(), Arc::clone(&replica)).unwrap();
         let target = primary.read().unwrap().last_applied_lsn();
         wait_until(|| replica.read().unwrap().last_applied_lsn() == target);
 
@@ -182,7 +185,10 @@ fn replicas_behind_the_flush_boundary_catch_up_from_a_table_image() {
         let replica = replica.read().unwrap();
         let primary = primary.read().unwrap();
         assert_eq!(replica.storage_engine(), name);
-        assert_eq!(replica.record_hash_at(target), primary.record_hash_at(target));
+        assert_eq!(
+            replica.record_hash_at(target),
+            primary.record_hash_at(target)
+        );
         for i in 0..1000u32 {
             assert_eq!(replica.get(&key(i)), primary.get(&key(i)), "{name} key {i}");
         }
@@ -199,16 +205,24 @@ fn replicas_behind_the_flush_boundary_catch_up_from_a_table_image() {
 fn server_writes_flush_and_survive_restart() {
     let temp = TempDir::new("lsm-server");
     let open = || Db::open_configured(RealFs::new(), temp.path(), DurabilityMode::Fsync, lsm());
-    let mut server = Server::start("127.0.0.1:0", open().unwrap(), ServerConfig::default()).unwrap();
+    let mut server =
+        Server::start("127.0.0.1:0", open().unwrap(), ServerConfig::default()).unwrap();
     let mut client = Client::connect(server.local_addr()).unwrap();
     for i in 0..3000u32 {
         assert_eq!(client.set(key(i % 1500), value(i)).unwrap(), Status::Ok);
     }
     for i in 0..1500u32 {
-        assert_eq!(client.get(key(i)).unwrap(), Some(value(i + 1500)), "key {i}");
+        assert_eq!(
+            client.get(key(i)).unwrap(),
+            Some(value(i + 1500)),
+            "key {i}"
+        );
     }
     let stats = client.stats().unwrap();
-    assert!(stats.lines().any(|line| line == "storage_engine=lsm"), "{stats}");
+    assert!(
+        stats.lines().any(|line| line == "storage_engine=lsm"),
+        "{stats}"
+    );
     let flushes: u64 = stats
         .lines()
         .find_map(|line| line.strip_prefix("lsm_flushes_total="))
@@ -222,6 +236,10 @@ fn server_writes_flush_and_survive_restart() {
 
     let db = open().unwrap();
     for i in 0..1500u32 {
-        assert_eq!(db.get(&key(i)), GetResult::Found(value(i + 1500)), "key {i}");
+        assert_eq!(
+            db.get(&key(i)),
+            GetResult::Found(value(i + 1500)),
+            "key {i}"
+        );
     }
 }

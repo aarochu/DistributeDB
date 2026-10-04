@@ -44,6 +44,7 @@ pub use command::{parse, Command, ParseError};
 pub use fileio::{
     FileSystem, FsError, FsResult, LockGuard, RealFs, SimConfig, SimFs, SplitMix64, SIM_PAGE_SIZE,
 };
+pub use lsm::tree::LsmConfig;
 pub use protocol::{
     decode_request_body, decode_response_body, read_frame, write_frame, ProtocolError, Request,
     RequestKind, Response, Status, PROTOCOL_VERSION,
@@ -60,4 +61,3 @@ pub use wal::{
     Db, DurabilityMode, Identity, LsmStats, NodeRole, OpenConfig, PendingGroup, StorageKind,
     UnsyncedGroup, Wal, WalError, WalResult, WalSyncStats, DEFAULT_RETENTION_BUDGET_BYTES,
 };
-pub use lsm::tree::LsmConfig;
