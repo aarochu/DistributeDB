@@ -72,7 +72,7 @@ cargo run -- replica --primary-addr 127.0.0.1:5556 --cluster-id CLUSTER_ID --dat
 
 Use the same command with another directory for a second replica. The replication listener is bound to loopback and has no authentication. Add `--read-addr 127.0.0.1:5557` to a replica command to expose optional eventually consistent reads on that port; writes sent there return `NOT_PRIMARY`.
 
-For a reproducible three-node Docker demo, use [the local cluster guide](docs/docker-cluster.md). It includes startup, replica read checks, catch-up, and restart commands.
+For a reproducible three-node Docker demo, use [the local cluster guide](docs/docker-cluster.md). It includes startup, replica read checks, catch-up, and restart commands, plus `scripts/demo.sh`, which runs the full SOW §26 demonstration.
 
 ## Roadmap and verification
 

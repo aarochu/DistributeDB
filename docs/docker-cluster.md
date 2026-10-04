@@ -56,3 +56,25 @@ docker compose --profile replicas down --volumes
 ```
 
 The replica startup flag explicitly provisions snapshot rebootstrap on first use of each replica volume. Existing replica policy is not changed by a later flag. If a replica volume belongs to a different cluster, startup rejects its identity rather than joining it silently. The current snapshot transfer has a 256 MiB cap and buffers the transfer in memory; see [replication and recovery](replication.md).
+
+## SOW demonstration
+
+`scripts/demo.sh` runs the SOW §26 scenario end to end and prints each step. It needs a fresh cluster, so reset first. This **deletes the three named data volumes**:
+
+```sh
+docker compose --profile replicas down --volumes
+sh scripts/demo.sh
+```
+
+The script:
+
+1. Starts the primary (Node A) and two replicas (Nodes B and C).
+2. Writes `user:1` to `user:3` and reads them back from all three nodes.
+3. Publishes an offline primary snapshot.
+4. Kills Node B with `SIGKILL` and writes `user:4` and `user:5`. `STATS` then shows the primary ahead of Node B and its lag as `unknown`.
+5. Restarts Node B and shows it caught up at zero lag.
+6. Kills Node A with `SIGKILL` and restarts it. `STATS` shows the snapshot LSN, the two WAL records replayed after it, and the recovery time. All five users are still readable.
+7. Runs the 90/10, 50/50 and 10/90 GET/SET benchmark mixes against the primary with both replicas attached.
+8. Prints throughput, client-observed p50/p95/p99 latency, server-side latency percentiles, replication lag, and recovery time.
+
+CI runs the same script on every pull request that touches the cluster. Client, primary and replicas share one host, so the benchmark figures describe that host only; see [the benchmark method](benchmarks.md).

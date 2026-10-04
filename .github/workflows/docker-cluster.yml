@@ -8,7 +8,10 @@ on:
       - "compose.yaml"
       - "scripts/start_cluster.sh"
       - "scripts/smoke_cluster.sh"
+      - "scripts/demo.sh"
       - "src/main.rs"
+      - "src/bin/**"
+      - "src/server/**"
       - "src/replication/**"
       - ".github/workflows/docker-cluster.yml"
   workflow_dispatch:
@@ -28,6 +31,10 @@ jobs:
         run: sh scripts/start_cluster.sh
       - name: Test reconnect and primary recovery
         run: sh scripts/smoke_cluster.sh
+      - name: Run the SOW demonstration on a fresh cluster
+        run: |
+          docker compose --profile replicas down --volumes
+          sh scripts/demo.sh
       - name: Show logs on failure
         if: failure()
         run: docker compose --profile replicas logs --no-color --tail 100
