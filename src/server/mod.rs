@@ -474,6 +474,11 @@ where
                 continue;
             }
         };
+        // Accepted sockets inherit the listener's non-blocking mode on macOS
+        // and Windows (not on Linux); workers rely on blocking reads.
+        if stream.set_nonblocking(false).is_err() {
+            continue;
+        }
 
         // Enforce the connection cap: the acceptor rejects the excess (§5).
         let live = shared.live_connections.fetch_add(1, Ordering::SeqCst);
