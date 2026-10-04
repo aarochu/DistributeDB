@@ -11,11 +11,11 @@ SOW leaves behavior open.
 | --- | --- | --- |
 | §4, §6: `SET`, `GET`, `DELETE`, `EXISTS` and in-memory map | `src/command`, `src/storage`, `src/wal` | Module unit tests and `tests/networking.rs` exercise the four operations. The local REPL is intentionally volatile. |
 | §5, §13: concurrent TCP clients, framing, malformed/partial requests, disconnects, shutdown | `src/protocol`, `src/client`, `src/server` | `tests/networking.rs` covers concurrent clients and adverse framing. Shutdown now interrupts and joins connection workers before releasing the database lock; reopening no longer depends on a retry. |
-| §7–8: WAL, acknowledged write recovery, restart after kill | `src/wal`, `src/fileio`, `src/bin/wal_kill_harness.rs` | `tests/wal_recovery.rs`, `tests/wal_crash_sim.rs`, `tests/wal_cutpoints.rs`, and `tests/process_failure.rs` exercise recovery. Simulated torn writes and process kills do not establish physical power-loss guarantees. |
+| §7–8: WAL, acknowledged write recovery, restart after kill | `src/wal`, `src/fileio`, `src/bin/wal_kill_harness.rs` | `tests/wal_recovery.rs`, `tests/wal_crash_sim.rs`, `tests/wal_cutpoints.rs`, and `tests/process_failure.rs` exercise recovery. That last file includes SOW §19's example at full size: a primary killed during 100,000 concurrent writes, with every acknowledged write checked after restart. Simulated torn writes and process kills do not establish physical power-loss guarantees. |
 | §9: snapshots and post-snapshot WAL replay | `src/wal/snapshot.rs`, `src/wal/current.rs`, `src/main.rs` snapshot command | Snapshot publication/recovery tests and `tests/snapshot_publish_crash.rs` cover the local path. Snapshot creation is manual and offline. |
 | §10–12, §14: ordered primary/replica stream, ACKs, reconnect, lag, failure handling | `src/replication`, `src/main.rs` | `tests/replication.rs` and `tests/replica_cli.rs` cover ordinary replication and catch-up. Asynchronous primary `OK` guarantees local durability only; replica reads may lag. Reclaimed history needs explicitly provisioned snapshot rebootstrap. There is no automatic failover. |
-| §17: runtime statistics | `src/server`, `src/server/latency.rs` | `tests/networking.rs` checks counters and latency fields. Disconnected replica lag is unknown; measurements are process-local samples. |
-| §18: mixed-workload benchmarks and published results | `src/bin/ddb_bench.rs`, `benchmarks/run_benchmarks.sh`, `benchmarks/results/` | Three 90/10, 50/50, and 10/90 mixes, CSV output, and published CI-runner results exist. The shared runner is not a controlled hardware benchmark. |
+| §17: runtime statistics | `src/server`, `src/server/latency.rs`, [observability](observability.md) | `tests/networking.rs` checks counters, latency, WAL sync, recovery-time, and lock fields. Disconnected replica lag is unknown; measurements are process-local samples. |
+| §18, Phase 7: benchmarks, published results, contention analysis | `src/bin/ddb_bench.rs`, `benchmarks/`, [performance analysis](performance.md) | Three 90/10, 50/50, and 10/90 mixes, CSV output, and published CI-runner results exist. Lock wait and hold are measured, and one optimization (syncing outside the database lock) was compared base-versus-head on the same runner. The shared runner is not a controlled hardware benchmark. |
 | §19–20: unit, integration, and failure testing | `src` module tests, `tests/`, `scripts/run_failure_trials.sh` | Rust CI runs format, lint, and all targets; separate workflows run failure trials and a Docker cluster. Test coverage does not imply exhaustive fault tolerance. |
 | §25–27: architecture docs, local cluster, three-node demo | `README.md`, `docs/Technical-Design.md`, `compose.yaml`, `scripts/demo.sh` | The Docker workflow runs the cluster smoke/demo path. It does not exercise deployment outside its isolated CI environment. |
 
@@ -32,8 +32,4 @@ SOW leaves behavior open.
 
 ## Remaining validation
 
-Run the PR's CI suite for the shutdown change. The local Windows workspace used
-for this audit has no Rust toolchain, so the new test has not been executed
-locally. Physical power-loss durability requires validation on the stated
-filesystem profile and storage hardware. Phase 7 profiling and measured
-optimization remain ongoing rather than a completed performance claim.
+Physical power-loss durability requires validation on the stated filesystem profile and storage hardware. Client-visible throughput claims need longer measurement windows on dedicated hardware; the CI-runner comparisons show server-side effects, not hardware-independent throughput.
