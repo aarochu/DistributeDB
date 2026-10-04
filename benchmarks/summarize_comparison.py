@@ -1,6 +1,6 @@
 """Summarize benchmarks/compare_revisions.sh output as a Markdown table.
 
-Usage: python3 benchmarks/summarize_comparison.py BASE.csv HEAD.csv
+Usage: python3 benchmarks/summarize_comparison.py BASE.csv HEAD.csv [BASE_LABEL HEAD_LABEL]
 
 Each cell is the median over trials for one GET/SET mix. "Change" is head
 relative to base; a negative change in a latency column is an improvement.
@@ -18,6 +18,8 @@ METRICS = [
     ("server_read_lock_wait_p99_us", "read-lock wait p99 µs", 1.0),
     ("server_write_lock_hold_p99_us", "write-lock hold p99 µs", 1.0),
     ("replica_catch_up_ms", "replica catch-up ms", 1.0),
+    ("server_peak_rss_kib", "server peak RSS MiB", 1024.0),
+    ("data_bytes", "data on disk MiB", 1024.0 * 1024.0),
 ]
 
 
@@ -45,13 +47,14 @@ def cell(value):
 def main():
     base_rows, base = load(sys.argv[1])
     head_rows, head = load(sys.argv[2])
-    revisions = {
-        "base": base_rows[0]["revision"].strip('"')[:7],
-        "head": head_rows[0]["revision"].strip('"')[:7],
-    }
-    print(f"Base `{revisions['base']}` vs head `{revisions['head']}`, median of "
+    if len(sys.argv) >= 5:
+        base_label, head_label = sys.argv[3], sys.argv[4]
+    else:
+        base_label = "base `" + base_rows[0]["revision"].strip('"')[:7] + "`"
+        head_label = "head `" + head_rows[0]["revision"].strip('"')[:7] + "`"
+    print(f"{base_label} vs {head_label}, median of "
           f"{len(base_rows) // max(len(base), 1)} trials per mix.\n")
-    print("| GET/SET | Metric | Base | Head | Change |")
+    print(f"| GET/SET | Metric | {base_label} | {head_label} | Change |")
     print("|---|---|---:|---:|---:|")
     for mix in sorted(base, key=float, reverse=True):
         reads = round(float(mix) * 100)

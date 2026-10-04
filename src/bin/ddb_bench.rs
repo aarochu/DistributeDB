@@ -282,17 +282,39 @@ fn csv_field(value: &str) -> String {
     format!("\"{}\"", value.replace('"', "\"\""))
 }
 
+/// Write every key once, spread over one connection per client so the
+/// server can group-commit them.
+fn prepopulate(config: &Config) -> Result<(), String> {
+    let workers: Vec<_> = (0..config.clients)
+        .map(|worker| {
+            let config = config.clone();
+            thread::spawn(move || -> Result<(), String> {
+                let mut client =
+                    Client::connect(config.addr.as_str()).map_err(|error| error.to_string())?;
+                let value = vec![b'x'; config.value_bytes];
+                for index in (worker..config.keys).step_by(config.clients) {
+                    let status = client
+                        .set(key(index), value.clone())
+                        .map_err(|error| error.to_string())?;
+                    if !write_ok(status, &config.durability) {
+                        return Err(format!("prepopulation SET returned {status:?}"));
+                    }
+                }
+                Ok(())
+            })
+        })
+        .collect();
+    for worker in workers {
+        worker
+            .join()
+            .map_err(|_| "prepopulation worker panicked".to_string())??;
+    }
+    Ok(())
+}
+
 fn run(config: Config) -> Result<(), String> {
     let mut setup = Client::connect(config.addr.as_str()).map_err(|error| error.to_string())?;
-    let value = vec![b'x'; config.value_bytes];
-    for index in 0..config.keys {
-        let status = setup
-            .set(key(index), value.clone())
-            .map_err(|error| error.to_string())?;
-        if !write_ok(status, &config.durability) {
-            return Err(format!("prepopulation SET returned {status:?}"));
-        }
-    }
+    prepopulate(&config)?;
     wait_replicas(&mut setup, config.replicas)?;
     let (cpu_before, clock_ticks, _) = process_resources(config.server_pid);
     let barrier = Arc::new(Barrier::new(config.clients + 1));
