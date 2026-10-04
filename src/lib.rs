@@ -58,6 +58,7 @@ pub use wal::snapshot::{
     SnapshotHeader,
 };
 pub use wal::{
-    Db, DurabilityMode, Identity, LsmStats, NodeRole, OpenConfig, PendingGroup, StorageKind,
-    UnsyncedGroup, Wal, WalError, WalResult, WalSyncStats, DEFAULT_RETENTION_BUDGET_BYTES,
+    Db, DurabilityMode, Identity, LsmStats, NodeRole, OpenConfig, PendingGroup, ReplicationFloor,
+    StorageKind, UnsyncedGroup, Wal, WalError, WalResult, WalSyncStats,
+    DEFAULT_RETENTION_BUDGET_BYTES,
 };
