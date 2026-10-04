@@ -99,7 +99,16 @@ fn stat(stats: &str, suffix: &str) -> Option<String> {
 }
 
 fn wait_replica(client: &mut Client, replica: &mut Process, expected_lsn: usize) {
-    let deadline = Instant::now() + Duration::from_secs(30);
+    wait_replica_within(client, replica, expected_lsn, Duration::from_secs(30));
+}
+
+fn wait_replica_within(
+    client: &mut Client,
+    replica: &mut Process,
+    expected_lsn: usize,
+    timeout: Duration,
+) {
+    let deadline = Instant::now() + timeout;
     let expected = expected_lsn.to_string();
     loop {
         let stats = client.stats().expect("primary STATS");
@@ -459,7 +468,14 @@ fn primary_killed_during_100k_concurrent_writes_keeps_every_ack() {
     assert_eq!(acknowledged(&progress), RECORDS);
     let stats = client.stats().unwrap();
     let final_lsn: usize = stat(&stats, "current_lsn").unwrap().parse().unwrap();
-    wait_replica(&mut client, &mut replica, final_lsn);
+    // The replica applies one record per sync, so it trails 16 writers and
+    // can need well over 30 seconds to drain its lag on a CI runner.
+    wait_replica_within(
+        &mut client,
+        &mut replica,
+        final_lsn,
+        Duration::from_secs(180),
+    );
     drop(client);
     replica.shutdown();
     primary.shutdown();
