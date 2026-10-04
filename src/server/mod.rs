@@ -174,6 +174,11 @@ struct Metrics {
     /// Server-side service time of `SET`/`DELETE`, including sequencer queueing
     /// and the group commit that made the write durable.
     write_latency: LatencyHistogram,
+    /// Time a `GET`/`EXISTS` waited to acquire the database read lock: the
+    /// direct cost of contention with the sequencer's write lock.
+    read_lock_wait: LatencyHistogram,
+    /// Time the sequencer held the database write lock for one group commit.
+    write_lock_hold: LatencyHistogram,
 }
 
 /// The outcome the sequencer returns for a submitted write: the assigned LSN on
@@ -553,7 +558,9 @@ where
     match request {
         Request::Get { key } => {
             shared.metrics.reads_total.fetch_add(1, Ordering::Relaxed);
+            let waiting = Instant::now();
             let db = shared.db.read().expect("db read lock poisoned");
+            shared.metrics.read_lock_wait.record(waiting.elapsed());
             match db.get(&key) {
                 GetResult::Found(value) => (Response::new(KIND_GET, Status::Ok, value), true),
                 GetResult::NotFound => {
@@ -563,7 +570,9 @@ where
         }
         Request::Exists { key } => {
             shared.metrics.reads_total.fetch_add(1, Ordering::Relaxed);
+            let waiting = Instant::now();
             let db = shared.db.read().expect("db read lock poisoned");
+            shared.metrics.read_lock_wait.record(waiting.elapsed());
             let byte = if db.exists(&key) { 1u8 } else { 0u8 };
             (Response::new(KIND_EXISTS, Status::Ok, vec![byte]), true)
         }
@@ -705,7 +714,10 @@ where
         let muts: Vec<Mutation> = batch.iter().map(|j| j.mutation.clone()).collect();
         let result = {
             let mut db = shared.db.write().expect("db write lock poisoned");
-            db.apply_group(&muts)
+            let held = Instant::now();
+            let result = db.apply_group(&muts);
+            shared.metrics.write_lock_hold.record(held.elapsed());
+            result
         };
 
         match result {
@@ -783,6 +795,8 @@ where
         durability,
         read_latency: percentiles(&shared.metrics.read_latency),
         write_latency: percentiles(&shared.metrics.write_latency),
+        read_lock_wait: percentiles(&shared.metrics.read_lock_wait),
+        write_lock_hold: percentiles(&shared.metrics.write_lock_hold),
         wal_sync,
         recovery_duration: recovery.0,
         records_replayed: recovery.1,
@@ -810,6 +824,8 @@ struct StatsSnapshot {
     /// p50/p95/p99 in nanoseconds; `None` before the first sample.
     read_latency: [Option<u64>; 3],
     write_latency: [Option<u64>; 3],
+    read_lock_wait: [Option<u64>; 3],
+    write_lock_hold: [Option<u64>; 3],
     wal_sync: WalSyncStats,
     recovery_duration: Duration,
     records_replayed: u64,
@@ -844,9 +860,15 @@ fn render_stats_lines(s: &StatsSnapshot) -> String {
     // Records recovery would replay after the snapshot boundary.
     let wal_entries = s.current_lsn.saturating_sub(s.snapshot_lsn);
     out.push_str(&format!("wal_entries={wal_entries}\n"));
-    for (class, values) in [("read", s.read_latency), ("write", s.write_latency)] {
+    let histograms = [
+        ("read_latency", s.read_latency),
+        ("write_latency", s.write_latency),
+        ("read_lock_wait", s.read_lock_wait),
+        ("write_lock_hold", s.write_lock_hold),
+    ];
+    for (class, values) in histograms {
         for (name, value) in ["p50", "p95", "p99"].into_iter().zip(values) {
-            out.push_str(&format!("{class}_latency_{name}_us={}\n", micros(value)));
+            out.push_str(&format!("{class}_{name}_us={}\n", micros(value)));
         }
     }
     let sync = &s.wal_sync;
@@ -967,6 +989,8 @@ mod tests {
             durability: "fsync",
             read_latency: [Some(1_500), Some(9_000), None],
             write_latency: [None; 3],
+            read_lock_wait: [Some(200), Some(2_000), Some(20_000)],
+            write_lock_hold: [None; 3],
             wal_sync: WalSyncStats {
                 syncs: 4,
                 errors: 0,
@@ -1002,6 +1026,9 @@ mod tests {
             "read_latency_p95_us=9",
             "read_latency_p99_us=unknown",
             "write_latency_p50_us=unknown",
+            "read_lock_wait_p50_us=1",
+            "read_lock_wait_p99_us=20",
+            "write_lock_hold_p99_us=unknown",
             "wal_syncs_total=4",
             "wal_sync_errors_total=0",
             "wal_sync_avg_us=100",
@@ -1012,6 +1039,6 @@ mod tests {
             assert!(lines.contains(&expected), "missing {expected}");
         }
         // Bounded: a small fixed number of lines.
-        assert_eq!(lines.len(), 26);
+        assert_eq!(lines.len(), 32);
     }
 }
