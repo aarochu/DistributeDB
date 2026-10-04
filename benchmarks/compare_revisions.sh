@@ -59,14 +59,16 @@ for trial in $(seq 1 "$DDB_TRIALS"); do
       build="$work/$label/target/release"
       data="$work/data-$label-$trial-$ratio"
       mkdir -p "$data"
-      sleep infinity | "$build/distributedb" serve --addr "127.0.0.1:$port" \
+      # Hold stdin open through a process substitution rather than a pipeline,
+      # so $! is the server alone and `wait` returns when it exits.
+      "$build/distributedb" serve --addr "127.0.0.1:$port" \
         --replication-addr "127.0.0.1:$((port + 1))" --data "$data" \
-        >"$data.log" 2>&1 &
+        < <(sleep infinity) >"$data.log" 2>&1 &
       server_pid=$!
       wait_port "$port"
       printf '%s trial %s, GET ratio %s: ' "$label" "$trial" "$ratio" >&2
       # Run from the worktree so the CSV records that revision.
-      (cd "$work/$label" && "$build/ddb_bench" --addr "127.0.0.1:$port" \
+      (cd "$work/$label" && timeout 300 "$build/ddb_bench" --addr "127.0.0.1:$port" \
         --clients "$DDB_CLIENTS" --operations "$DDB_OPERATIONS" \
         --warmup "$DDB_WARMUP" --keys "$DDB_KEYS" \
         --value-bytes "$DDB_VALUE_BYTES" --read-ratio "$ratio" \
