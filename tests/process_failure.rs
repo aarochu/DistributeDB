@@ -26,7 +26,7 @@ struct Process {
 impl Process {
     /// Starts the server binary with stderr appended to `log`, so diagnostics
     /// survive a failed trial and a full pipe cannot block the process.
-    fn spawn(args: &[&str], log: &Path) -> Self {
+    fn spawn<S: AsRef<std::ffi::OsStr>>(args: &[S], log: &Path) -> Self {
         let stderr = File::options()
             .create(true)
             .append(true)
@@ -192,6 +192,82 @@ fn provision(primary_dir: &Path, replica_dir: &Path) -> String {
     distributedb::replication::format_id(&cluster)
 }
 
+/// Data directories, logs, loopback addresses, and command lines for one
+/// primary and one provisioned replica.
+struct Cluster {
+    root: PathBuf,
+    primary_dir: PathBuf,
+    replica_dir: PathBuf,
+    primary_log: PathBuf,
+    replica_log: PathBuf,
+    cluster_id: String,
+    client_addr: SocketAddr,
+    primary_args: Vec<String>,
+    replica_args: Vec<String>,
+}
+
+impl Cluster {
+    fn new(name: &str) -> Self {
+        let root = data_dir(name);
+        let primary_dir = root.join("primary");
+        let replica_dir = root.join("replica");
+        let cluster_id = provision(&primary_dir, &replica_dir);
+        let client_reservation = TcpListener::bind("127.0.0.1:0").unwrap();
+        let replication_reservation = TcpListener::bind("127.0.0.1:0").unwrap();
+        let client_addr = client_reservation.local_addr().unwrap();
+        let replication_addr = replication_reservation.local_addr().unwrap().to_string();
+        drop(client_reservation);
+        drop(replication_reservation);
+        let primary_args = vec![
+            "serve".to_string(),
+            "--addr".to_string(),
+            client_addr.to_string(),
+            "--replication-addr".to_string(),
+            replication_addr.clone(),
+            "--data".to_string(),
+            primary_dir.to_string_lossy().into_owned(),
+        ];
+        let replica_args = vec![
+            "replica".to_string(),
+            "--primary-addr".to_string(),
+            replication_addr,
+            "--cluster-id".to_string(),
+            cluster_id.clone(),
+            "--data".to_string(),
+            replica_dir.to_string_lossy().into_owned(),
+        ];
+        Self {
+            primary_log: root.join("primary.log"),
+            replica_log: root.join("replica.log"),
+            root,
+            primary_dir,
+            replica_dir,
+            cluster_id,
+            client_addr,
+            primary_args,
+            replica_args,
+        }
+    }
+
+    fn open_replica(&self) -> Db<RealFs> {
+        let mut cluster = [0u8; 16];
+        for (index, byte) in cluster.iter_mut().enumerate() {
+            *byte = u8::from_str_radix(&self.cluster_id[index * 2..index * 2 + 2], 16).unwrap();
+        }
+        Db::open_configured(
+            RealFs,
+            &self.replica_dir,
+            DurabilityMode::Fsync,
+            OpenConfig {
+                role: NodeRole::Replica,
+                cluster_id: Some(cluster),
+                ..OpenConfig::default()
+            },
+        )
+        .unwrap()
+    }
+}
+
 #[test]
 fn replica_and_primary_process_kill_restart_converges() {
     let seed: usize = std::env::var("DDB_FAILURE_SEED")
@@ -205,41 +281,14 @@ fn replica_and_primary_process_kill_restart_converges() {
     let second = replica_kill + 20 + (seed / 7) % 31;
     let primary_kill = second + 5 + (seed / 11) % 21;
     let tail = 20 + (seed / 13) % 31;
-    let root = data_dir("cluster");
+    let cluster = Cluster::new("cluster");
+    let root = &cluster.root;
     println!("process failure seed {seed}: data under {}", root.display());
-    let primary_dir = root.join("primary");
-    let replica_dir = root.join("replica");
-    let primary_log = root.join("primary.log");
-    let replica_log = root.join("replica.log");
-    let cluster_id = provision(&primary_dir, &replica_dir);
-    let client_reservation = TcpListener::bind("127.0.0.1:0").unwrap();
-    let replication_reservation = TcpListener::bind("127.0.0.1:0").unwrap();
-    let client_addr = client_reservation.local_addr().unwrap();
-    let replication_addr = replication_reservation.local_addr().unwrap();
-    drop(client_reservation);
-    drop(replication_reservation);
-    let primary_path = primary_dir.to_string_lossy().into_owned();
-    let replica_path = replica_dir.to_string_lossy().into_owned();
-    let client_address = client_addr.to_string();
-    let replication_address = replication_addr.to_string();
-    let primary_args = [
-        "serve",
-        "--addr",
-        client_address.as_str(),
-        "--replication-addr",
-        replication_address.as_str(),
-        "--data",
-        primary_path.as_str(),
-    ];
-    let replica_args = [
-        "replica",
-        "--primary-addr",
-        replication_address.as_str(),
-        "--cluster-id",
-        cluster_id.as_str(),
-        "--data",
-        replica_path.as_str(),
-    ];
+    let primary_log = &cluster.primary_log;
+    let replica_log = &cluster.replica_log;
+    let client_addr = cluster.client_addr;
+    let primary_args = cluster.primary_args.as_slice();
+    let replica_args = cluster.replica_args.as_slice();
 
     let mut primary = Process::spawn(&primary_args, &primary_log);
     let mut replica = Process::spawn(&replica_args, &replica_log);
@@ -288,21 +337,7 @@ fn replica_and_primary_process_kill_restart_converges() {
 
     replica.shutdown();
     primary.shutdown();
-    let mut cluster = [0u8; 16];
-    for (index, byte) in cluster.iter_mut().enumerate() {
-        *byte = u8::from_str_radix(&cluster_id[index * 2..index * 2 + 2], 16).unwrap();
-    }
-    let reopened = Db::open_configured(
-        RealFs,
-        &replica_dir,
-        DurabilityMode::Fsync,
-        OpenConfig {
-            role: NodeRole::Replica,
-            cluster_id: Some(cluster),
-            ..OpenConfig::default()
-        },
-    )
-    .unwrap();
+    let reopened = cluster.open_replica();
     assert_eq!(reopened.last_applied_lsn(), final_lsn as u64);
     for index in 0..final_lsn {
         assert_eq!(
@@ -312,4 +347,133 @@ fn replica_and_primary_process_kill_restart_converges() {
     }
     drop(reopened);
     std::fs::remove_dir_all(root).unwrap();
+}
+
+/// SOW §19's example at full size: launch a primary and a replica, write
+/// 100,000 records from concurrent clients, kill the primary during the
+/// writes, restart it, and compare its recovered state with every
+/// acknowledged write. The remaining records are then written and the
+/// replica must converge to an identical state.
+#[test]
+fn primary_killed_during_100k_concurrent_writes_keeps_every_ack() {
+    const RECORDS: usize = 100_000;
+    const WRITERS: usize = 16;
+    const PER_WRITER: usize = RECORDS / WRITERS;
+    let seed: usize = std::env::var("DDB_FAILURE_SEED")
+        .ok()
+        .and_then(|text| text.parse().ok())
+        .unwrap_or(1);
+    let kill_after = 50_000 + (seed * 7_919) % 40_000;
+    let cluster = Cluster::new("large");
+    println!(
+        "large failure test: kill after {kill_after} acks, data under {}",
+        cluster.root.display()
+    );
+    let addr = cluster.client_addr;
+    let mut primary = Process::spawn(&cluster.primary_args, &cluster.primary_log);
+    let mut replica = Process::spawn(&cluster.replica_args, &cluster.replica_log);
+    drop(wait_client(addr));
+
+    // Each writer owns a disjoint key range and records how far into it the
+    // primary has acknowledged. A client has at most one write in flight.
+    let progress: Vec<Arc<AtomicUsize>> = (0..WRITERS)
+        .map(|_| Arc::new(AtomicUsize::new(0)))
+        .collect();
+    let run_writers = |progress: &[Arc<AtomicUsize>]| -> Vec<thread::JoinHandle<()>> {
+        progress
+            .iter()
+            .enumerate()
+            .map(|(writer, done)| {
+                let begin = writer * PER_WRITER + done.load(Ordering::SeqCst);
+                let end = (writer + 1) * PER_WRITER;
+                let done = Arc::clone(done);
+                thread::spawn(move || {
+                    let Ok(mut client) = Client::connect(addr) else {
+                        return;
+                    };
+                    for index in begin..end {
+                        match client.set(format!("key-{index}").into_bytes(), value(index)) {
+                            Ok(Status::Ok) => {
+                                done.store(index + 1 - writer * PER_WRITER, Ordering::SeqCst)
+                            }
+                            _ => return,
+                        }
+                    }
+                })
+            })
+            .collect()
+    };
+    let acknowledged = |progress: &[Arc<AtomicUsize>]| -> usize {
+        progress.iter().map(|done| done.load(Ordering::SeqCst)).sum()
+    };
+
+    let writers = run_writers(&progress);
+    let deadline = Instant::now() + Duration::from_secs(120);
+    while acknowledged(&progress) < kill_after {
+        assert!(Instant::now() < deadline, "writers stalled before the kill");
+        thread::sleep(Duration::from_millis(5));
+    }
+    primary.kill();
+    for writer in writers {
+        writer.join().unwrap();
+    }
+    let acked = acknowledged(&progress);
+    assert!(acked < RECORDS, "all writes finished before the kill");
+
+    // Every acknowledged write survives; at most one in-flight write per
+    // client may also have become durable.
+    primary = Process::spawn(&cluster.primary_args, &cluster.primary_log);
+    let mut client = wait_client(addr);
+    let stats = client.stats().unwrap();
+    let recovered: usize = stat(&stats, "current_lsn").unwrap().parse().unwrap();
+    assert!(
+        (acked..=acked + WRITERS).contains(&recovered),
+        "recovered LSN {recovered} after {acked} acknowledged writes"
+    );
+    let checkers: Vec<_> = progress
+        .iter()
+        .enumerate()
+        .map(|(writer, done)| {
+            let done = done.load(Ordering::SeqCst);
+            thread::spawn(move || {
+                let mut client = Client::connect(addr).unwrap();
+                let begin = writer * PER_WRITER;
+                for index in begin..begin + done {
+                    let found = client.get(format!("key-{index}").into_bytes()).unwrap();
+                    assert_eq!(found, Some(value(index)), "lost acknowledged key-{index}");
+                }
+            })
+        })
+        .collect();
+    for checker in checkers {
+        checker.join().unwrap();
+    }
+
+    // Finish the workload; rewriting an in-flight key stores the same value.
+    for writer in run_writers(&progress) {
+        writer.join().unwrap();
+    }
+    assert_eq!(acknowledged(&progress), RECORDS);
+    let stats = client.stats().unwrap();
+    let final_lsn: usize = stat(&stats, "current_lsn").unwrap().parse().unwrap();
+    wait_replica(&mut client, &mut replica, final_lsn);
+    drop(client);
+    replica.shutdown();
+    primary.shutdown();
+
+    let primary_db = Db::open(RealFs, &cluster.primary_dir, DurabilityMode::Fsync).unwrap();
+    let replica_db = cluster.open_replica();
+    assert_eq!(primary_db.len(), RECORDS);
+    assert_eq!(replica_db.len(), RECORDS);
+    assert_eq!(replica_db.last_applied_lsn(), primary_db.last_applied_lsn());
+    let last = primary_db.last_applied_lsn();
+    assert_eq!(replica_db.record_hash_at(last), primary_db.record_hash_at(last));
+    for index in 0..RECORDS {
+        let key = format!("key-{index}");
+        assert_eq!(primary_db.get(key.as_bytes()), GetResult::Found(value(index)));
+        assert_eq!(replica_db.get(key.as_bytes()), GetResult::Found(value(index)));
+    }
+    drop(primary_db);
+    drop(replica_db);
+    std::fs::remove_dir_all(&cluster.root).unwrap();
 }
