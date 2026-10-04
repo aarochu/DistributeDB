@@ -92,8 +92,8 @@ fn writes_commit_while_a_flush_is_written() {
         }),
         ..OpenConfig::default()
     };
-    let db = Db::open_configured(fs.clone(), Path::new("/lsm"), DurabilityMode::Fsync, config)
-        .unwrap();
+    let db =
+        Db::open_configured(fs.clone(), Path::new("/lsm"), DurabilityMode::Fsync, config).unwrap();
     let mut server = Server::start("127.0.0.1:0", db, ServerConfig::default()).unwrap();
     let mut client = Client::connect(server.local_addr()).unwrap();
 

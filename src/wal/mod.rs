@@ -2465,7 +2465,11 @@ impl<F: FileSystem + Clone> Db<F> {
         };
         !self.wal.failed
             && tree.flush_pending()
-            && tree.memtable_bytes() >= tree.config().memtable_bytes.saturating_mul(LSM_STALL_FACTOR)
+            && tree.memtable_bytes()
+                >= tree
+                    .config()
+                    .memtable_bytes
+                    .saturating_mul(LSM_STALL_FACTOR)
     }
 
     /// Start a compaction if level 0 has reached its trigger.
