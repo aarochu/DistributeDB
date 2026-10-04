@@ -103,7 +103,10 @@ fn reads_do_not_wait_for_a_group_sync() {
     let (status, write_time) = writer.join().unwrap();
     assert_eq!(status, Status::Ok);
     assert!(write_time >= SLOW_SYNC, "SET returned before its sync");
-    assert_eq!(reader.get(b"existing".to_vec()).unwrap(), Some(b"new".to_vec()));
+    assert_eq!(
+        reader.get(b"existing".to_vec()).unwrap(),
+        Some(b"new".to_vec())
+    );
     let stats = reader.stats().unwrap();
     assert!(stats.lines().any(|line| line == "current_lsn=2"), "{stats}");
     drop(reader);
