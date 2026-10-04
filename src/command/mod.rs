@@ -24,6 +24,8 @@ pub const MIN_KEY_LEN: usize = 1;
 pub const SET_FIXED_OVERHEAD: usize = 33;
 /// Maximum encoded mutation size in bytes (Technical-Design §4.1).
 pub const MAX_MUTATION_ENCODED_LEN: usize = 1_000_000;
+/// Largest number of pairs one `SCAN` may request.
+pub const MAX_SCAN_LIMIT: usize = 10_000;
 
 /// A parsed key-value command (SOW §4.1).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -36,6 +38,14 @@ pub enum Command {
     Delete { key: Vec<u8> },
     /// `EXISTS key` — test whether `key` exists.
     Exists { key: Vec<u8> },
+    /// `SCAN start end limit` — up to `limit` pairs with `start <= key < end`
+    /// in key order. An empty `start` begins at the first key; `end: None` is
+    /// unbounded.
+    Scan {
+        start: Vec<u8>,
+        end: Option<Vec<u8>>,
+        limit: usize,
+    },
 }
 
 /// Error returned when a command line cannot be parsed or violates a limit.
@@ -63,6 +73,8 @@ pub enum ParseError {
         /// The maximum permitted encoded size.
         max: usize,
     },
+    /// A `SCAN` limit was not an integer in `1..=MAX_SCAN_LIMIT`.
+    InvalidLimit(String),
 }
 
 impl fmt::Display for ParseError {
@@ -82,6 +94,10 @@ impl fmt::Display for ParseError {
             ParseError::MutationTooLarge { encoded_len, max } => write!(
                 f,
                 "mutation too large: encoded {encoded_len} bytes exceeds limit {max}"
+            ),
+            ParseError::InvalidLimit(limit) => write!(
+                f,
+                "invalid SCAN limit {limit} (must be 1..={MAX_SCAN_LIMIT})"
             ),
         }
     }
@@ -127,8 +143,40 @@ pub fn parse(line: &str) -> Result<Command, ParseError> {
         "GET" => parse_single_key("GET", rest).map(|key| Command::Get { key }),
         "DELETE" => parse_single_key("DELETE", rest).map(|key| Command::Delete { key }),
         "EXISTS" => parse_single_key("EXISTS", rest).map(|key| Command::Exists { key }),
+        "SCAN" => parse_scan(rest),
         _ => Err(ParseError::UnknownCommand(word.to_string())),
     }
+}
+
+/// Parse `SCAN start end limit`. `*` as `start` begins at the first key and
+/// `*` as `end` leaves the range unbounded, so `*` itself cannot be a bound.
+fn parse_scan(rest: &str) -> Result<Command, ParseError> {
+    let args: Vec<&str> = rest.split_whitespace().collect();
+    let &[start, end, limit] = args.as_slice() else {
+        return Err(ParseError::WrongArgCount {
+            command: "SCAN",
+            expected: "3 (start end limit)",
+            got: args.len(),
+        });
+    };
+    let bound = |text: &str| -> Result<Option<Vec<u8>>, ParseError> {
+        if text == "*" {
+            return Ok(None);
+        }
+        let key = text.as_bytes().to_vec();
+        validate_key_len(&key)?;
+        Ok(Some(key))
+    };
+    let limit = limit
+        .parse::<usize>()
+        .ok()
+        .filter(|limit| (1..=MAX_SCAN_LIMIT).contains(limit))
+        .ok_or_else(|| ParseError::InvalidLimit(limit.to_string()))?;
+    Ok(Command::Scan {
+        start: bound(start)?.unwrap_or_default(),
+        end: bound(end)?,
+        limit,
+    })
 }
 
 /// Parse the arguments of a `SET`: `key` then rest-of-line as the value.

@@ -390,6 +390,10 @@ fn client_execute(client: &mut Client, command: Command) -> Option<String> {
             Ok(false) => FALSE.to_string(),
             Err(err) => format!("ERROR: {err}"),
         },
+        Command::Scan { start, end, limit } => match client.scan(start, end, limit as u32) {
+            Ok((pairs, more)) => render_scan(&pairs, more),
+            Err(err) => format!("ERROR: {err}"),
+        },
     };
     Some(rendered)
 }
@@ -473,7 +477,33 @@ fn execute(engine: &mut StorageEngine, command: Command) -> String {
                 FALSE.to_string()
             }
         }
+        Command::Scan { start, end, limit } => {
+            let (pairs, more) = engine.scan(&start, end.as_deref(), limit);
+            render_scan(&pairs, more)
+        }
     }
+}
+
+/// One `key value` line per pair, then `(more)` when the range continues;
+/// `(empty)` when nothing matched.
+fn render_scan(pairs: &[(Vec<u8>, Vec<u8>)], more: bool) -> String {
+    let mut lines: Vec<String> = pairs
+        .iter()
+        .map(|(key, value)| {
+            format!(
+                "{} {}",
+                String::from_utf8_lossy(key),
+                String::from_utf8_lossy(value)
+            )
+        })
+        .collect();
+    if more {
+        lines.push("(more)".to_string());
+    }
+    if lines.is_empty() {
+        lines.push("(empty)".to_string());
+    }
+    lines.join("\n")
 }
 
 /// Response printed for a successful `SET` or `DELETE`.

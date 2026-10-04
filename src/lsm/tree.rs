@@ -317,6 +317,57 @@ impl<F: FileSystem + Clone> LsmTree<F> {
         MergeIter::new(sources)
     }
 
+    /// Up to `limit` live pairs with `start <= key < end` in key order, and
+    /// whether more remain. Tables outside the range are skipped, and each
+    /// table is read from the block that may hold `start`.
+    pub fn scan(
+        &self,
+        start: &[u8],
+        end: Option<&[u8]>,
+        limit: usize,
+    ) -> LsmResult<(Vec<(Vec<u8>, Vec<u8>)>, bool)> {
+        let mut sources: Vec<Source<'_>> = Vec::new();
+        sources.push(Box::new(
+            self.memtable
+                .range_from(start)
+                .map(|(key, entry)| Ok::<_, LsmError>((key.clone(), entry.clone()))),
+        ));
+        if let Some(frozen) = &self.immutable {
+            sources.push(Box::new(
+                frozen
+                    .range_from(start)
+                    .map(|(key, entry)| Ok::<_, LsmError>((key.clone(), entry.clone()))),
+            ));
+        }
+        for live in &self.tables {
+            let before_range = end.is_some_and(|end| live.record.min_key.as_slice() >= end);
+            if before_range || live.record.max_key.as_slice() < start {
+                continue;
+            }
+            let first = start.to_vec();
+            sources.push(Box::new(
+                live.table
+                    .iter_from(&self.fs, start)
+                    .filter(move |item| !matches!(item, Ok((key, _)) if *key < first)),
+            ));
+        }
+        let mut pairs = Vec::new();
+        for item in MergeIter::new(sources)? {
+            let (key, entry) = item?;
+            if end.is_some_and(|end| key.as_slice() >= end) {
+                break;
+            }
+            let Some(value) = entry else {
+                continue;
+            };
+            if pairs.len() == limit {
+                return Ok((pairs, true));
+            }
+            pairs.push((key, value));
+        }
+        Ok((pairs, false))
+    }
+
     /// Every live key and value in ascending key order.
     pub fn live_pairs(&self) -> LsmResult<Vec<(Vec<u8>, Vec<u8>)>> {
         let mut pairs = Vec::new();

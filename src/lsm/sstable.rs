@@ -543,6 +543,16 @@ impl SsTable {
         Ok(Lookup::Absent)
     }
 
+    /// Entries from the block that may hold `start` onward. Entries before
+    /// `start` in that first block are included; callers skip them.
+    pub fn iter_from<'a, F: FileSystem>(&'a self, fs: &'a F, start: &[u8]) -> TableIter<'a, F> {
+        let mut iter = self.iter(fs);
+        iter.next_block = self
+            .index
+            .partition_point(|handle| handle.last_key.as_slice() < start);
+        iter
+    }
+
     /// Every entry in ascending key order, read one block at a time.
     pub fn iter<'a, F: FileSystem>(&'a self, fs: &'a F) -> TableIter<'a, F> {
         TableIter {
