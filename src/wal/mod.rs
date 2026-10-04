@@ -48,7 +48,7 @@ pub mod current;
 pub mod format;
 pub mod snapshot;
 
-use crate::fileio::{FileSystem, FsError};
+use crate::fileio::{FileSystem, FsError, FsResult};
 use crate::storage::{Mutation, StorageEngine};
 use current::Current;
 use format::{
@@ -105,6 +105,10 @@ pub enum WalError {
     FailClosed,
     /// Client mutation attempted against a statically configured replica.
     ReadOnlyReplica,
+    /// A WAL operation was attempted while a group appended by
+    /// [`Wal::append_unsynced`] is still waiting for [`Wal::complete_group`].
+    /// Only the single sequencer appends groups, so this indicates misuse.
+    GroupInProgress,
     /// A mutation exceeded the encoded-size limit.
     MutationTooLarge {
         /// The encoded length that was rejected.
@@ -131,6 +135,7 @@ impl std::fmt::Display for WalError {
             WalError::Identity(m) => write!(f, "identity error: {m}"),
             WalError::FailClosed => write!(f, "wal is fail-closed and rejecting mutations"),
             WalError::ReadOnlyReplica => write!(f, "replica rejects client mutations"),
+            WalError::GroupInProgress => write!(f, "a WAL group commit is already in progress"),
             WalError::MutationTooLarge { encoded_len } => {
                 write!(f, "mutation encoded length {encoded_len} exceeds limit")
             }
@@ -620,6 +625,37 @@ pub struct Wal<F: FileSystem> {
     failed: bool,
     /// Group-commit sync counters since this process opened the WAL.
     sync_stats: WalSyncStats,
+    /// A group has been appended but not completed. While set, nothing else
+    /// may append, rotate, or snapshot, because the active segment holds
+    /// bytes the writer bookkeeping does not yet account for.
+    group_pending: bool,
+}
+
+/// A group appended to the active segment but not yet synced, produced by
+/// [`Wal::append_unsynced`]. Syncing it needs only this value, not the writer,
+/// so a caller can run [`UnsyncedGroup::sync`] without holding the lock that
+/// guards the [`Wal`]. [`Wal::complete_group`] then commits the bookkeeping.
+pub struct UnsyncedGroup<F: FileSystem> {
+    fs: F,
+    segment: PathBuf,
+    /// `false` in `os` mode and for an empty group: nothing to sync.
+    needs_sync: bool,
+    assigned: Vec<u64>,
+    next_lsn: u64,
+    last_hash: u64,
+    group_len: u64,
+}
+
+impl<F: FileSystem> UnsyncedGroup<F> {
+    /// `fsync` the segment holding this group and return how long it took.
+    pub fn sync(&self) -> FsResult<Duration> {
+        if !self.needs_sync {
+            return Ok(Duration::ZERO);
+        }
+        let started = Instant::now();
+        self.fs.sync_file(&self.segment)?;
+        Ok(started.elapsed())
+    }
 }
 
 /// Group-commit `fsync` counters since the WAL was opened (SOW §17 "WAL flush
@@ -664,12 +700,38 @@ impl<F: FileSystem> Wal<F> {
     /// synced before the caller applies them and observes `OK`
     /// (Technical-Design §3, §6.2). On any I/O failure the writer transitions
     /// to a fail-closed state and returns an error without acknowledging.
-    pub fn append_group(&mut self, mutations: &[Mutation]) -> WalResult<Vec<u64>> {
+    pub fn append_group(&mut self, mutations: &[Mutation]) -> WalResult<Vec<u64>>
+    where
+        F: Clone,
+    {
+        let group = self.append_unsynced(mutations)?;
+        let synced = group.sync();
+        self.complete_group(group, synced)
+    }
+
+    /// First half of [`Wal::append_group`]: assign LSNs and append the group
+    /// and its footer to the active segment without syncing. The writer's
+    /// LSN, hash, and length bookkeeping is unchanged until
+    /// [`Wal::complete_group`], and no other group may start before then.
+    pub fn append_unsynced(&mut self, mutations: &[Mutation]) -> WalResult<UnsyncedGroup<F>>
+    where
+        F: Clone,
+    {
+        self.ensure_idle()?;
         if self.failed {
             return Err(WalError::FailClosed);
         }
         if mutations.is_empty() {
-            return Ok(Vec::new());
+            self.group_pending = true;
+            return Ok(UnsyncedGroup {
+                fs: self.fs.clone(),
+                segment: self.paths.segment(self.active_first_lsn),
+                needs_sync: false,
+                assigned: Vec::new(),
+                next_lsn: self.next_lsn,
+                last_hash: self.last_record_hash,
+                group_len: 0,
+            });
         }
         if mutations.len() > MAX_GROUP_RECORDS {
             return Err(WalError::Corruption(format!(
@@ -711,41 +773,66 @@ impl<F: FileSystem> Wal<F> {
             last_hash = hash;
             lsn += 1;
         }
-        let last_lsn = lsn - 1;
         let footer = GroupFooter {
             first_lsn,
-            last_lsn,
+            last_lsn: lsn - 1,
             count: mutations.len() as u32,
             last_record_hash: last_hash,
         };
         buf.extend_from_slice(&footer.encode());
 
-        // Append the group + footer, then sync (fsync mode).
         let seg_path = self.paths.segment(self.active_first_lsn);
-        let group_len = buf.len() as u64;
         if let Err(e) = self.fs.append(&seg_path, &buf) {
             self.failed = true;
             return Err(WalError::Io(e));
         }
-        if self.mode == DurabilityMode::Fsync {
-            let started = Instant::now();
-            if let Err(e) = self.fs.sync_file(&seg_path) {
+        self.group_pending = true;
+        Ok(UnsyncedGroup {
+            fs: self.fs.clone(),
+            segment: seg_path,
+            needs_sync: self.mode == DurabilityMode::Fsync,
+            assigned,
+            next_lsn: lsn,
+            last_hash,
+            group_len: buf.len() as u64,
+        })
+    }
+
+    /// Second half of [`Wal::append_group`]: given the outcome of
+    /// [`UnsyncedGroup::sync`], either fail closed or commit the group's
+    /// bookkeeping and return its LSNs. Only after this returns `Ok` may the
+    /// caller apply the group and acknowledge it.
+    pub fn complete_group(
+        &mut self,
+        group: UnsyncedGroup<F>,
+        synced: FsResult<Duration>,
+    ) -> WalResult<Vec<u64>> {
+        self.group_pending = false;
+        match synced {
+            Err(e) => {
                 self.sync_stats.errors += 1;
                 self.failed = true;
                 return Err(WalError::Io(e));
             }
-            let elapsed = started.elapsed();
-            self.sync_stats.syncs += 1;
-            self.sync_stats.total += elapsed;
-            self.sync_stats.max = self.sync_stats.max.max(elapsed);
-            self.durable_lsn = last_lsn;
+            Ok(elapsed) if group.needs_sync => {
+                self.sync_stats.syncs += 1;
+                self.sync_stats.total += elapsed;
+                self.sync_stats.max = self.sync_stats.max.max(elapsed);
+                self.durable_lsn = group.next_lsn - 1;
+            }
+            Ok(_) => {}
         }
+        self.active_len += group.group_len;
+        self.next_lsn = group.next_lsn;
+        self.last_record_hash = group.last_hash;
+        Ok(group.assigned)
+    }
 
-        // Commit writer bookkeeping only after the durable append succeeded.
-        self.active_len += group_len;
-        self.next_lsn = lsn;
-        self.last_record_hash = last_hash;
-        Ok(assigned)
+    fn ensure_idle(&self) -> WalResult<()> {
+        if self.group_pending {
+            return Err(WalError::GroupInProgress);
+        }
+        Ok(())
     }
 
     /// Explicitly sync the WAL through `lsn` (Technical-Design §2.1
@@ -753,6 +840,7 @@ impl<F: FileSystem> Wal<F> {
     /// `fsync` mode, so this syncs the active segment file and confirms the
     /// durability boundary.
     pub fn sync_through(&mut self, lsn: u64) -> WalResult<u64> {
+        self.ensure_idle()?;
         if self.failed {
             return Err(WalError::FailClosed);
         }
@@ -778,6 +866,7 @@ impl<F: FileSystem> Wal<F> {
     }
 
     fn rotate(&mut self) -> WalResult<()> {
+        self.ensure_idle()?;
         let old_path = self.paths.segment(self.active_first_lsn);
         // Seal the prior segment with a successful sync first.
         if self.mode == DurabilityMode::Fsync {
@@ -944,6 +1033,21 @@ pub struct Db<F: FileSystem> {
     retention_budget_bytes: u64,
     allow_snapshot_rebootstrap: bool,
     _lock: Box<dyn crate::fileio::LockGuard>,
+}
+
+/// A client mutation group appended to the WAL but not yet synced or applied;
+/// see [`Db::begin_group`].
+pub struct PendingGroup<F: FileSystem> {
+    group: UnsyncedGroup<F>,
+    prev_hash: u64,
+}
+
+impl<F: FileSystem> PendingGroup<F> {
+    /// `fsync` the group. Needs no access to the [`Db`], so the caller can
+    /// release the database lock first.
+    pub fn sync(&self) -> FsResult<Duration> {
+        self.group.sync()
+    }
 }
 
 /// Verified snapshot bytes and the history boundary offered to a replica.
@@ -1142,6 +1246,7 @@ impl<F: FileSystem + Clone> Db<F> {
             active_len: outcome.active_segment_valid_len,
             failed: false,
             sync_stats: WalSyncStats::default(),
+            group_pending: false,
         };
 
         Ok(Db {
@@ -1586,8 +1691,41 @@ impl<F: FileSystem + Clone> Db<F> {
         if muts.is_empty() {
             return Ok(Vec::new());
         }
-        let mut prev_hash = self.wal.last_record_hash;
-        let assigned = self.wal.append_group(muts)?;
+        let pending = self.begin_group(muts)?;
+        let synced = pending.sync();
+        self.finish_group(pending, muts, synced)
+    }
+
+    /// First half of [`Db::apply_group`]: append `muts` to the WAL without
+    /// syncing or applying them. The map, LSNs, and replication history are
+    /// unchanged, so readers keep seeing only acknowledged state.
+    ///
+    /// The server's sequencer calls this under the database write lock,
+    /// releases the lock for [`PendingGroup::sync`], then retakes it for
+    /// [`Db::finish_group`]. Reads therefore do not wait for the `fsync`
+    /// (Phase 7 lock-scope change). No other mutation, snapshot, or rotation
+    /// is accepted until the group finishes.
+    pub fn begin_group(&mut self, muts: &[Mutation]) -> WalResult<PendingGroup<F>> {
+        if self.wal.identity.role != "primary" {
+            return Err(WalError::ReadOnlyReplica);
+        }
+        let prev_hash = self.wal.last_record_hash;
+        let group = self.wal.append_unsynced(muts)?;
+        Ok(PendingGroup { group, prev_hash })
+    }
+
+    /// Second half of [`Db::apply_group`]: given the sync outcome, fail closed
+    /// or apply `muts` (the same slice passed to [`Db::begin_group`]) to the
+    /// map in LSN order and return their LSNs.
+    pub fn finish_group(
+        &mut self,
+        pending: PendingGroup<F>,
+        muts: &[Mutation],
+        synced: FsResult<Duration>,
+    ) -> WalResult<Vec<u64>> {
+        let mut prev_hash = pending.prev_hash;
+        let assigned = self.wal.complete_group(pending.group, synced)?;
+        debug_assert_eq!(assigned.len(), muts.len());
         // Write-ahead order: apply to the map only after the durable append.
         for (m, &lsn) in muts.iter().zip(assigned.iter()) {
             self.engine.apply(m.clone());
@@ -1966,6 +2104,7 @@ impl<F: FileSystem + Clone> Db<F> {
     ///
     /// [`last_applied_lsn`]: Db::last_applied_lsn
     pub fn publish_snapshot(&mut self) -> WalResult<u64> {
+        self.wal.ensure_idle()?;
         if self.wal.is_failed() {
             return Err(WalError::FailClosed);
         }
@@ -2357,6 +2496,73 @@ mod tests {
         assert_eq!(db.generation_id(), 1);
         assert_eq!(db.generations_removed(), 0);
         assert!(fs.exists(&stray));
+    }
+
+    fn set_mutation(key: &[u8], value: &[u8]) -> Mutation {
+        Mutation::Set {
+            key: key.to_vec(),
+            value: value.to_vec(),
+        }
+    }
+
+    #[test]
+    fn pending_group_is_invisible_and_blocks_other_writers() {
+        let fs = sim();
+        let mut db = Db::open(fs.clone(), &root(), DurabilityMode::Fsync).unwrap();
+        db.set(b"k".to_vec(), b"old".to_vec()).unwrap();
+        let muts = [set_mutation(b"k", b"new"), set_mutation(b"j", b"1")];
+        let pending = db.begin_group(&muts).unwrap();
+
+        // Appended but not synced or applied: readers see acknowledged state.
+        assert_eq!(db.get(b"k"), GetResult::Found(b"old".to_vec()));
+        assert_eq!(db.last_applied_lsn(), 1);
+        assert_eq!(db.last_durable_lsn(), 1);
+        // Nothing else may touch the WAL until the group finishes.
+        assert!(matches!(
+            db.begin_group(&muts),
+            Err(WalError::GroupInProgress)
+        ));
+        assert!(matches!(
+            db.set(b"x".to_vec(), b"y".to_vec()),
+            Err(WalError::GroupInProgress)
+        ));
+        assert!(matches!(
+            db.publish_snapshot(),
+            Err(WalError::GroupInProgress)
+        ));
+
+        let synced = pending.sync();
+        assert_eq!(db.finish_group(pending, &muts, synced).unwrap(), vec![2, 3]);
+        assert_eq!(db.get(b"k"), GetResult::Found(b"new".to_vec()));
+        assert_eq!(db.last_durable_lsn(), 3);
+        assert_eq!(db.wal_sync_stats().syncs, 2);
+        // The writer is idle again, and the group recovers after a crash.
+        db.set(b"x".to_vec(), b"y".to_vec()).unwrap();
+        drop(db);
+        fs.crash();
+        let db = Db::open(fs, &root(), DurabilityMode::Fsync).unwrap();
+        assert_eq!(db.last_applied_lsn(), 4);
+        assert_eq!(db.get(b"j"), GetResult::Found(b"1".to_vec()));
+    }
+
+    #[test]
+    fn failed_group_sync_fails_closed_without_applying() {
+        let fs = sim();
+        let mut db = Db::open(fs.clone(), &root(), DurabilityMode::Fsync).unwrap();
+        let muts = [set_mutation(b"k", b"v")];
+        let pending = db.begin_group(&muts).unwrap();
+        let failed = Err(FsError::InjectedFault("sync failed".into()));
+        assert!(matches!(
+            db.finish_group(pending, &muts, failed),
+            Err(WalError::Io(_))
+        ));
+        assert_eq!(db.get(b"k"), GetResult::NotFound);
+        assert_eq!(db.last_applied_lsn(), 0);
+        assert_eq!(db.wal_sync_stats().errors, 1);
+        assert!(matches!(
+            db.set(b"k".to_vec(), b"v".to_vec()),
+            Err(WalError::FailClosed)
+        ));
     }
 
     #[test]

@@ -632,7 +632,9 @@ fn wal_error_to_status(err: &crate::wal::WalError) -> Status {
         WalError::ReadOnlyReplica => Status::NotPrimary,
         WalError::MutationTooLarge { .. } => Status::BadRequest,
         WalError::ResourceExhausted { .. } => Status::ResourceExhausted,
-        WalError::Format(_) | WalError::Identity(_) => Status::InternalError,
+        WalError::Format(_) | WalError::Identity(_) | WalError::GroupInProgress => {
+            Status::InternalError
+        }
     }
 }
 
@@ -712,12 +714,31 @@ where
 
         // Apply the whole batch as one durable group commit (one fsync).
         let muts: Vec<Mutation> = batch.iter().map(|j| j.mutation.clone()).collect();
-        let result = {
+        // Append under the write lock, sync with no database lock held, then
+        // apply under the write lock. Readers keep using the pre-group map
+        // during the sync, which is correct because none of these writes has
+        // been acknowledged yet (Phase 7 lock-scope change).
+        let (begun, first_hold) = {
             let mut db = shared.db.write().expect("db write lock poisoned");
             let held = Instant::now();
-            let result = db.apply_group(&muts);
-            shared.metrics.write_lock_hold.record(held.elapsed());
-            result
+            (db.begin_group(&muts), held.elapsed())
+        };
+        let result = match begun {
+            Err(e) => {
+                shared.metrics.write_lock_hold.record(first_hold);
+                Err(e)
+            }
+            Ok(pending) => {
+                let synced = pending.sync();
+                let mut db = shared.db.write().expect("db write lock poisoned");
+                let held = Instant::now();
+                let result = db.finish_group(pending, &muts, synced);
+                shared
+                    .metrics
+                    .write_lock_hold
+                    .record(first_hold + held.elapsed());
+                result
+            }
         };
 
         match result {
