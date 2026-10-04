@@ -119,12 +119,7 @@ impl StorageEngine {
     /// Up to `limit` pairs with `start <= key < end` in key order, and
     /// whether more remain. The hash map is unordered, so this sorts the
     /// keys in range: `O(n log n)` over the whole map.
-    pub fn scan(
-        &self,
-        start: &[u8],
-        end: Option<&[u8]>,
-        limit: usize,
-    ) -> ScanPage {
+    pub fn scan(&self, start: &[u8], end: Option<&[u8]>, limit: usize) -> ScanPage {
         let mut keys: Vec<&Vec<u8>> = self
             .map
             .keys()
