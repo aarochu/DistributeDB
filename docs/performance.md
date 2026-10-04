@@ -78,3 +78,28 @@ The primary now sends up to one group (64 records) back to back and accepts ACKs
 | 10/90 | 5,976 | 50–51 |
 
 The benchmark polls for catch-up every 50 ms, so the head values mean the replica had already caught up at the first or second check: it kept pace with the primary instead of trailing it by seconds. Every run ended with the replica caught up. Primary throughput with and without the replica was unchanged within run-to-run variation (median changes of −2% to +1%).
+
+## Phase 8: LSM engine compared with the in-memory engine
+
+SOW Phase 8 asks for benchmarks comparing the advanced index with the initial storage approach. `benchmarks/compare_engines.sh` ran the three GET/SET mixes against a fresh in-memory primary and a fresh LSM primary built from the same revision, alternating the order, with three trials per mix. The run used 32 clients, 100,000 keys of 128-byte values (several times the 4 MiB memtable, so LSM reads go to tables on disk), and 20,000 measured operations, on a GitHub-hosted `ubuntu-24.04` runner on 2026-10-04. Raw rows: [`20261004T183724Z-engine-memory.csv`](../benchmarks/results/20261004T183724Z-engine-memory.csv) and [`20261004T183724Z-engine-lsm.csv`](../benchmarks/results/20261004T183724Z-engine-lsm.csv).
+
+Ranges over three trials:
+
+| GET/SET | Engine | ops/s | Server read p99 µs | Server peak RSS MiB |
+|---|---|---|---|---|
+| 90/10 | memory | 47,300–61,700 | 93–132 | 51.5–53.5 |
+| 90/10 | LSM | 32,000–40,000 | 742–882 | 30.1–30.8 |
+| 50/50 | memory | 26,600–43,000 | 93–132 | 53.8–55.0 |
+| 50/50 | LSM | 8,900–32,700 | 371–441 | 30.8–30.8 |
+| 10/90 | memory | 10,200–18,300 | 111–156 | 55.7–55.9 |
+| 10/90 | LSM | 16,300–30,200 | 221–263 | 29.1–30.8 |
+
+What the ranges support:
+
+- **Memory:** the LSM server peaked at about 30 MiB against about 54 MiB for the in-memory server in every trial, because only the memtable and table indexes and bloom filters stay in memory. That gap grows with the dataset.
+- **Read latency:** an LSM read that reaches a table costs a bloom check and a block read, so the server-side read p99 was 2 to 9 times the in-memory engine's in every trial. Read-heavy throughput was lower in every trial (32,000–40,000 against 47,300–61,700 ops/s).
+- **Write-heavy throughput:** LSM ranged 16,300–30,200 ops/s and the in-memory engine 10,200–18,300. The medians favour LSM by 34%, but the ranges touch, so three trials do not establish it.
+- **Stalls:** one 50/50 LSM trial ran at 8,900 ops/s with a 107 ms client p99. Flushes and compactions run on the sequencer thread and hold back new writes while a table is written ([limits](lsm.md#limits)). Moving maintenance to its own thread is the next measured change it suggests.
+- **Disk:** the LSM directories were 11 to 13% smaller, mainly because the LSM engine deletes WAL covered by flushes while the in-memory engine keeps all WAL without a snapshot.
+
+As with the other comparisons, this is one shared CI runner and sub-second windows. It shows the engines' relative behaviour on that runner, not absolute performance.

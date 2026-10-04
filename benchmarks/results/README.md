@@ -64,3 +64,6 @@ Each measured interval lasted less than a second. Configuration order was fixed,
 
 [`20261004T074644Z-compare-replica-base.csv`](20261004T074644Z-compare-replica-base.csv) and [`20261004T074644Z-compare-replica-head.csv`](20261004T074644Z-compare-replica-head.csv) compare replica catch-up time before and after replication was pipelined and replica syncs were grouped. Each run used a fresh primary with one replica, three trials per mix and revision. See [performance engineering](../../docs/performance.md#replication-pipelined-records-and-grouped-replica-syncs).
 
+## 2026-10-04 — LSM and in-memory engine comparison
+
+[`20261004T183724Z-engine-memory.csv`](20261004T183724Z-engine-memory.csv) and [`20261004T183724Z-engine-lsm.csv`](20261004T183724Z-engine-lsm.csv) compare the two storage engines from one build: 100,000 keys of 128 bytes, three trials per mix, a fresh fsync primary per run. See [performance engineering](../../docs/performance.md#phase-8-lsm-engine-compared-with-the-in-memory-engine).

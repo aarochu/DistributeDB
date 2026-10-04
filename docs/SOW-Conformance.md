@@ -23,8 +23,10 @@ SOW leaves behavior open.
 
 - SOW §11 permits asynchronous replication first. Synchronous or semi-synchronous
   acknowledgment is not a core acceptance condition and is not implemented.
-- SOW §15 and §22 Phase 8 make transactions and a disk-aware B+ tree or LSM
-  index optional. The current implementation uses the allowed in-memory map.
+- SOW §15 makes transactions optional; they are not implemented. SOW §16 and
+  §22 Phase 8 ask for one advanced index: the LSM tree is implemented as an
+  alternative storage engine ([LSM storage engine](lsm.md)), and the in-memory
+  map remains the default.
 - SOW §23–24 exclude or defer Raft, automatic failover, sharding, distributed
   transactions, and production authentication. Their absence is intentional.
 - SOW §21 is a recommended example layout, not a language or path contract.
