@@ -348,7 +348,11 @@ fn client_command(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         match stdin.lock().read_line(&mut line) {
             Ok(0) => break, // EOF.
             Ok(_) => {
-                let parsed = if hex_mode { parse_hex(&line) } else { parse(&line) };
+                let parsed = if hex_mode {
+                    parse_hex(&line)
+                } else {
+                    parse(&line)
+                };
                 let rendered = match parsed {
                     Ok(command) => client_execute(&mut client, command, hex_mode),
                     Err(err) => Some(format!("BAD_REQUEST: {err}")),
@@ -676,7 +680,11 @@ mod tests {
         assert_eq!(encode_hex(&[0, 10, 32, 255]), "000a20ff");
         assert_eq!(encode_hex(&[]), "");
         assert_eq!(
-            render_scan_mode(&[(vec![0, 255], vec![10, 0]), (vec![1], vec![])], false, true),
+            render_scan_mode(
+                &[(vec![0, 255], vec![10, 0]), (vec![1], vec![])],
+                false,
+                true
+            ),
             "00ff 0a00\n01 -"
         );
         assert_eq!(render_scan_mode(&[], false, true), "(empty)");
