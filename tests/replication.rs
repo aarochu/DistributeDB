@@ -175,6 +175,90 @@ fn mismatched_cluster_stops_replica_without_rewriting_history() {
 }
 
 #[test]
+fn known_history_mismatch_stops_even_a_rebootstrap_provisioned_replica() {
+    let mut primary = Db::open(
+        SimFs::new(SimConfig::new(60)),
+        Path::new("/primary"),
+        DurabilityMode::Fsync,
+    )
+    .unwrap();
+    let cluster_id = primary.identity().cluster_id;
+    primary.set(b"key".to_vec(), b"primary".to_vec()).unwrap();
+
+    // Build a different, durable record at the same LSN and cluster ID. A
+    // provisioned snapshot policy must not turn a known mismatch into an
+    // implicit reset of this replica's local history.
+    let mut divergent_source = Db::open_configured(
+        SimFs::new(SimConfig::new(61)),
+        Path::new("/divergent-source"),
+        DurabilityMode::Fsync,
+        OpenConfig {
+            cluster_id: Some(cluster_id),
+            ..OpenConfig::default()
+        },
+    )
+    .unwrap();
+    divergent_source
+        .set(b"key".to_vec(), b"replica".to_vec())
+        .unwrap();
+    let divergent_record = divergent_source
+        .durable_records_after(0, 1)
+        .unwrap()
+        .remove(0);
+    let replica_fs = SimFs::new(SimConfig::new(62));
+    let replica_config = OpenConfig {
+        role: NodeRole::Replica,
+        cluster_id: Some(cluster_id),
+        allow_snapshot_rebootstrap: true,
+        ..OpenConfig::default()
+    };
+    let mut replica = Db::open_configured(
+        replica_fs.clone(),
+        Path::new("/replica"),
+        DurabilityMode::Fsync,
+        replica_config,
+    )
+    .unwrap();
+    replica.apply_replicated_record(&divergent_record).unwrap();
+    let divergent_hash = replica.record_hash_at(1);
+    assert_ne!(divergent_hash, primary.record_hash_at(1));
+    let replica = Arc::new(RwLock::new(replica));
+    let primary = Arc::new(RwLock::new(primary));
+    let mut listener = PrimaryListener::start(
+        "127.0.0.1:0",
+        Arc::clone(&primary),
+        Arc::new(ReplicationStats::default()),
+    )
+    .unwrap();
+    let mut runner = ReplicaRunner::start(listener.local_addr(), Arc::clone(&replica)).unwrap();
+    wait_until(|| runner.fatal_error().is_some());
+    assert!(runner
+        .fatal_error()
+        .unwrap()
+        .contains("history hash mismatch"));
+    assert_eq!(replica.read().unwrap().last_applied_lsn(), 1);
+    assert_eq!(replica.read().unwrap().record_hash_at(1), divergent_hash);
+    assert_eq!(
+        replica.read().unwrap().get(b"key"),
+        GetResult::Found(b"replica".to_vec())
+    );
+    runner.shutdown();
+    listener.shutdown();
+    drop(replica);
+    replica_fs.crash();
+    let reopened = Db::open_configured(
+        replica_fs,
+        Path::new("/replica"),
+        DurabilityMode::Fsync,
+        replica_config,
+    )
+    .unwrap();
+    assert_eq!(reopened.last_applied_lsn(), 1);
+    assert_eq!(reopened.record_hash_at(1), divergent_hash);
+    assert_eq!(reopened.get(b"key"), GetResult::Found(b"replica".to_vec()));
+}
+
+#[test]
 fn snapshot_rebootstrap_is_explicit_and_recovers_after_crash() {
     let primary_fs = SimFs::new(SimConfig::new(40));
     let mut primary = Db::open(primary_fs, Path::new("/primary"), DurabilityMode::Fsync).unwrap();
