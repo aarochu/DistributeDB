@@ -62,7 +62,15 @@ In another terminal:
 printf 'SET user:123 Aaron\nGET user:123\n' | cargo run -- client --addr 127.0.0.1:5555
 ```
 
+For binary keys and values, add `--hex` and encode each byte as two hexadecimal digits. In this mode, `GET` and `SCAN` values are printed in hex; `-` means an empty `SET` value or empty `SCAN` value. `NOT_FOUND` remains distinct from an empty `GET` result. For example, this writes and reads a key containing a zero byte and a value containing a newline:
+
+```sh
+printf 'SET 6b00 0a\nGET 6b00\n' | cargo run -- client --addr 127.0.0.1:5555 --hex
+```
+
 `SCAN start end limit` lists up to `limit` keys from `start` (inclusive) to `end` (exclusive) in key order, with `*` for an open bound. For example, `SCAN user: user; 100` lists `user:` keys. A trailing `(more)` means more keys remain; continue from just after the last key shown.
+
+`PING` prints `PONG` when the server is reachable, and `STATS` prints its [statistics](docs/observability.md) as `name=value` lines.
 
 The `serve` process exits after `shutdown` on stdin or EOF. Run `cargo run` without a subcommand for the original **in-memory** REPL. A stopped primary can publish a snapshot with `cargo run -- snapshot --data ./data/primary`; see [snapshot operations](docs/snapshot-operations.md) for the locking and downtime requirements. Automatic scheduling is not implemented.
 

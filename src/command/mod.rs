@@ -11,8 +11,8 @@
 //! after the key (so values may contain spaces) and is preserved verbatim.
 //! CLI text is UTF-8 and is converted to bytes for the byte-string engine.
 //!
-//! The whitespace CLI syntax is for demonstrations only (Technical-Design
-//! §4.1); arbitrary bytes travel over the binary protocol in later phases.
+//! The text syntax is for demonstrations. `parse_hex` accepts hex-encoded
+//! byte arguments so the CLI can send arbitrary keys and values.
 
 use std::fmt;
 
@@ -46,6 +46,10 @@ pub enum Command {
         end: Option<Vec<u8>>,
         limit: usize,
     },
+    /// `PING` — liveness check.
+    Ping,
+    /// `STATS` — operational statistics.
+    Stats,
 }
 
 /// Error returned when a command line cannot be parsed or violates a limit.
@@ -53,7 +57,7 @@ pub enum Command {
 pub enum ParseError {
     /// The input line was empty or contained only whitespace.
     Empty,
-    /// The command word was not one of SET/GET/DELETE/EXISTS.
+    /// The command word was not a known command.
     UnknownCommand(String),
     /// The command received the wrong number of arguments.
     ///
@@ -75,6 +79,8 @@ pub enum ParseError {
     },
     /// A `SCAN` limit was not an integer in `1..=MAX_SCAN_LIMIT`.
     InvalidLimit(String),
+    /// A hex-mode argument had an odd length or a non-hexadecimal digit.
+    InvalidHex(&'static str),
 }
 
 impl fmt::Display for ParseError {
@@ -99,6 +105,7 @@ impl fmt::Display for ParseError {
                 f,
                 "invalid SCAN limit {limit} (must be 1..={MAX_SCAN_LIMIT})"
             ),
+            ParseError::InvalidHex(field) => write!(f, "invalid hexadecimal {field}"),
         }
     }
 }
@@ -144,8 +151,129 @@ pub fn parse(line: &str) -> Result<Command, ParseError> {
         "DELETE" => parse_single_key("DELETE", rest).map(|key| Command::Delete { key }),
         "EXISTS" => parse_single_key("EXISTS", rest).map(|key| Command::Exists { key }),
         "SCAN" => parse_scan(rest),
+        "PING" => parse_no_args("PING", rest).map(|()| Command::Ping),
+        "STATS" => parse_no_args("STATS", rest).map(|()| Command::Stats),
         _ => Err(ParseError::UnknownCommand(word.to_string())),
     }
+}
+
+/// Reject arguments to a command that takes none.
+fn parse_no_args(command: &'static str, rest: &str) -> Result<(), ParseError> {
+    let got = rest.split_whitespace().count();
+    if got != 0 {
+        return Err(ParseError::WrongArgCount {
+            command,
+            expected: "0",
+            got,
+        });
+    }
+    Ok(())
+}
+
+/// Parse a CLI line whose byte arguments are hexadecimal. In this mode a
+/// single `-` denotes an empty SET value; SCAN uses `*` for an open bound.
+/// The command word and argument counts match the text parser.
+pub fn parse_hex(line: &str) -> Result<Command, ParseError> {
+    let mut fields = line.split_whitespace();
+    let word = fields.next().ok_or(ParseError::Empty)?;
+    let command = word.to_ascii_uppercase();
+    let args: Vec<&str> = fields.collect();
+    let required = match command.as_str() {
+        "SET" => (2, "2 (key value)"),
+        "GET" | "DELETE" | "EXISTS" => (1, "1 (key)"),
+        "SCAN" => (3, "3 (start end limit)"),
+        "PING" | "STATS" => (0, "0"),
+        _ => return Err(ParseError::UnknownCommand(word.to_string())),
+    };
+    if args.len() != required.0 {
+        return Err(ParseError::WrongArgCount {
+            command: match command.as_str() {
+                "SET" => "SET",
+                "GET" => "GET",
+                "DELETE" => "DELETE",
+                "EXISTS" => "EXISTS",
+                "PING" => "PING",
+                "STATS" => "STATS",
+                _ => "SCAN",
+            },
+            expected: required.1,
+            got: args.len(),
+        });
+    }
+
+    let key = || -> Result<Vec<u8>, ParseError> {
+        let key = decode_hex(args[0], "key")?;
+        validate_key_len(&key)?;
+        Ok(key)
+    };
+    match command.as_str() {
+        "SET" => {
+            let key = key()?;
+            let value = if args[1] == "-" {
+                Vec::new()
+            } else {
+                decode_hex(args[1], "value")?
+            };
+            let encoded_len = SET_FIXED_OVERHEAD
+                .checked_add(key.len())
+                .and_then(|n| n.checked_add(value.len()))
+                .unwrap_or(usize::MAX);
+            if encoded_len > MAX_MUTATION_ENCODED_LEN {
+                return Err(ParseError::MutationTooLarge {
+                    encoded_len,
+                    max: MAX_MUTATION_ENCODED_LEN,
+                });
+            }
+            Ok(Command::Set { key, value })
+        }
+        "GET" => Ok(Command::Get { key: key()? }),
+        "DELETE" => Ok(Command::Delete { key: key()? }),
+        "EXISTS" => Ok(Command::Exists { key: key()? }),
+        "SCAN" => {
+            let bound = |field: &str| -> Result<Option<Vec<u8>>, ParseError> {
+                if field == "*" {
+                    return Ok(None);
+                }
+                let bytes = decode_hex(field, "SCAN bound")?;
+                validate_key_len(&bytes)?;
+                Ok(Some(bytes))
+            };
+            let limit = args[2]
+                .parse::<usize>()
+                .ok()
+                .filter(|limit| (1..=MAX_SCAN_LIMIT).contains(limit))
+                .ok_or_else(|| ParseError::InvalidLimit(args[2].to_string()))?;
+            Ok(Command::Scan {
+                start: bound(args[0])?.unwrap_or_default(),
+                end: bound(args[1])?,
+                limit,
+            })
+        }
+        "PING" => Ok(Command::Ping),
+        "STATS" => Ok(Command::Stats),
+        _ => unreachable!(),
+    }
+}
+
+fn decode_hex(text: &str, field: &'static str) -> Result<Vec<u8>, ParseError> {
+    let bytes = text.as_bytes();
+    if !bytes.len().is_multiple_of(2) {
+        return Err(ParseError::InvalidHex(field));
+    }
+    let digit = |byte: u8| match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    };
+    bytes
+        .chunks_exact(2)
+        .map(|pair| {
+            let high = digit(pair[0]).ok_or(ParseError::InvalidHex(field))?;
+            let low = digit(pair[1]).ok_or(ParseError::InvalidHex(field))?;
+            Ok(high << 4 | low)
+        })
+        .collect()
 }
 
 /// Parse `SCAN start end limit`. `*` as `start` begins at the first key and
@@ -451,5 +579,68 @@ mod tests {
             }
             other => panic!("expected MutationTooLarge just over boundary, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn hex_mode_preserves_arbitrary_bytes_and_empty_value() {
+        assert_eq!(
+            parse_hex("SET 0020ff 0a00ff").unwrap(),
+            Command::Set {
+                key: vec![0, b' ', 255],
+                value: vec![10, 0, 255],
+            }
+        );
+        assert_eq!(
+            parse_hex("set FF -").unwrap(),
+            Command::Set {
+                key: vec![255],
+                value: Vec::new(),
+            }
+        );
+        assert_eq!(
+            parse_hex("GET 00ff").unwrap(),
+            Command::Get { key: vec![0, 255] }
+        );
+        assert_eq!(
+            parse_hex("DELETE 00ff").unwrap(),
+            Command::Delete { key: vec![0, 255] }
+        );
+        assert_eq!(
+            parse_hex("EXISTS 00ff").unwrap(),
+            Command::Exists { key: vec![0, 255] }
+        );
+        assert_eq!(
+            parse_hex("SCAN * ff 10").unwrap(),
+            Command::Scan {
+                start: Vec::new(),
+                end: Some(vec![255]),
+                limit: 10,
+            }
+        );
+    }
+
+    #[test]
+    fn hex_mode_rejects_bad_arguments_and_enforces_size() {
+        assert_eq!(parse_hex("GET f"), Err(ParseError::InvalidHex("key")));
+        assert_eq!(parse_hex("SET 00 zz"), Err(ParseError::InvalidHex("value")));
+        assert_eq!(parse_hex("GET -"), Err(ParseError::InvalidHex("key")));
+        assert_eq!(
+            parse_hex("SET 00"),
+            Err(ParseError::WrongArgCount {
+                command: "SET",
+                expected: "2 (key value)",
+                got: 1,
+            })
+        );
+        let oversized_key = "ff".repeat(MAX_KEY_LEN + 1);
+        assert_eq!(
+            parse_hex(&format!("GET {oversized_key}")),
+            Err(ParseError::InvalidKeyLength(MAX_KEY_LEN + 1))
+        );
+        let oversized_value = "00".repeat(MAX_MUTATION_ENCODED_LEN - SET_FIXED_OVERHEAD);
+        assert!(matches!(
+            parse_hex(&format!("SET 00 {oversized_value}")),
+            Err(ParseError::MutationTooLarge { .. })
+        ));
     }
 }

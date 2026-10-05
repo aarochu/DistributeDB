@@ -40,7 +40,7 @@ pub mod wal;
 // Re-export the primary types for ergonomic use by the CLI and tests.
 pub use checksum::{crc32c, crc64_ecma, Crc32c, Crc64Ecma};
 pub use client::{Client, ClientError, ClientResult};
-pub use command::{parse, Command, ParseError};
+pub use command::{parse, parse_hex, Command, ParseError};
 pub use fileio::{
     FileSystem, FsError, FsResult, LockGuard, RealFs, SimConfig, SimFs, SplitMix64, SIM_PAGE_SIZE,
 };

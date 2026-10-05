@@ -36,8 +36,8 @@ use std::io::{self, BufRead, Write};
 use std::sync::{Arc, RwLock};
 
 use distributedb::{
-    parse, Client, Command, GetResult, NodeRole, OpenConfig, PrimaryListener, ReplicaRunner,
-    ReplicationStats, Server, ServerConfig, Status, StorageEngine,
+    parse, parse_hex, Client, Command, GetResult, NodeRole, OpenConfig, PrimaryListener,
+    ReplicaRunner, ReplicationStats, Server, ServerConfig, Status, StorageEngine,
 };
 
 fn main() {
@@ -333,6 +333,7 @@ fn replica_command(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
 fn client_command(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let addr = flag_value(args, "--addr").ok_or("client requires --addr HOST:PORT")?;
     let mut client = Client::connect(addr.as_str())?;
+    let hex_mode = args.iter().any(|arg| arg == "--hex");
     if args.iter().any(|arg| arg == "--stats") {
         print!("{}", client.stats()?);
         return Ok(());
@@ -347,8 +348,9 @@ fn client_command(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         match stdin.lock().read_line(&mut line) {
             Ok(0) => break, // EOF.
             Ok(_) => {
-                let rendered = match parse(&line) {
-                    Ok(command) => client_execute(&mut client, command),
+                let parsed = if hex_mode { parse_hex(&line) } else { parse(&line) };
+                let rendered = match parsed {
+                    Ok(command) => client_execute(&mut client, command, hex_mode),
                     Err(err) => Some(format!("BAD_REQUEST: {err}")),
                 };
                 if let Some(text) = rendered {
@@ -368,7 +370,7 @@ fn client_command(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
 /// Execute one parsed command over the network client and render the response
 /// in the same human-readable form as the local REPL. Returns `None` when
 /// nothing should be printed (never, currently) so the caller stays uniform.
-fn client_execute(client: &mut Client, command: Command) -> Option<String> {
+fn client_execute(client: &mut Client, command: Command, hex_mode: bool) -> Option<String> {
     let rendered = match command {
         Command::Set { key, value } => match client.set(key, value) {
             Ok(Status::Ok) | Ok(Status::OkVolatile) => OK.to_string(),
@@ -381,6 +383,7 @@ fn client_execute(client: &mut Client, command: Command) -> Option<String> {
             Err(err) => format!("ERROR: {err}"),
         },
         Command::Get { key } => match client.get(key) {
+            Ok(Some(value)) if hex_mode => encode_hex(&value),
             Ok(Some(value)) => String::from_utf8_lossy(&value).into_owned(),
             Ok(None) => NOT_FOUND.to_string(),
             Err(err) => format!("ERROR: {err}"),
@@ -391,7 +394,15 @@ fn client_execute(client: &mut Client, command: Command) -> Option<String> {
             Err(err) => format!("ERROR: {err}"),
         },
         Command::Scan { start, end, limit } => match client.scan(start, end, limit as u32) {
-            Ok((pairs, more)) => render_scan(&pairs, more),
+            Ok((pairs, more)) => render_scan_mode(&pairs, more, hex_mode),
+            Err(err) => format!("ERROR: {err}"),
+        },
+        Command::Ping => match client.ping() {
+            Ok(()) => PONG.to_string(),
+            Err(err) => format!("ERROR: {err}"),
+        },
+        Command::Stats => match client.stats() {
+            Ok(stats) => stats.trim_end().to_string(),
             Err(err) => format!("ERROR: {err}"),
         },
     };
@@ -481,20 +492,36 @@ fn execute(engine: &mut StorageEngine, command: Command) -> String {
             let (pairs, more) = engine.scan(&start, end.as_deref(), limit);
             render_scan(&pairs, more)
         }
+        Command::Ping => PONG.to_string(),
+        // The volatile REPL has no server; report what it holds.
+        Command::Stats => format!("keys={}", engine.len()),
     }
 }
 
 /// One `key value` line per pair, then `(more)` when the range continues;
 /// `(empty)` when nothing matched.
 fn render_scan(pairs: &[(Vec<u8>, Vec<u8>)], more: bool) -> String {
+    render_scan_mode(pairs, more, false)
+}
+
+fn render_scan_mode(pairs: &[(Vec<u8>, Vec<u8>)], more: bool, hex_mode: bool) -> String {
     let mut lines: Vec<String> = pairs
         .iter()
         .map(|(key, value)| {
-            format!(
-                "{} {}",
-                String::from_utf8_lossy(key),
-                String::from_utf8_lossy(value)
-            )
+            if hex_mode {
+                let rendered_value = if value.is_empty() {
+                    "-".to_string()
+                } else {
+                    encode_hex(value)
+                };
+                format!("{} {rendered_value}", encode_hex(key))
+            } else {
+                format!(
+                    "{} {}",
+                    String::from_utf8_lossy(key),
+                    String::from_utf8_lossy(value)
+                )
+            }
         })
         .collect();
     if more {
@@ -506,8 +533,20 @@ fn render_scan(pairs: &[(Vec<u8>, Vec<u8>)], more: bool) -> String {
     lines.join("\n")
 }
 
+fn encode_hex(bytes: &[u8]) -> String {
+    const DIGITS: &[u8; 16] = b"0123456789abcdef";
+    let mut result = String::with_capacity(bytes.len() * 2);
+    for &byte in bytes {
+        result.push(DIGITS[(byte >> 4) as usize] as char);
+        result.push(DIGITS[(byte & 15) as usize] as char);
+    }
+    result
+}
+
 /// Response printed for a successful `SET` or `DELETE`.
 const OK: &str = "OK";
+/// Response printed for `PING`.
+const PONG: &str = "PONG";
 /// Response printed for a `GET` on a key that does not exist.
 ///
 /// Distinct from an empty stored value, which renders as an empty string.
@@ -630,5 +669,39 @@ mod tests {
         assert_eq!(String::from_utf8(output).unwrap(), "NOT_FOUND\n");
         let err_text = String::from_utf8(errors).unwrap();
         assert!(err_text.starts_with("BAD_REQUEST:"), "got: {err_text}");
+    }
+
+    #[test]
+    fn hex_mode_output_preserves_binary_values_and_scan_pairs() {
+        assert_eq!(encode_hex(&[0, 10, 32, 255]), "000a20ff");
+        assert_eq!(encode_hex(&[]), "");
+        assert_eq!(
+            render_scan_mode(&[(vec![0, 255], vec![10, 0]), (vec![1], vec![])], false, true),
+            "00ff 0a00\n01 -"
+        );
+        assert_eq!(render_scan_mode(&[], false, true), "(empty)");
+    }
+
+    #[test]
+    fn hex_mode_commands_round_trip_over_tcp() {
+        use distributedb::{Db, DurabilityMode, SimConfig, SimFs};
+
+        let fs = SimFs::new(SimConfig::new(0x8117));
+        let db = Db::open(fs, std::path::Path::new("/cli-hex"), DurabilityMode::Fsync).unwrap();
+        let mut server = Server::start("127.0.0.1:0", db, ServerConfig::default()).unwrap();
+        let mut client = Client::connect(server.local_addr()).unwrap();
+        let run_hex = |client: &mut Client, line| {
+            client_execute(client, parse_hex(line).unwrap(), true).unwrap()
+        };
+
+        assert_eq!(run_hex(&mut client, "SET 6b00 0aff"), "OK");
+        assert_eq!(run_hex(&mut client, "GET 6b00"), "0aff");
+        assert_eq!(run_hex(&mut client, "SCAN * * 10"), "6b00 0aff");
+        assert_eq!(run_hex(&mut client, "SET 6b00 -"), "OK");
+        assert_eq!(run_hex(&mut client, "GET 6b00"), "");
+        assert_eq!(run_hex(&mut client, "DELETE 6b00"), "OK");
+        assert_eq!(run_hex(&mut client, "GET 6b00"), "NOT_FOUND");
+        drop(client);
+        server.shutdown();
     }
 }

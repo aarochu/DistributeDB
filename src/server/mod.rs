@@ -93,7 +93,7 @@ use std::time::{Duration, Instant};
 use crate::fileio::FileSystem;
 use crate::protocol::{
     self, Request, Response, Status, KIND_DELETE, KIND_EXISTS, KIND_GET, KIND_SCAN, KIND_SET,
-    KIND_STATS, PROTOCOL_VERSION,
+    KIND_PING, KIND_STATS, PROTOCOL_VERSION,
 };
 use crate::replication::{PeerProgress, ReplicationStats};
 use crate::storage::{GetResult, Mutation};
@@ -743,6 +743,10 @@ where
                 Err(error) => (read_failure(KIND_SCAN, &error), true),
             }
         }
+        Request::Ping => (
+            Response::new(KIND_PING, Status::Ok, b"PONG".to_vec()),
+            true,
+        ),
         Request::Stats => {
             shared.metrics.reads_total.fetch_add(1, Ordering::Relaxed);
             let stats = render_stats(shared);
