@@ -1279,11 +1279,11 @@ impl<F: FileSystem + Clone> Db<F> {
         let fs = self.wal.fs.clone();
         let path = self.wal.paths.tmp().join("replica-snapshot-download.tmp");
         fs.create_dir_all(&self.wal.paths.tmp())?;
-        if fs.exists(&path) {
-            fs.truncate(&path, 0)?;
-        } else {
-            fs.create_file(&path)?;
-        }
+        // SimFs can resurrect a removed but not directory-synced temp file
+        // when the same name is created again. Truncate after create in both
+        // adapters so retries never append to an earlier transfer.
+        fs.create_file(&path)?;
+        fs.truncate(&path, 0)?;
         Ok(SnapshotDownload {
             fs,
             path,
