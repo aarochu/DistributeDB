@@ -20,5 +20,5 @@ jobs:
       - uses: actions/checkout@v4
       - name: Toolchain
         run: rustc --version && cargo --version
-      - name: Run 100 seeded process kill and restart trials
+      - name: Run 100 seeded two-node and three-node failure trials
         run: bash scripts/run_failure_trials.sh

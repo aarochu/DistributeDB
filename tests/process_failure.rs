@@ -98,6 +98,21 @@ fn stat(stats: &str, suffix: &str) -> Option<String> {
     })
 }
 
+/// STATS retains disconnected peers. Match each zero-lag peer to its own
+/// applied LSN instead of selecting the first `_applied_lsn` line.
+fn converged_replicas(stats: &str, expected_lsn: usize) -> usize {
+    stats
+        .lines()
+        .filter_map(|line| line.split_once('='))
+        .filter(|(name, lag)| name.starts_with("replica_") && name.ends_with("_lag") && *lag == "0")
+        .filter(|(name, _)| {
+            let prefix = name.strip_suffix("_lag").unwrap();
+            let applied = format!("{prefix}_applied_lsn={expected_lsn}");
+            stats.lines().any(|line| line == applied.as_str())
+        })
+        .count()
+}
+
 fn wait_replica(client: &mut Client, replica: &mut Process, expected_lsn: usize) {
     wait_replica_within(client, replica, expected_lsn, Duration::from_secs(30));
 }
@@ -109,12 +124,10 @@ fn wait_replica_within(
     timeout: Duration,
 ) {
     let deadline = Instant::now() + timeout;
-    let expected = expected_lsn.to_string();
     loop {
         let stats = client.stats().expect("primary STATS");
         if stat(&stats, "replicas_connected").as_deref() == Some("1")
-            && stat(&stats, "_applied_lsn").as_deref() == Some(expected.as_str())
-            && stat(&stats, "_lag").as_deref() == Some("0")
+            && converged_replicas(&stats, expected_lsn) == 1
         {
             return;
         }
@@ -126,6 +139,35 @@ fn wait_replica_within(
         assert!(
             Instant::now() < deadline,
             "replica did not converge to LSN {expected_lsn}: {stats}"
+        );
+        thread::sleep(Duration::from_millis(25));
+    }
+}
+
+fn wait_two_replicas(
+    client: &mut Client,
+    first: &mut Process,
+    second: &mut Process,
+    expected_lsn: usize,
+) {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let stats = client.stats().expect("primary STATS");
+        if stat(&stats, "replicas_connected").as_deref() == Some("2")
+            && converged_replicas(&stats, expected_lsn) == 2
+        {
+            return;
+        }
+        for replica in [&mut *first, &mut *second] {
+            let child = replica.child.as_mut().expect("replica process exists");
+            if let Some(status) = child.try_wait().expect("poll replica") {
+                let log = std::fs::read_to_string(&replica.log).unwrap_or_default();
+                panic!("replica exited {status} before LSN {expected_lsn}: {log}");
+            }
+        }
+        assert!(
+            Instant::now() < deadline,
+            "two replicas did not converge to LSN {expected_lsn}: {stats}"
         );
         thread::sleep(Duration::from_millis(25));
     }
@@ -258,22 +300,30 @@ impl Cluster {
         }
     }
 
-    fn open_replica(&self) -> Db<RealFs> {
+    fn cluster_bytes(&self) -> [u8; 16] {
         let mut cluster = [0u8; 16];
         for (index, byte) in cluster.iter_mut().enumerate() {
             *byte = u8::from_str_radix(&self.cluster_id[index * 2..index * 2 + 2], 16).unwrap();
         }
+        cluster
+    }
+
+    fn open_replica_at(&self, path: &Path) -> Db<RealFs> {
         Db::open_configured(
             RealFs,
-            &self.replica_dir,
+            path,
             DurabilityMode::Fsync,
             OpenConfig {
                 role: NodeRole::Replica,
-                cluster_id: Some(cluster),
+                cluster_id: Some(self.cluster_bytes()),
                 ..OpenConfig::default()
             },
         )
         .unwrap()
+    }
+
+    fn open_replica(&self) -> Db<RealFs> {
+        self.open_replica_at(&self.replica_dir)
     }
 }
 
@@ -356,6 +406,135 @@ fn replica_and_primary_process_kill_restart_converges() {
     }
     drop(reopened);
     std::fs::remove_dir_all(root).unwrap();
+}
+
+/// Seeded three-node failure path from the SOW §26 demo: an offline primary
+/// snapshot, a stopped replica that catches up, and a primary kill with a
+/// write in flight. This runs once in the normal Rust suite and 100 times in
+/// the process-failure workflow; the Docker demo remains a separate check.
+#[test]
+fn three_node_snapshot_and_process_restart_converges() {
+    let seed: usize = std::env::var("DDB_FAILURE_SEED")
+        .ok()
+        .and_then(|text| text.parse().ok())
+        .unwrap_or(1);
+    let snapshot_at = 8 + seed % 13;
+    let replica_restart_at = snapshot_at + 5 + (seed / 3) % 15;
+    let primary_kill_at = replica_restart_at + 5 + (seed / 7) % 15;
+    let tail = 5 + (seed / 11) % 15;
+    let cluster = Cluster::new("three-node");
+    let second_dir = cluster.root.join("replica-2");
+    assert_eq!(
+        provision(&cluster.primary_dir, &second_dir),
+        cluster.cluster_id
+    );
+    let mut second_args = cluster.replica_args.clone();
+    *second_args.last_mut().unwrap() = second_dir.to_string_lossy().into_owned();
+    let second_log = cluster.root.join("replica-2.log");
+    println!(
+        "three-node failure seed {seed}: data under {}",
+        cluster.root.display()
+    );
+
+    let mut primary = Process::spawn(&cluster.primary_args, &cluster.primary_log);
+    let mut first = Process::spawn(&cluster.replica_args, &cluster.replica_log);
+    let mut second = Process::spawn(&second_args, &second_log);
+    let mut client = wait_client(cluster.client_addr);
+    write_range(&mut client, 0, snapshot_at);
+    wait_two_replicas(&mut client, &mut first, &mut second, snapshot_at);
+
+    // Snapshot requires exclusive ownership of the primary data directory.
+    drop(client);
+    primary.shutdown();
+    let snapshot = Command::new(env!("CARGO_BIN_EXE_distributedb"))
+        .args(["snapshot", "--data"])
+        .arg(&cluster.primary_dir)
+        .output()
+        .expect("run offline snapshot");
+    assert!(
+        snapshot.status.success(),
+        "snapshot failed: {}",
+        String::from_utf8_lossy(&snapshot.stderr)
+    );
+    primary = Process::spawn(&cluster.primary_args, &cluster.primary_log);
+    client = wait_client(cluster.client_addr);
+    wait_two_replicas(&mut client, &mut first, &mut second, snapshot_at);
+
+    second.kill();
+    write_range(&mut client, snapshot_at, replica_restart_at);
+    wait_replica(&mut client, &mut first, replica_restart_at);
+    second = Process::spawn(&second_args, &second_log);
+    wait_two_replicas(&mut client, &mut first, &mut second, replica_restart_at);
+
+    // Acknowledged writes survive a primary process kill. The one request in
+    // flight can also have committed; its response is an unknown outcome.
+    drop(client);
+    let acked = Arc::new(AtomicUsize::new(0));
+    let writer = spawn_writer(
+        cluster.client_addr,
+        replica_restart_at,
+        usize::MAX,
+        Arc::clone(&acked),
+    );
+    wait_acked(&acked, primary_kill_at);
+    primary.kill();
+    writer.join().expect("writer thread");
+    let acknowledged = acked.load(Ordering::SeqCst);
+    primary = Process::spawn(&cluster.primary_args, &cluster.primary_log);
+    client = wait_client(cluster.client_addr);
+    let stats = client.stats().expect("restarted primary STATS");
+    let recovered: usize = stat(&stats, "current_lsn").unwrap().parse().unwrap();
+    assert!(
+        recovered == acknowledged || recovered == acknowledged + 1,
+        "seed {seed}: recovered LSN {recovered} after {acknowledged} acknowledgments"
+    );
+    assert_eq!(
+        stat(&stats, "snapshot_lsn").unwrap(),
+        snapshot_at.to_string()
+    );
+    assert_eq!(
+        stat(&stats, "recovery_records_replayed").unwrap(),
+        (recovered - snapshot_at).to_string()
+    );
+    for index in 0..recovered {
+        assert_eq!(
+            client.get(format!("key-{index}").into_bytes()).unwrap(),
+            Some(value(index)),
+            "seed {seed}: primary lost key-{index}"
+        );
+    }
+    let final_lsn = recovered + tail;
+    write_range(&mut client, recovered, final_lsn);
+    wait_two_replicas(&mut client, &mut first, &mut second, final_lsn);
+    drop(client);
+
+    second.shutdown();
+    first.shutdown();
+    primary.shutdown();
+    let primary_db = Db::open(RealFs, &cluster.primary_dir, DurabilityMode::Fsync).unwrap();
+    let first_db = cluster.open_replica();
+    let second_db = cluster.open_replica_at(&second_dir);
+    let history_hash = primary_db.record_hash_at(final_lsn as u64);
+    assert!(history_hash.is_some());
+    for (name, db) in [("first", &first_db), ("second", &second_db)] {
+        assert_eq!(db.last_applied_lsn(), final_lsn as u64, "{name} LSN");
+        assert_eq!(
+            db.record_hash_at(final_lsn as u64),
+            history_hash,
+            "{name} hash"
+        );
+        for index in 0..final_lsn {
+            assert_eq!(
+                db.get(format!("key-{index}").as_bytes()),
+                GetResult::Found(value(index)),
+                "seed {seed}: {name} lost key-{index}"
+            );
+        }
+    }
+    drop(second_db);
+    drop(first_db);
+    drop(primary_db);
+    std::fs::remove_dir_all(&cluster.root).unwrap();
 }
 
 /// SOW §19's example at full size: launch a primary and a replica, write
