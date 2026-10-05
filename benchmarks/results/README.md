@@ -78,3 +78,14 @@ Each measured interval lasted less than a second. Configuration order was fixed,
 | Snapshot + tail | 500 | 2.13 ms (2.12–2.15) | 2.22 ms (2.21–2.24) |
 
 The snapshot path replayed 10,000 fewer records and was faster in this run. These are warm-cache timings on one GitHub-hosted `ubuntu-24.04` runner with ext4 reported by `df -T`; the storage device and mount options were not captured. The snapshot changes disk layout and retained bytes (383,043 versus 1,823,251), so the timing difference cannot be attributed solely to replay. This small, shared-runner experiment demonstrates reduced replay work; it does not establish a fixed recovery-time bound or hardware power-loss behavior.
+
+## 2026-10-05 — 100,000-mutation snapshot recovery gate
+
+[`20261005T003251Z-recovery-100k.csv`](20261005T003251Z-recovery-100k.csv) and its [run context](20261005T003251Z-recovery-100k.context.txt) came from [workflow run 37247917666](https://github.com/aarochu/DistributeDB/actions/runs/37247917666). The two `fsync` directories received the same 100,500 SET mutations over 2,000 keys with 128-byte values. One published a snapshot at LSN 100,000; both then received the same 500-record tail. The benchmark verified every final key/value, the final LSN, and the exact replay counts before publishing. Seven measured opens per path followed one warm-up open, with path order alternating; no rows were excluded.
+
+| Recovery base | WAL records replayed | Internal recovery time, median (range) | Whole open time, median |
+|---|---:|---:|---:|
+| Full WAL | 100,500 | 125.64 ms (123.61–126.22) | 130.24 ms |
+| Snapshot + tail | 500 | 2.09 ms (2.05–2.13) | 2.19 ms |
+
+The snapshot path replayed 100,000 fewer records. It was faster in this run, but these are warm-cache timings on one GitHub-hosted `ubuntu-24.04` runner with ext4 reported by `df -T`. The storage device and mount options were not captured. The snapshot path retained 383,043 bytes versus 17,449,491 bytes for the full-WAL path, so the timing difference cannot be attributed solely to replay. This run establishes the Technical Design Phase 4 replay-work gate for this implementation and workload, not a fixed recovery-time or power-loss guarantee.
