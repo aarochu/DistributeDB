@@ -48,6 +48,7 @@ pub mod current;
 pub mod format;
 pub mod snapshot;
 
+use crate::checksum::Crc64Ecma;
 use crate::fileio::{FileSystem, FsError, FsResult};
 use crate::lsm::tree::{
     CompactedTables, CompactionJob, FlushJob, LsmConfig, LsmTree, WrittenTable,
@@ -1206,7 +1207,93 @@ pub struct ReplicationSnapshot {
     pub crc64: u64,
 }
 
+/// A replica's incomplete snapshot transfer. Only one receiver uses a data
+/// directory at a time; a retry truncates any file left by a process crash.
+/// The completed image is still loaded for the existing snapshot decoder.
+pub(crate) struct SnapshotDownload<F: FileSystem> {
+    fs: F,
+    path: PathBuf,
+    expected_len: usize,
+    received: usize,
+    crc: Crc64Ecma,
+    trailer: Vec<u8>,
+}
+
+impl<F: FileSystem> SnapshotDownload<F> {
+    pub(crate) fn received(&self) -> usize {
+        self.received
+    }
+
+    pub(crate) fn append(&mut self, offset: u64, chunk: &[u8]) -> WalResult<()> {
+        if offset != self.received as u64
+            || chunk.is_empty()
+            || chunk.len() > self.expected_len - self.received
+        {
+            return Err(WalError::Corruption(
+                "invalid snapshot chunk offset or length".into(),
+            ));
+        }
+        self.fs.append(&self.path, chunk)?;
+        let mut combined = Vec::with_capacity(self.trailer.len() + chunk.len());
+        combined.extend_from_slice(&self.trailer);
+        combined.extend_from_slice(chunk);
+        let crc_len = combined.len().saturating_sub(8);
+        self.crc.update(&combined[..crc_len]);
+        self.trailer.clear();
+        self.trailer.extend_from_slice(&combined[crc_len..]);
+        self.received += chunk.len();
+        Ok(())
+    }
+
+    pub(crate) fn finish(self, expected_crc64: u64) -> WalResult<Vec<u8>> {
+        if self.received != self.expected_len || self.trailer.len() != 8 {
+            return Err(WalError::Corruption("incomplete snapshot transfer".into()));
+        }
+        let trailer = u64::from_le_bytes(self.trailer[..].try_into().expect("eight bytes"));
+        if trailer != expected_crc64 || self.crc.finalize() != expected_crc64 {
+            return Err(WalError::Corruption("snapshot checksum mismatch".into()));
+        }
+        self.fs.sync_file(&self.path)?;
+        Ok(self.fs.read(&self.path)?)
+    }
+}
+
+impl<F: FileSystem> Drop for SnapshotDownload<F> {
+    fn drop(&mut self) {
+        let _ = self.fs.remove_file(&self.path);
+    }
+}
+
 impl<F: FileSystem + Clone> Db<F> {
+    /// Stage a replica snapshot in the data directory's temporary area so a
+    /// stalled transfer does not reserve the advertised image size in RAM.
+    pub(crate) fn begin_snapshot_download(
+        &self,
+        expected_len: usize,
+    ) -> WalResult<SnapshotDownload<F>> {
+        if self.wal.identity.role != "replica" || !self.allow_snapshot_rebootstrap {
+            return Err(WalError::Identity(
+                "snapshot rebootstrap is not provisioned".into(),
+            ));
+        }
+        let fs = self.wal.fs.clone();
+        let path = self.wal.paths.tmp().join("replica-snapshot-download.tmp");
+        fs.create_dir_all(&self.wal.paths.tmp())?;
+        if fs.exists(&path) {
+            fs.truncate(&path, 0)?;
+        } else {
+            fs.create_file(&path)?;
+        }
+        Ok(SnapshotDownload {
+            fs,
+            path,
+            expected_len,
+            received: 0,
+            crc: Crc64Ecma::new(),
+            trailer: Vec::with_capacity(8),
+        })
+    }
+
     /// Persisted node identity, including the cluster ID a replica must use
     /// when it is provisioned. This value is stable across restarts.
     pub fn identity(&self) -> &Identity {
@@ -3227,6 +3314,51 @@ mod tests {
             Db::open_configured(fs, &root(), DurabilityMode::Fsync, wrong_cluster),
             Err(WalError::Identity(_))
         ));
+    }
+
+    #[test]
+    fn snapshot_download_spools_chunks_and_discards_interrupted_transfer() {
+        let fs = sim();
+        let cluster = [7u8; 16];
+        let db = Db::open_configured(
+            fs.clone(),
+            &root(),
+            DurabilityMode::Fsync,
+            OpenConfig {
+                role: NodeRole::Replica,
+                cluster_id: Some(cluster),
+                allow_snapshot_rebootstrap: true,
+                ..OpenConfig::default()
+            },
+        )
+        .unwrap();
+        let bytes = snapshot::encode(cluster, 1, 42, &[(b"k".to_vec(), b"v".to_vec())]);
+        let crc = u64::from_le_bytes(bytes[bytes.len() - 8..].try_into().unwrap());
+        let path = root().join("tmp/replica-snapshot-download.tmp");
+
+        {
+            let mut download = db.begin_snapshot_download(bytes.len()).unwrap();
+            download.append(0, &bytes[..5]).unwrap();
+            assert_eq!(download.received(), 5);
+            assert!(fs.exists(&path));
+            assert!(download.append(3, &bytes[5..6]).is_err());
+        }
+        assert!(!fs.exists(&path));
+
+        let mut download = db.begin_snapshot_download(bytes.len()).unwrap();
+        for chunk in bytes.chunks(7) {
+            download.append(download.received() as u64, chunk).unwrap();
+        }
+        assert_eq!(download.finish(crc).unwrap(), bytes);
+        assert!(!fs.exists(&path));
+
+        let mut download = db.begin_snapshot_download(bytes.len()).unwrap();
+        download.append(0, &bytes).unwrap();
+        assert!(matches!(
+            download.finish(crc ^ 1),
+            Err(WalError::Corruption(_))
+        ));
+        assert!(!fs.exists(&path));
     }
 
     #[test]

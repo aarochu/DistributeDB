@@ -18,7 +18,6 @@ use std::sync::{Arc, Mutex, RwLock};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use crate::checksum::crc64_ecma;
 use crate::fileio::FileSystem;
 use crate::wal::{Db, DurabilityMode, MAX_GROUP_RECORDS};
 use protocol::{read_message, write_message, Message};
@@ -716,19 +715,22 @@ where
                 if snapshot_bytes > MAX_SNAPSHOT_BYTES as u64 || snapshot_bytes < 72 {
                     return Err(SessionError::Fatal("snapshot size is invalid".into()));
                 }
-                let mut bytes = Vec::with_capacity(snapshot_bytes as usize);
-                while bytes.len() < snapshot_bytes as usize {
+                let mut download = db
+                    .read()
+                    .expect("db lock poisoned")
+                    .begin_snapshot_download(snapshot_bytes as usize)
+                    .map_err(|error| SessionError::Fatal(error.to_string()))?;
+                while download.received() < snapshot_bytes as usize {
                     match read_message(&mut reader) {
                         Ok(Some(Message::SnapshotChunk {
                             snapshot_lsn: chunk_lsn,
                             offset,
                             bytes: chunk,
-                        })) if chunk_lsn == snapshot_lsn
-                            && offset == bytes.len() as u64
-                            && !chunk.is_empty()
-                            && chunk.len() <= snapshot_bytes as usize - bytes.len() =>
+                        })) if chunk_lsn == snapshot_lsn =>
                         {
-                            bytes.extend_from_slice(&chunk);
+                            download
+                                .append(offset, &chunk)
+                                .map_err(|error| SessionError::Fatal(error.to_string()))?;
                         }
                         Ok(None) | Err(_) => return Err(SessionError::Retry),
                         _ => return Err(SessionError::Fatal("invalid snapshot chunk".into())),
@@ -742,14 +744,9 @@ where
                     Ok(None) | Err(_) => return Err(SessionError::Retry),
                     _ => return Err(SessionError::Fatal("invalid snapshot completion".into())),
                 }
-                let embedded_crc = u64::from_le_bytes(
-                    bytes[bytes.len() - 8..].try_into().expect("length checked"),
-                );
-                if embedded_crc != snapshot_crc64
-                    || crc64_ecma(&bytes[..bytes.len() - 8]) != snapshot_crc64
-                {
-                    return Err(SessionError::Fatal("snapshot checksum mismatch".into()));
-                }
+                let bytes = download
+                    .finish(snapshot_crc64)
+                    .map_err(|error| SessionError::Fatal(error.to_string()))?;
                 let mut guard = db.write().expect("db lock poisoned");
                 guard
                     .install_replica_snapshot(&bytes, snapshot_lsn, record_hash)
