@@ -20,7 +20,12 @@ jobs:
       - name: Toolchain
         run: rustc --version && cargo --version
       - name: Compare full WAL and snapshot-tail recovery
-        run: DDB_RECOVERY_OUTPUT=bench-out/recovery.csv DDB_STORAGE_MEDIUM=ci-runner-disk bash benchmarks/run_recovery_benchmark.sh
+        env:
+          DDB_RECOVERY_RECORDS: "100000"
+          DDB_RECOVERY_TAIL: "500"
+          DDB_RECOVERY_OUTPUT: bench-out/recovery.csv
+          DDB_STORAGE_MEDIUM: ci-runner-disk
+        run: bash benchmarks/run_recovery_benchmark.sh
       - name: Upload measurements
         if: always()
         uses: actions/upload-artifact@v4

@@ -42,7 +42,8 @@ opens alternate which path goes first. CSV rows contain the internal recovery
 duration, whole `Db::open` duration, replayed records, snapshot LSN, and data
 size. The companion context file records revision, UTC time, Rust version,
 kernel, reported filesystem, and runner. The GitHub recovery benchmark workflow
-runs this procedure and uploads both files. The two directories have distinct
+runs the procedure with 100,000 initial mutations and a 500-record tail, and
+uploads both files. The two directories have distinct
 node identities but identical mutations and final key/value state. A snapshot
 adds a separate file and changes the disk layout, so elapsed times compare
 these two recovery strategies rather than isolating the cost of replay alone.
