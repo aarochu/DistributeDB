@@ -266,8 +266,10 @@ fn decode_hex(text: &str, field: &'static str) -> Result<Vec<u8>, ParseError> {
         b'A'..=b'F' => Some(byte - b'A' + 10),
         _ => None,
     };
-    bytes
-        .chunks_exact(2)
+    let (pairs, remainder) = bytes.as_chunks::<2>();
+    debug_assert!(remainder.is_empty());
+    pairs
+        .iter()
         .map(|pair| {
             let high = digit(pair[0]).ok_or(ParseError::InvalidHex(field))?;
             let low = digit(pair[1]).ok_or(ParseError::InvalidHex(field))?;
