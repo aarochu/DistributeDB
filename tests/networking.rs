@@ -228,11 +228,11 @@ fn parse_stat(stats: &str, name: &str) -> u64 {
 fn malformed_frame_gets_bad_request_and_server_stays_usable() {
     let mut server = start_sim_server(ServerConfig::default());
 
-    // A syntactically complete frame with an UNKNOWN request kind (7). The
+    // A syntactically complete frame with an unknown request kind (255). The
     // frame is well-formed at the framing layer (valid length prefix, valid
     // version byte) but the body is semantically invalid.
     let mut stream = raw_connect(&server);
-    let body: Vec<u8> = vec![PROTOCOL_VERSION, 7]; // version=1, kind=7 (unknown)
+    let body: Vec<u8> = vec![PROTOCOL_VERSION, u8::MAX];
     let mut frame = (body.len() as u32).to_le_bytes().to_vec();
     frame.extend_from_slice(&body);
     stream.write_all(&frame).expect("write malformed frame");
