@@ -726,8 +726,7 @@ where
                             snapshot_lsn: chunk_lsn,
                             offset,
                             bytes: chunk,
-                        })) if chunk_lsn == snapshot_lsn =>
-                        {
+                        })) if chunk_lsn == snapshot_lsn => {
                             download
                                 .append(offset, &chunk)
                                 .map_err(|error| SessionError::Fatal(error.to_string()))?;
