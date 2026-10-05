@@ -46,6 +46,10 @@ pub enum Command {
         end: Option<Vec<u8>>,
         limit: usize,
     },
+    /// `PING` — liveness check.
+    Ping,
+    /// `STATS` — operational statistics.
+    Stats,
 }
 
 /// Error returned when a command line cannot be parsed or violates a limit.
@@ -53,7 +57,7 @@ pub enum Command {
 pub enum ParseError {
     /// The input line was empty or contained only whitespace.
     Empty,
-    /// The command word was not one of SET/GET/DELETE/EXISTS.
+    /// The command word was not a known command.
     UnknownCommand(String),
     /// The command received the wrong number of arguments.
     ///
@@ -144,8 +148,23 @@ pub fn parse(line: &str) -> Result<Command, ParseError> {
         "DELETE" => parse_single_key("DELETE", rest).map(|key| Command::Delete { key }),
         "EXISTS" => parse_single_key("EXISTS", rest).map(|key| Command::Exists { key }),
         "SCAN" => parse_scan(rest),
+        "PING" => parse_no_args("PING", rest).map(|()| Command::Ping),
+        "STATS" => parse_no_args("STATS", rest).map(|()| Command::Stats),
         _ => Err(ParseError::UnknownCommand(word.to_string())),
     }
+}
+
+/// Reject arguments to a command that takes none.
+fn parse_no_args(command: &'static str, rest: &str) -> Result<(), ParseError> {
+    let got = rest.split_whitespace().count();
+    if got != 0 {
+        return Err(ParseError::WrongArgCount {
+            command,
+            expected: "0",
+            got,
+        });
+    }
+    Ok(())
 }
 
 /// Parse `SCAN start end limit`. `*` as `start` begins at the first key and

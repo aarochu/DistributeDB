@@ -157,6 +157,18 @@ impl Client {
         }
     }
 
+    /// `PING`. Succeeds when the server answers `PONG`.
+    pub fn ping(&mut self) -> ClientResult<()> {
+        let resp = self.round_trip(&Request::Ping)?;
+        match resp.status {
+            Status::Ok if resp.data == b"PONG" => Ok(()),
+            status => Err(ClientError::UnexpectedStatus {
+                status,
+                data: resp.data,
+            }),
+        }
+    }
+
     /// `STATS`. Returns the server's operational statistics as text
     /// (`name=value` lines, version first).
     pub fn stats(&mut self) -> ClientResult<String> {

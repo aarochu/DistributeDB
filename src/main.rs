@@ -394,6 +394,14 @@ fn client_execute(client: &mut Client, command: Command) -> Option<String> {
             Ok((pairs, more)) => render_scan(&pairs, more),
             Err(err) => format!("ERROR: {err}"),
         },
+        Command::Ping => match client.ping() {
+            Ok(()) => PONG.to_string(),
+            Err(err) => format!("ERROR: {err}"),
+        },
+        Command::Stats => match client.stats() {
+            Ok(stats) => stats.trim_end().to_string(),
+            Err(err) => format!("ERROR: {err}"),
+        },
     };
     Some(rendered)
 }
@@ -481,6 +489,9 @@ fn execute(engine: &mut StorageEngine, command: Command) -> String {
             let (pairs, more) = engine.scan(&start, end.as_deref(), limit);
             render_scan(&pairs, more)
         }
+        Command::Ping => PONG.to_string(),
+        // The volatile REPL has no server; report what it holds.
+        Command::Stats => format!("keys={}", engine.len()),
     }
 }
 
@@ -508,6 +519,8 @@ fn render_scan(pairs: &[(Vec<u8>, Vec<u8>)], more: bool) -> String {
 
 /// Response printed for a successful `SET` or `DELETE`.
 const OK: &str = "OK";
+/// Response printed for `PING`.
+const PONG: &str = "PONG";
 /// Response printed for a `GET` on a key that does not exist.
 ///
 /// Distinct from an empty stored value, which renders as an empty string.

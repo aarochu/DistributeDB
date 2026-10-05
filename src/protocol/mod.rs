@@ -55,6 +55,8 @@ pub const KIND_EXISTS: u8 = 4;
 pub const KIND_STATS: u8 = 5;
 /// `kind` byte for a `SCAN` request.
 pub const KIND_SCAN: u8 = 6;
+/// `PING`: liveness check; the reply is `PONG`.
+pub const KIND_PING: u8 = 7;
 /// Largest `SCAN OK` data the server sends: a response body is
 /// `version:u8 | kind:u8 | status:u16 | data_len:u32 | data`.
 pub const MAX_SCAN_DATA_LEN: usize = MAX_BODY_LEN - 8;
@@ -74,6 +76,8 @@ pub enum RequestKind {
     Stats,
     /// `SCAN start end limit` (ordered range read).
     Scan,
+    /// `PING` (liveness check).
+    Ping,
 }
 
 impl RequestKind {
@@ -86,6 +90,7 @@ impl RequestKind {
             RequestKind::Exists => KIND_EXISTS,
             RequestKind::Stats => KIND_STATS,
             RequestKind::Scan => KIND_SCAN,
+            RequestKind::Ping => KIND_PING,
         }
     }
 
@@ -98,6 +103,7 @@ impl RequestKind {
             KIND_EXISTS => Ok(RequestKind::Exists),
             KIND_STATS => Ok(RequestKind::Stats),
             KIND_SCAN => Ok(RequestKind::Scan),
+            KIND_PING => Ok(RequestKind::Ping),
             other => Err(ProtocolError::UnknownKind(other)),
         }
     }
@@ -196,6 +202,8 @@ pub enum Request {
         /// Maximum pairs, `1..=MAX_SCAN_LIMIT`.
         limit: u32,
     },
+    /// `PING` — liveness check; answered without touching the database.
+    Ping,
 }
 
 impl Request {
@@ -208,6 +216,7 @@ impl Request {
             Request::Exists { .. } => RequestKind::Exists,
             Request::Stats => RequestKind::Stats,
             Request::Scan { .. } => RequestKind::Scan,
+            Request::Ping => RequestKind::Ping,
         }
     }
 
@@ -228,7 +237,7 @@ impl Request {
                 body.extend_from_slice(&(key.len() as u32).to_le_bytes());
                 body.extend_from_slice(key);
             }
-            Request::Stats => {}
+            Request::Stats | Request::Ping => {}
             Request::Scan { start, end, limit } => {
                 let end = end.as_deref().unwrap_or_default();
                 body.extend_from_slice(&(start.len() as u32).to_le_bytes());
@@ -565,11 +574,14 @@ pub fn decode_request_body(body: &[u8]) -> Result<Request, ProtocolError> {
                 _ => unreachable!("kind is Get/Delete/Exists in this arm"),
             }
         }
-        RequestKind::Stats => {
+        RequestKind::Stats | RequestKind::Ping => {
             if !payload.is_empty() {
                 return Err(ProtocolError::TrailingBytes);
             }
-            Ok(Request::Stats)
+            Ok(match kind {
+                RequestKind::Stats => Request::Stats,
+                _ => Request::Ping,
+            })
         }
         RequestKind::Scan => {
             let start_len = take_len_field(payload, 0, "start")? as usize;
@@ -1184,6 +1196,8 @@ mod tests {
             RequestKind::Delete,
             RequestKind::Exists,
             RequestKind::Stats,
+            RequestKind::Scan,
+            RequestKind::Ping,
         ] {
             assert_eq!(RequestKind::from_u8(kind.as_u8()).unwrap(), kind);
         }
