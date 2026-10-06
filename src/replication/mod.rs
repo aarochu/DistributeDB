@@ -743,12 +743,18 @@ where
                     Ok(None) | Err(_) => return Err(SessionError::Retry),
                     _ => return Err(SessionError::Fatal("invalid snapshot completion".into())),
                 }
-                let bytes = download
-                    .finish(snapshot_crc64)
+                let cluster_id = db.read().expect("db lock poisoned").identity().cluster_id;
+                let (download, decoded) = download
+                    .finish(snapshot_crc64, cluster_id)
                     .map_err(|error| SessionError::Fatal(error.to_string()))?;
                 let mut guard = db.write().expect("db lock poisoned");
                 guard
-                    .install_replica_snapshot(&bytes, snapshot_lsn, record_hash)
+                    .install_replica_snapshot_download(
+                        &download,
+                        decoded,
+                        snapshot_lsn,
+                        record_hash,
+                    )
                     .map_err(|error| SessionError::Fatal(error.to_string()))?;
                 drop(guard);
                 write_message(

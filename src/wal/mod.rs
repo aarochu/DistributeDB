@@ -60,6 +60,7 @@ use format::{
     DecodedRecord, FormatError, GroupFooter, MutationRecord, RecordType, SegmentHeader,
     GROUP_FOOTER_LEN, GROUP_MAGIC, MAX_RECORD_ENCODED_LEN, SEGMENT_HEADER_LEN,
 };
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -1209,7 +1210,7 @@ pub struct ReplicationSnapshot {
 
 /// A replica's incomplete snapshot transfer. Only one receiver uses a data
 /// directory at a time; a retry truncates any file left by a process crash.
-/// The completed image is still loaded for the existing snapshot decoder.
+/// A completed transfer stays on disk while its entries are decoded.
 pub(crate) struct SnapshotDownload<F: FileSystem> {
     fs: F,
     path: PathBuf,
@@ -1245,7 +1246,11 @@ impl<F: FileSystem> SnapshotDownload<F> {
         Ok(())
     }
 
-    pub(crate) fn finish(self, expected_crc64: u64) -> WalResult<Vec<u8>> {
+    pub(crate) fn finish(
+        self,
+        expected_crc64: u64,
+        cluster_id: [u8; 16],
+    ) -> WalResult<(Self, snapshot::DecodedSnapshot)> {
         if self.received != self.expected_len || self.trailer.len() != 8 {
             return Err(WalError::Corruption("incomplete snapshot transfer".into()));
         }
@@ -1254,7 +1259,89 @@ impl<F: FileSystem> SnapshotDownload<F> {
             return Err(WalError::Corruption("snapshot checksum mismatch".into()));
         }
         self.fs.sync_file(&self.path)?;
-        Ok(self.fs.read(&self.path)?)
+        match self.fs.read_at(&self.path, self.expected_len as u64, 1) {
+            Ok(_) => return Err(WalError::Corruption("snapshot has trailing bytes".into())),
+            Err(FsError::Io(error)) if error.kind() == std::io::ErrorKind::UnexpectedEof => {}
+            Err(error) => return Err(error.into()),
+        }
+        let decoded = self.decode(cluster_id, expected_crc64)?;
+        Ok((self, decoded))
+    }
+
+    fn decode(
+        &self,
+        cluster_id: [u8; 16],
+        expected_crc64: u64,
+    ) -> WalResult<snapshot::DecodedSnapshot> {
+        let header_bytes = self
+            .fs
+            .read_at(&self.path, 0, snapshot::SNAPSHOT_HEADER_LEN)?;
+        let header = snapshot::SnapshotHeader::decode(&header_bytes, Some(cluster_id))
+            .map_err(|error| WalError::Corruption(format!("received snapshot: {error}")))?;
+        let payload_len =
+            self.expected_len - snapshot::SNAPSHOT_HEADER_LEN - snapshot::SNAPSHOT_CRC64_LEN;
+        if header.payload_len != payload_len as u64 {
+            return Err(WalError::Corruption(
+                "received snapshot payload length mismatch".into(),
+            ));
+        }
+        let mut crc = Crc64Ecma::new();
+        crc.update(&header_bytes);
+        let mut offset = snapshot::SNAPSHOT_HEADER_LEN;
+        let payload_end = offset + payload_len;
+        let mut pairs = Vec::new();
+        let mut seen = HashSet::new();
+        while offset < payload_end {
+            let remaining = payload_end - offset;
+            if remaining < snapshot::ENTRY_FIXED_OVERHEAD {
+                return Err(WalError::Corruption(
+                    "received snapshot entry header overrun".into(),
+                ));
+            }
+            let lengths =
+                self.fs
+                    .read_at(&self.path, offset as u64, snapshot::ENTRY_FIXED_OVERHEAD)?;
+            let key_len = u32::from_le_bytes(lengths[0..4].try_into().unwrap()) as usize;
+            let value_len = u32::from_le_bytes(lengths[4..8].try_into().unwrap()) as usize;
+            let entry_len = snapshot::ENTRY_FIXED_OVERHEAD
+                .checked_add(key_len)
+                .and_then(|len| len.checked_add(value_len))
+                .ok_or_else(|| {
+                    WalError::Corruption("received snapshot entry length overflow".into())
+                })?;
+            if entry_len > remaining {
+                return Err(WalError::Corruption(
+                    "received snapshot entry overrun".into(),
+                ));
+            }
+            let key = self.fs.read_at(&self.path, (offset + 8) as u64, key_len)?;
+            let value = self
+                .fs
+                .read_at(&self.path, (offset + 8 + key_len) as u64, value_len)?;
+            if !seen.insert(key.clone()) {
+                return Err(WalError::Corruption(
+                    "received snapshot duplicate key".into(),
+                ));
+            }
+            crc.update(&lengths);
+            crc.update(&key);
+            crc.update(&value);
+            pairs.push((key, value));
+            offset += entry_len;
+        }
+        if header.entry_count != pairs.len() as u64 {
+            return Err(WalError::Corruption(
+                "received snapshot entry count mismatch".into(),
+            ));
+        }
+        let trailer = self.fs.read_at(&self.path, payload_end as u64, 8)?;
+        let stored_crc = u64::from_le_bytes(trailer.try_into().unwrap());
+        if stored_crc != expected_crc64 || crc.finalize() != expected_crc64 {
+            return Err(WalError::Corruption(
+                "received snapshot checksum mismatch".into(),
+            ));
+        }
+        Ok(snapshot::DecodedSnapshot { header, pairs })
     }
 }
 
@@ -1274,6 +1361,11 @@ impl<F: FileSystem + Clone> Db<F> {
         if self.wal.identity.role != "replica" || !self.allow_snapshot_rebootstrap {
             return Err(WalError::Identity(
                 "snapshot rebootstrap is not provisioned".into(),
+            ));
+        }
+        if expected_len < snapshot::SNAPSHOT_HEADER_LEN + snapshot::SNAPSHOT_CRC64_LEN {
+            return Err(WalError::Corruption(
+                "snapshot download is too short".into(),
             ));
         }
         let fs = self.wal.fs.clone();
@@ -2168,6 +2260,41 @@ impl<F: FileSystem + Clone> Db<F> {
         expected_lsn: u64,
         expected_hash: u64,
     ) -> WalResult<u64> {
+        let decoded = snapshot::decode(bytes, Some(self.wal.identity.cluster_id))
+            .map_err(|error| WalError::Corruption(format!("received snapshot: {error}")))?;
+        self.install_replica_snapshot_decoded(
+            decoded,
+            Some(bytes),
+            None,
+            expected_lsn,
+            expected_hash,
+        )
+    }
+
+    pub(crate) fn install_replica_snapshot_download(
+        &mut self,
+        download: &SnapshotDownload<F>,
+        decoded: snapshot::DecodedSnapshot,
+        expected_lsn: u64,
+        expected_hash: u64,
+    ) -> WalResult<u64> {
+        self.install_replica_snapshot_decoded(
+            decoded,
+            None,
+            Some(download),
+            expected_lsn,
+            expected_hash,
+        )
+    }
+
+    fn install_replica_snapshot_decoded(
+        &mut self,
+        decoded: snapshot::DecodedSnapshot,
+        bytes: Option<&[u8]>,
+        download: Option<&SnapshotDownload<F>>,
+        expected_lsn: u64,
+        expected_hash: u64,
+    ) -> WalResult<u64> {
         if self.wal.identity.role != "replica" || !self.allow_snapshot_rebootstrap {
             return Err(WalError::Identity(
                 "snapshot rebootstrap is not provisioned for this replica".into(),
@@ -2176,8 +2303,6 @@ impl<F: FileSystem + Clone> Db<F> {
         if self.wal.failed {
             return Err(WalError::FailClosed);
         }
-        let decoded = snapshot::decode(bytes, Some(self.wal.identity.cluster_id))
-            .map_err(|error| WalError::Corruption(format!("received snapshot: {error}")))?;
         if decoded.header.snapshot_lsn != expected_lsn
             || decoded.header.record_hash_at_lsn != expected_hash
             || expected_lsn <= self.last_applied_lsn
@@ -2208,7 +2333,27 @@ impl<F: FileSystem + Clone> Db<F> {
             Engine::Memory(_) => {
                 let snapshot_path = paths.snapshot(expected_lsn);
                 fs.create_file(&snapshot_path)?;
-                fs.append(&snapshot_path, bytes)?;
+                if let Some(download) = download {
+                    let mut copied_crc = Crc64Ecma::new();
+                    for offset in (0..download.expected_len).step_by(256 * 1024) {
+                        let chunk_len = (download.expected_len - offset).min(256 * 1024);
+                        let chunk = fs.read_at(&download.path, offset as u64, chunk_len)?;
+                        let checksum_len = (download.expected_len - 8)
+                            .saturating_sub(offset)
+                            .min(chunk_len);
+                        copied_crc.update(&chunk[..checksum_len]);
+                        fs.append(&snapshot_path, &chunk)?;
+                    }
+                    if copied_crc.finalize() != download.crc.finalize() {
+                        return Err(WalError::Corruption(
+                            "snapshot changed during installation".into(),
+                        ));
+                    }
+                } else if let Some(bytes) = bytes {
+                    fs.append(&snapshot_path, bytes)?;
+                } else {
+                    return Err(WalError::Corruption("snapshot image is missing".into()));
+                }
                 fs.sync_file(&snapshot_path)?;
                 let mut engine = StorageEngine::new();
                 for (key, value) in decoded.pairs {
@@ -3320,7 +3465,7 @@ mod tests {
     fn snapshot_download_spools_chunks_and_discards_interrupted_transfer() {
         let fs = sim();
         let cluster = [7u8; 16];
-        let db = Db::open_configured(
+        let mut db = Db::open_configured(
             fs.clone(),
             &root(),
             DurabilityMode::Fsync,
@@ -3349,13 +3494,91 @@ mod tests {
         for chunk in bytes.chunks(7) {
             download.append(download.received() as u64, chunk).unwrap();
         }
-        assert_eq!(download.finish(crc).unwrap(), bytes);
+        let (download, decoded) = download.finish(crc, cluster).unwrap();
+        assert_eq!(decoded.header.snapshot_lsn, 1);
+        assert_eq!(decoded.pairs, vec![(b"k".to_vec(), b"v".to_vec())]);
+        db.install_replica_snapshot_download(&download, decoded, 1, 42)
+            .unwrap();
+        assert_eq!(db.get(b"k"), GetResult::Found(b"v".to_vec()));
+        drop(download);
         assert!(!fs.exists(&path));
+        drop(db);
+        fs.crash();
+        let recovered = Db::open_configured(
+            fs,
+            &root(),
+            DurabilityMode::Fsync,
+            OpenConfig {
+                role: NodeRole::Replica,
+                cluster_id: Some(cluster),
+                allow_snapshot_rebootstrap: true,
+                ..OpenConfig::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(recovered.get(b"k"), GetResult::Found(b"v".to_vec()));
+    }
+
+    #[test]
+    fn snapshot_download_rechecks_spooled_file_and_duplicate_keys() {
+        let fs = sim();
+        let cluster = [7u8; 16];
+        let db = Db::open_configured(
+            fs.clone(),
+            &root(),
+            DurabilityMode::Fsync,
+            OpenConfig {
+                role: NodeRole::Replica,
+                cluster_id: Some(cluster),
+                allow_snapshot_rebootstrap: true,
+                ..OpenConfig::default()
+            },
+        )
+        .unwrap();
+        let bytes = snapshot::encode(cluster, 1, 42, &[(b"k".to_vec(), b"v".to_vec())]);
+        let crc = u64::from_le_bytes(bytes[bytes.len() - 8..].try_into().unwrap());
+        let path = root().join("tmp/replica-snapshot-download.tmp");
+        let mut download = db.begin_snapshot_download(bytes.len()).unwrap();
+        download.append(0, &bytes).unwrap();
+        let mut corrupted = bytes.clone();
+        corrupted[72] ^= 1;
+        fs.truncate(&path, 0).unwrap();
+        fs.append(&path, &corrupted).unwrap();
+        assert!(matches!(
+            download.finish(crc, cluster),
+            Err(WalError::Corruption(_))
+        ));
+
+        let mut download = db.begin_snapshot_download(bytes.len()).unwrap();
+        download.append(0, &bytes).unwrap();
+        fs.append(&path, b"extra").unwrap();
+        assert!(matches!(
+            download.finish(crc, cluster),
+            Err(WalError::Corruption(_))
+        ));
+
+        let duplicate = snapshot::encode(
+            cluster,
+            1,
+            42,
+            &[
+                (b"k".to_vec(), b"v".to_vec()),
+                (b"k".to_vec(), b"w".to_vec()),
+            ],
+        );
+        let duplicate_crc =
+            u64::from_le_bytes(duplicate[duplicate.len() - 8..].try_into().unwrap());
+        let mut download = db.begin_snapshot_download(duplicate.len()).unwrap();
+        download.append(0, &duplicate).unwrap();
+        assert!(matches!(
+            download.finish(duplicate_crc, cluster),
+            Err(WalError::Corruption(_))
+        ));
 
         let mut download = db.begin_snapshot_download(bytes.len()).unwrap();
         download.append(0, &bytes).unwrap();
         assert!(matches!(
-            download.finish(crc ^ 1),
+            download.finish(crc ^ 1, cluster),
             Err(WalError::Corruption(_))
         ));
         assert!(!fs.exists(&path));
