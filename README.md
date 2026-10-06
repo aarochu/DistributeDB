@@ -72,6 +72,8 @@ printf 'SET 6b00 0a\nGET 6b00\n' | cargo run -- client --addr 127.0.0.1:5555 --h
 
 `PING` prints `PONG` when the server is reachable, and `STATS` prints its [statistics](docs/observability.md) as `name=value` lines.
 
+`BEGIN` starts a transaction on the connection. Each `SET` and `DELETE` then prints `QUEUED`, and `COMMIT` applies them all at once as one durable group, or none of them if it fails. `ROLLBACK` discards them. A transaction holds at most 64 writes; see the [protocol notes](docs/Technical-Design.md) for isolation and limits.
+
 The `serve` process exits after `shutdown` on stdin or EOF. Run `cargo run` without a subcommand for the original **in-memory** REPL. A stopped primary can publish a snapshot with `cargo run -- snapshot --data ./data/primary`; see [snapshot operations](docs/snapshot-operations.md) for the locking and downtime requirements. Automatic scheduling is not implemented.
 
 For a local replica, copy the `cluster_id` printed by the primary at startup and start a separate process and data directory:

@@ -23,7 +23,11 @@ SOW leaves behavior open.
 
 - SOW §11 permits asynchronous replication first. Synchronous or semi-synchronous
   acknowledgment is not a core acceptance condition and is not implemented.
-- SOW §15 makes transactions optional; they are not implemented. SOW §16 and
+- SOW §15 makes transactions optional. `BEGIN`/`COMMIT`/`ROLLBACK` are
+  implemented per connection: a commit is one WAL group, so it is atomic on
+  recovery and to other readers (`tests/transactions.rs`). Isolation is read
+  committed without conflict detection, and replica reads can briefly show
+  part of a transaction. SOW §16 and
   §22 Phase 8 ask for one advanced index: the LSM tree is implemented as an
   alternative storage engine ([LSM storage engine](lsm.md)), and the in-memory
   map remains the default.
