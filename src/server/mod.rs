@@ -112,6 +112,8 @@ pub const DEFAULT_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 pub const DEFAULT_MAX_QUEUE_DEPTH: usize = 1024;
 /// Default intentional group-commit wait: none (Technical-Design §5).
 pub const DEFAULT_GROUP_WAIT: Duration = Duration::from_millis(0);
+/// Default wait for replica ACKs in synchronous mode.
+pub const DEFAULT_SYNC_TIMEOUT: Duration = Duration::from_secs(1);
 
 /// Configuration for a [`Server`] (Technical-Design §5, §16).
 #[derive(Debug, Clone)]
@@ -127,6 +129,13 @@ pub struct ServerConfig {
     pub group_wait: Duration,
     /// Optional primary-side replica ACK state included in STATS.
     pub replication_stats: Option<Arc<ReplicationStats>>,
+    /// Replica ACKs a write waits for before `OK` (SOW §11). `0`, the
+    /// default, is asynchronous replication. Requires `replication_stats`.
+    pub sync_replicas: usize,
+    /// How long a write waits for those ACKs. On timeout the client gets
+    /// `UNAVAILABLE`: the write is durable on the primary and will still
+    /// replicate, so the outcome is unknown, not failed.
+    pub sync_timeout: Duration,
 }
 
 impl Default for ServerConfig {
@@ -137,6 +146,8 @@ impl Default for ServerConfig {
             max_queue_depth: DEFAULT_MAX_QUEUE_DEPTH,
             group_wait: DEFAULT_GROUP_WAIT,
             replication_stats: None,
+            sync_replicas: 0,
+            sync_timeout: DEFAULT_SYNC_TIMEOUT,
         }
     }
 }
@@ -181,6 +192,8 @@ struct Metrics {
     read_lock_wait: LatencyHistogram,
     /// Time the sequencer held the database write lock for one group commit.
     write_lock_hold: LatencyHistogram,
+    /// Writes whose replica ACKs did not arrive within `sync_timeout`.
+    sync_ack_timeouts: AtomicU64,
 }
 
 /// The outcome the sequencer returns for a submitted write: the assigned LSN on
@@ -465,6 +478,12 @@ impl Server {
         A: std::net::ToSocketAddrs,
         FS: FileSystem + Clone + Send + Sync + 'static,
     {
+        if config.sync_replicas > 0 && config.replication_stats.is_none() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "sync_replicas needs replication_stats from a replication listener",
+            ));
+        }
         let listener = TcpListener::bind(addr)?;
         let local_addr = listener.local_addr()?;
         listener.set_nonblocking(true)?;
@@ -981,7 +1000,10 @@ where
     }
     // Block on the one-shot. We hold NO map lock here (deadlock rule, §5).
     match rx.recv() {
-        Ok(Ok(_lsn)) => {
+        Ok(Ok(lsn)) => {
+            if let Some(response) = await_replicas(shared, lsn, kind) {
+                return response;
+            }
             let status = if shared.volatile {
                 Status::OkVolatile
             } else {
@@ -994,6 +1016,37 @@ where
         // flight): report unavailable.
         Err(_) => Response::new(kind, Status::Unavailable, Vec::new()),
     }
+}
+
+/// In synchronous mode, wait for `sync_replicas` ACKs of `lsn`. Returns the
+/// response to send instead of `OK` when they do not arrive in time. The
+/// connection worker waits here with no lock held, so the sequencer keeps
+/// committing other groups.
+fn await_replicas<F>(shared: &Arc<Shared<F>>, lsn: u64, kind: u8) -> Option<Response>
+where
+    F: FileSystem + Clone + Send + Sync + 'static,
+{
+    let config = &shared.config;
+    let stats = config.replication_stats.as_ref()?;
+    if config.sync_replicas == 0
+        || stats.wait_for_acks(lsn, config.sync_replicas, config.sync_timeout)
+    {
+        return None;
+    }
+    shared
+        .metrics
+        .sync_ack_timeouts
+        .fetch_add(1, Ordering::Relaxed);
+    let message = format!(
+        "durable on the primary at LSN {lsn}, but {} replica ACK(s) did not arrive within {} ms",
+        config.sync_replicas,
+        config.sync_timeout.as_millis()
+    );
+    Some(Response::new(
+        kind,
+        Status::Unavailable,
+        message.into_bytes(),
+    ))
 }
 
 /// The sequencer loop: the single writer. Waits for jobs, drains a group up to
@@ -1245,7 +1298,11 @@ where
         storage_engine: storage.0,
         lsm: storage.1,
     };
-    render_stats_lines(&snapshot)
+    let mut out = render_stats_lines(&snapshot);
+    out.push_str(&format!("sync_replicas={}\n", shared.config.sync_replicas));
+    let timeouts = shared.metrics.sync_ack_timeouts.load(Ordering::Relaxed);
+    out.push_str(&format!("sync_ack_timeouts_total={timeouts}\n"));
+    out
 }
 
 /// A point-in-time snapshot of the metrics rendered into `STATS` output.

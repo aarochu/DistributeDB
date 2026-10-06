@@ -3,8 +3,10 @@
 //! The primary sends one locally durable mutation at a time on a distinct
 //! loopback port. A replica validates the record, syncs its own WAL, applies
 //! it, then ACKs. This one-record window bounds in-flight data and makes an
-//! ACK's durability meaning explicit. The primary never waits for ACK before
-//! answering a client write. Reconnect begins with a fresh history handshake.
+//! ACK's durability meaning explicit. By default the primary never waits for
+//! ACK before answering a client write; a server configured with
+//! `sync_replicas` waits for that many ACKs (see [`ReplicationStats::wait_for_acks`]).
+//! Reconnect begins with a fresh history handshake.
 //! Snapshot transfer is a Phase 6 extension; a reclaimed prefix currently
 //! fails explicitly with REBOOTSTRAP_REQUIRED.
 
@@ -14,7 +16,7 @@ use std::collections::HashMap;
 use std::io::{self, BufReader, BufWriter, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Condvar, Mutex, RwLock};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -44,6 +46,9 @@ pub struct PeerProgress {
 #[derive(Debug, Default)]
 pub struct ReplicationStats {
     peers: Mutex<HashMap<[u8; 16], PeerProgress>>,
+    /// Signalled whenever a peer's progress or connection changes, for
+    /// writes waiting on replica ACKs.
+    changed: Condvar,
 }
 
 impl ReplicationStats {
@@ -62,6 +67,7 @@ impl ReplicationStats {
                 connected: true,
             },
         );
+        self.changed.notify_all();
         true
     }
 
@@ -70,12 +76,41 @@ impl ReplicationStats {
         if let Some(progress) = peers.get_mut(&id) {
             progress.applied_lsn = applied_lsn;
         }
+        self.changed.notify_all();
     }
 
     fn disconnect(&self, id: [u8; 16]) {
         let mut peers = self.peers.lock().expect("replication stats poisoned");
         if let Some(progress) = peers.get_mut(&id) {
             progress.connected = false;
+        }
+        self.changed.notify_all();
+    }
+
+    /// Wait until `replicas` peers have acknowledged `lsn`, or `timeout`
+    /// passes. A replica ACKs only records it has synced and applied, so
+    /// `true` means the write is durable on that many replicas. A peer that
+    /// acknowledged `lsn` and then disconnected still counts: the record is
+    /// durable there.
+    pub fn wait_for_acks(&self, lsn: u64, replicas: usize, timeout: Duration) -> bool {
+        let deadline = Instant::now() + timeout;
+        let mut peers = self.peers.lock().expect("replication stats poisoned");
+        loop {
+            let acked = peers
+                .values()
+                .filter(|progress| progress.applied_lsn >= lsn)
+                .count();
+            if acked >= replicas {
+                return true;
+            }
+            let Some(left) = deadline.checked_duration_since(Instant::now()) else {
+                return false;
+            };
+            peers = self
+                .changed
+                .wait_timeout(peers, left)
+                .expect("replication stats poisoned")
+                .0;
         }
     }
 

@@ -179,8 +179,29 @@ fn serve_command(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     } else {
         None
     };
+    let sync_replicas = match flag_value(args, "--sync-replicas") {
+        Some(value) => value
+            .parse::<usize>()
+            .map_err(|_| format!("--sync-replicas expects a count, got {value:?}"))?,
+        None => 0,
+    };
+    let sync_timeout = match flag_value(args, "--sync-timeout-ms") {
+        Some(value) => std::time::Duration::from_millis(
+            value
+                .parse::<u64>()
+                .map_err(|_| format!("--sync-timeout-ms expects milliseconds, got {value:?}"))?,
+        ),
+        None => distributedb::server::DEFAULT_SYNC_TIMEOUT,
+    };
+    if sync_replicas > 0 && replication.is_none() {
+        return Err(
+            "--sync-replicas needs fsync durability, which runs the replication listener".into(),
+        );
+    }
     let config = ServerConfig {
         replication_stats: replication.as_ref().map(|_| stats),
+        sync_replicas,
+        sync_timeout,
         ..ServerConfig::default()
     };
     let server = Server::start_shared(addr.as_str(), shared, config)?;
