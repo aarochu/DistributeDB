@@ -254,6 +254,10 @@ fn handle_primary_connection<F>(
 where
     F: FileSystem + Clone,
 {
+    // The listener is nonblocking so the acceptor can observe shutdown.
+    // Windows and macOS pass that mode to accepted sockets, which made a read
+    // of a not-yet-arrived ACK fail at once and drop the session.
+    stream.set_nonblocking(false)?;
     stream.set_read_timeout(Some(IO_TIMEOUT))?;
     stream.set_write_timeout(Some(IO_TIMEOUT))?;
     stream.set_nodelay(true)?;
