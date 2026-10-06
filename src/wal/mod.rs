@@ -2260,8 +2260,9 @@ impl<F: FileSystem + Clone> Db<F> {
         )
     }
 
-    /// Clone the verified active snapshot for a replica that cannot verify a
-    /// reclaimed WAL prefix. The transfer layer bounds the offered size.
+    /// Offer the active snapshot for a replica that cannot verify a reclaimed
+    /// WAL prefix. Published map snapshots remain file-backed; LSM table
+    /// images are encoded in memory. The transfer layer bounds the size.
     pub fn replication_snapshot(&self) -> WalResult<Option<ReplicationSnapshot<F>>> {
         if let Engine::Lsm(tree) = &self.engine {
             // The installed tables hold exactly the state at their flush
