@@ -398,6 +398,174 @@ mod tests {
         assert_eq!(read_message(&mut frame.as_slice()).unwrap(), Some(message));
     }
 
+    fn assert_golden(message: Message, frame: &[u8]) {
+        assert_eq!(message.encode().unwrap(), frame);
+        let mut bytes = frame;
+        assert_eq!(read_message(&mut bytes).unwrap(), Some(message));
+    }
+
+    #[test]
+    fn golden_control_frames_v1() {
+        // Fixed vectors pin the four-byte body length, version/kind, field
+        // offsets, and little-endian encoding independently of round trips.
+        let mut hello = vec![54, 0, 0, 0, 1, 1];
+        hello.extend_from_slice(&[0x11; 16]);
+        hello.extend_from_slice(&[0x22; 16]);
+        hello.extend_from_slice(&[8, 7, 6, 5, 4, 3, 2, 1]);
+        hello.extend_from_slice(&[0x18, 0x17, 0x16, 0x15, 0x14, 0x13, 0x12, 0x11]);
+        hello.extend_from_slice(&[1, 0, 2, 0]);
+        assert_golden(
+            Message::Hello {
+                cluster_id: [0x11; 16],
+                replica_id: [0x22; 16],
+                durable_lsn: 0x0102_0304_0506_0708,
+                record_hash: 0x1112_1314_1516_1718,
+                wal_version: 1,
+                snapshot_version: 2,
+            },
+            &hello,
+        );
+
+        let mut hello_ack = vec![62, 0, 0, 0, 1, 2];
+        hello_ack.extend_from_slice(&[0x11; 16]);
+        hello_ack.extend_from_slice(&[0x33; 16]);
+        hello_ack.extend_from_slice(&[9, 0, 0, 0, 0, 0, 0, 0]);
+        hello_ack.extend_from_slice(&[10, 0, 0, 0, 0, 0, 0, 0]);
+        hello_ack.extend_from_slice(&[3, 0, 0, 0, 0, 0, 0, 0]);
+        hello_ack.extend_from_slice(&[1, 0, 1, 0]);
+        assert_golden(
+            Message::HelloAck {
+                cluster_id: [0x11; 16],
+                primary_id: [0x33; 16],
+                durable_lsn: 9,
+                record_hash: 10,
+                earliest_retained_lsn: 3,
+                wal_version: 1,
+                snapshot_version: 1,
+            },
+            &hello_ack,
+        );
+
+        let ack = [
+            26, 0, 0, 0, 1, 4, // body length, version, kind
+            9, 0, 0, 0, 0, 0, 0, 0, // durable LSN
+            8, 0, 0, 0, 0, 0, 0, 0, // applied LSN
+            10, 0, 0, 0, 0, 0, 0, 0, // record hash
+        ];
+        assert_golden(
+            Message::Ack {
+                durable_lsn: 9,
+                applied_lsn: 8,
+                record_hash: 10,
+            },
+            &ack,
+        );
+
+        let offer = [
+            34, 0, 0, 0, 1, 5, // body length, version, kind
+            9, 0, 0, 0, 0, 0, 0, 0, // snapshot LSN
+            10, 0, 0, 0, 0, 0, 0, 0, // record hash
+            100, 0, 0, 0, 0, 0, 0, 0, // image bytes
+            11, 0, 0, 0, 0, 0, 0, 0, // image CRC64
+        ];
+        assert_golden(
+            Message::SnapshotOffer {
+                snapshot_lsn: 9,
+                record_hash: 10,
+                snapshot_bytes: 100,
+                snapshot_crc64: 11,
+            },
+            &offer,
+        );
+
+        let chunk = [
+            25, 0, 0, 0, 1, 6, // body length, version, kind
+            9, 0, 0, 0, 0, 0, 0, 0, // snapshot LSN
+            0, 1, 0, 0, 0, 0, 0, 0, // offset 256
+            3, 0, 0, 0, // chunk bytes
+            b'a', b'b', b'c',
+        ];
+        assert_golden(
+            Message::SnapshotChunk {
+                snapshot_lsn: 9,
+                offset: 256,
+                bytes: b"abc".to_vec(),
+            },
+            &chunk,
+        );
+
+        let done = [
+            18, 0, 0, 0, 1, 7, // body length, version, kind
+            9, 0, 0, 0, 0, 0, 0, 0, // snapshot LSN
+            11, 0, 0, 0, 0, 0, 0, 0, // image CRC64
+        ];
+        assert_golden(
+            Message::SnapshotDone {
+                snapshot_lsn: 9,
+                snapshot_crc64: 11,
+            },
+            &done,
+        );
+
+        let error = [9, 0, 0, 0, 1, 8, 4, 0, 3, 0, b'b', b'a', b'd'];
+        assert_golden(
+            Message::Error {
+                code: ERROR_BAD_FRAME,
+                diagnostic: "bad".into(),
+            },
+            &error,
+        );
+
+        let heartbeat = [
+            18, 0, 0, 0, 1, 9, // body length, version, kind
+            9, 0, 0, 0, 0, 0, 0, 0, // durable LSN
+            8, 7, 6, 5, 4, 3, 2, 1, // monotonic timestamp
+        ];
+        assert_golden(
+            Message::Heartbeat {
+                durable_lsn: 9,
+                send_monotonic_ns: 0x0102_0304_0506_0708,
+            },
+            &heartbeat,
+        );
+    }
+
+    #[test]
+    fn golden_record_frame_v1() {
+        let record = MutationRecord {
+            lsn: 1,
+            rtype: RecordType::Set,
+            key: b"k".to_vec(),
+            value: b"v".to_vec(),
+            prev_hash: 0,
+        };
+        // The CRC32C and CRC64 bytes were calculated with an independent
+        // bitwise reference implementation checked against the standard
+        // "123456789" vectors. They pin the WAL bytes inside the frame too.
+        let record_hash = 0xde51_4c8d_b6b5_d769;
+        assert_eq!(record.record_hash(), record_hash);
+        let frame = [
+            49, 0, 0, 0, 1, 3, // body length, version, RECORD kind
+            35, 0, 0, 0, // complete WAL record byte length
+            31, 0, 0, 0, // record_len after the four-byte field
+            1, 0, 0, 0, 0, 0, 0, 0, // LSN
+            1, // SET
+            1, 0, 0, 0, // key length
+            1, 0, 0, 0, // value length
+            0, 0, 0, 0, 0, 0, 0, 0, // prev_hash
+            b'k', b'v', // key and value
+            0x8d, 0x8a, 0x8a, 0xea, // record CRC32C
+            0x69, 0xd7, 0xb5, 0xb6, 0x8d, 0x4c, 0x51, 0xde, // record hash
+        ];
+        assert_golden(
+            Message::Record {
+                record,
+                record_hash,
+            },
+            &frame,
+        );
+    }
+
     #[test]
     fn handshake_ack_and_record_round_trip() {
         let hello = Message::Hello {

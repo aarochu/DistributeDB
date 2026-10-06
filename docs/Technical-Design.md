@@ -9,7 +9,7 @@
 
 `[SOW]` marks a requirement or option stated in the SOW. `[DECISION]` marks a proposed implementation choice added here. `[ASSUMPTION]` marks a condition on which a guarantee depends. `[OPEN]` marks a decision requiring project validation or a later choice. SOW examples are illustrative, not automatically protocol or file-format specifications.
 
-This design specifies a manually configured primary with asynchronous replicas. “Fault tolerant” means recovery of an existing node and catch-up of replicas under the listed failures. It does **not** imply automatic primary promotion, zero data loss after primary disk loss, or availability while the sole primary is down. The SOW places automatic failover and consensus among stretch goals (§§23–24). The initial language/filesystem choice is recorded in [ADR-001](ADR-001-Language-and-Filesystem.md). The implemented WAL, snapshot, `CURRENT`, and client-protocol v1 layouts have byte-level tests; replication frames have round-trip tests but no golden byte vectors. Format changes require versioning or an explicit incompatibility decision.
+This design specifies a manually configured primary with asynchronous replicas. “Fault tolerant” means recovery of an existing node and catch-up of replicas under the listed failures. It does **not** imply automatic primary promotion, zero data loss after primary disk loss, or availability while the sole primary is down. The SOW places automatic failover and consensus among stretch goals (§§23–24). The initial language/filesystem choice is recorded in [ADR-001](ADR-001-Language-and-Filesystem.md). The implemented WAL, snapshot, `CURRENT`, client-protocol, and replication-frame v1 layouts have byte-level tests. Format changes require versioning or an explicit incompatibility decision.
 
 ### 1.1 Requirement trace
 
@@ -360,7 +360,7 @@ The numeric gates are minimum test coverage, not statistical proof of a zero fai
 The SOW leaves these choices open. Their implementation status and remaining review work are:
 
 1. **Implementation language and platform.** Resolved by [ADR-001](ADR-001-Language-and-Filesystem.md): stable Rust and an initial 64-bit Linux/local-ext4 durability profile. Physical power-loss behavior remains unverified.
-2. **Binary format freeze.** WAL, snapshot, `CURRENT`, and client-protocol byte layouts have golden tests. Replication frames have round-trip tests but lack golden byte vectors. A format change requires version migration or an explicit incompatibility decision.
+2. **Binary format freeze.** WAL, snapshot, `CURRENT`, client-protocol, and replication-frame byte layouts have golden tests. A format change requires version migration or an explicit incompatibility decision.
 3. **Generation verification.** Both roles use the same generation layout and checked `CURRENT` format. The primary remains in generation 1; a replica snapshot install switches generations. Simulated crash tests cover pointer replacement and cleanup; they do not prove hardware power-loss behavior.
 4. **Operational defaults.** Connection count, queue depth, idle timeouts, WAL segment size, disk budget, and memory budget still need workload-specific tuning. Snapshot scheduling is manual and offline; no automatic interval is implemented.
 5. **Replica reads.** An optional read-only replica listener is implemented and documented as eventually consistent. `STATS` exposes its applied LSN; individual read responses do not include it. The SOW requires clients to initially use the primary.

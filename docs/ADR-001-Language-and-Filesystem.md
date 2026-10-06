@@ -2,7 +2,7 @@
 
 **Status:** Accepted for implementation. Physical power-loss behavior on the selected Linux/ext4 hardware remains unverified.
 **Date:** 2026-09-30
-**Scope:** DistributeDB phases 1–8. WAL, snapshot, `CURRENT`, and client-protocol v1 layouts have byte-level tests; replication frames have round-trip tests but no golden byte vectors.
+**Scope:** DistributeDB phases 1–8. WAL, snapshot, `CURRENT`, client-protocol, and replication-frame v1 layouts have byte-level tests.
 
 ## Context
 
