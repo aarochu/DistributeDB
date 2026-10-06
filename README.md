@@ -117,7 +117,7 @@ For a reproducible three-node Docker demo, use [the local cluster guide](docs/do
 
 CI runs formatting, Clippy, Rust tests, and documentation checks. Passing these checks supports the tested scenarios; it does not prove power-loss durability on physical hardware. The workload mixes are 90/10, 50/50, and 10/90 GET/SET; [published results](benchmarks/results/README.md) come from a shared CI runner and are for comparing revisions, not a hardware performance claim.
 
-See the [SOW conformance audit](docs/SOW-Conformance.md), [development setup](docs/Development-Setup.md), [recovery notes](docs/recovery.md), [failure testing](docs/failure-testing.md), [benchmark method](docs/benchmarks.md), [`STATS` fields](docs/observability.md), [performance analysis](docs/performance.md), and the [LSM storage engine](docs/lsm.md) for test and operator details.
+See the [SOW conformance audit](docs/SOW-Conformance.md), [development setup](docs/Development-Setup.md), [recovery notes](docs/recovery.md), [failure testing](docs/failure-testing.md), [benchmark method](docs/benchmarks.md), [`STATS` fields](docs/observability.md), [performance analysis](docs/performance.md), the [LSM storage engine](docs/lsm.md), and the proposed [local cluster launcher and dashboard](docs/frontend-plan.md) for test and operator details.
 
 ## License
 
