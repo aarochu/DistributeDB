@@ -261,6 +261,8 @@ The replica can serve reads after it installs a valid snapshot, but its reported
 
 The SOW's phrase “replicate committed writes” is interpreted as “send locally durable mutations.” There is no distributed commit point in asynchronous mode. The `ACK` above means replica durability/apply progress, not that the client write was committed by a quorum. Synchronous replication requires a separately specified commit protocol, failure policy, and fencing rules; merely waiting for one ACK would not by itself supply consensus or safe automatic failover.
 
+`[DECISION]` The implemented synchronous mode is semi-synchronous acknowledgment with a stated failure policy, not a commit protocol. With `sync_replicas = N`, a client write is first committed locally exactly as in asynchronous mode. Its connection worker then waits, holding no lock, until *N* replicas have acknowledged its LSN; a replica ACKs only records it has synced and applied. A replica that acknowledged the LSN and then disconnected still counts. If the ACKs do not arrive within `sync_timeout`, the client receives `UNAVAILABLE`, an unknown outcome: the write is durable and visible on the primary and will replicate later. Nothing is rolled back, and there is no fencing or failover. A server with `sync_replicas > 0` refuses to start without a replication listener.
+
 ## 9. Recovery algorithm
 
 Startup is unavailable to clients until recovery completes. It must:
