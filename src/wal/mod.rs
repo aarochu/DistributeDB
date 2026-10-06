@@ -3658,7 +3658,7 @@ mod tests {
         let fs = sim();
         let mut db = Db::open(fs.clone(), &root(), DurabilityMode::Fsync).unwrap();
         db.set(b"a".to_vec(), b"first".to_vec()).unwrap();
-        db.set(b"b".to_vec(), b"second".to_vec()).unwrap();
+        db.set(b"b".to_vec(), vec![b'x'; 300 * 1024]).unwrap();
         let lsn = db.publish_snapshot().unwrap();
         let image = db.replication_snapshot().unwrap().unwrap();
         assert!(matches!(
@@ -3670,10 +3670,10 @@ mod tests {
         let path = db.wal.paths.snapshot(lsn);
         let expected = fs.read(&path).unwrap();
         let mut sent = Vec::new();
-        for offset in (0..image.byte_len()).step_by(7) {
+        for offset in (0..image.byte_len()).step_by(256 * 1024 - 26) {
             sent.extend(
                 image
-                    .chunk(offset, (image.byte_len() - offset).min(7))
+                    .chunk(offset, (image.byte_len() - offset).min(256 * 1024 - 26))
                     .unwrap(),
             );
         }
