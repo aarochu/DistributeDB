@@ -6,7 +6,7 @@
 
 - Rust 1.92 or newer with Cargo. The current crate uses the Rust standard library only, so the build and tests can run offline after the toolchain is installed.
 - Git for source control and review.
-- A 64-bit Linux host with a local ext4 filesystem for the initial durability profile. Windows development can run many unit tests, but it is not a validated durability profile; see [ADR-001](ADR-001-Language-and-Filesystem.md).
+- A 64-bit Linux host with a local ext4 filesystem for the initial durability profile. Windows can run the test suite (directory syncs open the directory with `FILE_FLAG_BACKUP_SEMANTICS`), but it is not a validated durability profile; see [ADR-001](ADR-001-Language-and-Filesystem.md).
 - Docker with Compose only for the optional local three-node demonstration.
 
 From the repository root:
