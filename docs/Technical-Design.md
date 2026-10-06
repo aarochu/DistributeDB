@@ -9,7 +9,7 @@
 
 `[SOW]` marks a requirement or option stated in the SOW. `[DECISION]` marks a proposed implementation choice added here. `[ASSUMPTION]` marks a condition on which a guarantee depends. `[OPEN]` marks a decision requiring project validation or a later choice. SOW examples are illustrative, not automatically protocol or file-format specifications.
 
-This design specifies a manually configured primary with asynchronous replicas. “Fault tolerant” means recovery of an existing node and catch-up of replicas under the listed failures. It does **not** imply automatic primary promotion, zero data loss after primary disk loss, or availability while the sole primary is down. The SOW places automatic failover and consensus among stretch goals (§§23–24). The initial language/filesystem choice is recorded in [ADR-001](DistributeDB-ADR-001-Language-and-Filesystem.md). All byte formats remain provisional until their golden fixtures pass.
+This design specifies a manually configured primary with asynchronous replicas. “Fault tolerant” means recovery of an existing node and catch-up of replicas under the listed failures. It does **not** imply automatic primary promotion, zero data loss after primary disk loss, or availability while the sole primary is down. The SOW places automatic failover and consensus among stretch goals (§§23–24). The initial language/filesystem choice is recorded in [ADR-001](ADR-001-Language-and-Filesystem.md). The implemented WAL, snapshot, `CURRENT`, and client-protocol v1 layouts have byte-level tests; replication frames have round-trip tests but no golden byte vectors. Format changes require versioning or an explicit incompatibility decision.
 
 ### 1.1 Requirement trace
 
@@ -355,15 +355,15 @@ The numeric gates are minimum test coverage, not statistical proof of a zero fai
 | Client retries | Duplicate logical operations | Document unknown outcomes; add dedup IDs only if required. |
 | Local benchmark artifacts | Misleading performance claims | Full environment and workload metadata, repeated runs, no unstated extrapolation. |
 
-## 15. Open decisions and design review checklist
+## 15. Decision status and design review checklist
 
-These choices are intentionally unresolved by the SOW. Resolve them in short architecture decision records before implementing dependent code:
+The SOW leaves these choices open. Their implementation status and remaining review work are:
 
-1. **Implementation language and platform.** SOW examples mention C++/CMake and Rust/Cargo but mandate neither. Choose one supported OS/filesystem profile and define its sync/rename implementation.
-2. **Binary format freeze.** Review the proposed offsets, encoded size limit, CRC parameters, and golden fixtures. Once a data file exists, changes require version migration or explicit incompatibility.
-3. **Generation verification.** Both roles use the same generation layout and `CURRENT` format. The primary remains in generation 1; only a replica snapshot install changes `CURRENT`. Freeze golden bytes and prove crash-safe pointer replacement and deletion through the simulated file layer before compaction.
-4. **Operational defaults.** Measure connection count, queue depth, idle timeouts, WAL segment size, snapshot interval, disk budget, and memory budget. The candidate values in this document are starting points, not measured requirements.
-5. **Replica reads.** Decide whether the final CLI exposes a read-only replica endpoint. If it does, label responses with applied LSN and document staleness. The SOW permits eventual replica reads but only requires clients to initially use the primary.
+1. **Implementation language and platform.** Resolved by [ADR-001](ADR-001-Language-and-Filesystem.md): stable Rust and an initial 64-bit Linux/local-ext4 durability profile. Physical power-loss behavior remains unverified.
+2. **Binary format freeze.** WAL, snapshot, `CURRENT`, and client-protocol byte layouts have golden tests. Replication frames have round-trip tests but lack golden byte vectors. A format change requires version migration or an explicit incompatibility decision.
+3. **Generation verification.** Both roles use the same generation layout and checked `CURRENT` format. The primary remains in generation 1; a replica snapshot install switches generations. Simulated crash tests cover pointer replacement and cleanup; they do not prove hardware power-loss behavior.
+4. **Operational defaults.** Connection count, queue depth, idle timeouts, WAL segment size, disk budget, and memory budget still need workload-specific tuning. Snapshot scheduling is manual and offline; no automatic interval is implemented.
+5. **Replica reads.** An optional read-only replica listener is implemented and documented as eventually consistent. `STATS` exposes its applied LSN; individual read responses do not include it. The SOW requires clients to initially use the primary.
 6. **Operational rebootstrap.** The replica provisioning flag permits snapshot replacement only when the old LSN cannot be verified and cluster IDs match. A known hash mismatch remains fatal even with that flag. The initial explicit reset procedure is to preserve the divergent directory and provision a new, empty replica directory after choosing the authoritative history; see [replication operations](replication.md#known-divergence-explicit-replacement). There is no in-place reset command or implicit reconnect side effect.
 7. **Security boundary.** Core SOW excludes production authentication and encryption at rest. Confirm the demo is loopback/private-network only; any public deployment needs a separate threat model, authentication, transport encryption, and access controls.
 
@@ -371,7 +371,7 @@ Reviewers should trace each claimed guarantee to an invariant, a specific durabl
 
 ## 16. Defaults and implementation notes
 
-`[DECISION, provisional]` Use 64 MiB WAL segments, 1,048,576-byte maximum frame body, 4,096-byte maximum key, **1,000,000-byte maximum encoded mutation record** (including its four-byte length field), 30-second idle client timeout, 5-second replica heartbeat interval, 15-second replica reconnect detection, and snapshot every 100,000 mutations or when WAL exceeds 1 GiB. Use group-commit limits of 64 records and 8 MiB of records plus footer, with **0 ms intentional wait** by default. These are initial test defaults, not SOW requirements or throughput targets. The encoder enforces `33 + key_len + value_len <= 1,000,000` with checked arithmetic; there is no independent maximum-value constant that can contradict it.
+`[DECISION, provisional]` Use 64 MiB WAL segments, 1,048,576-byte maximum frame body, 4,096-byte maximum key, **1,000,000-byte maximum encoded mutation record** (including its four-byte length field), 30-second idle client timeout, 5-second replica heartbeat interval, and 15-second replica reconnect detection. Use group-commit limits of 64 records and 8 MiB of records plus footer, with **0 ms intentional wait** by default. These are initial test defaults, not SOW requirements or throughput targets. The encoder enforces `33 + key_len + value_len <= 1,000,000` with checked arithmetic; there is no independent maximum-value constant that can contradict it. Snapshot publication is currently manual and offline; an automatic trigger such as 100,000 mutations or 1 GiB of WAL remains a candidate, not an implemented default.
 
 `[OPTIONAL, phase 7]` A **semi-synchronous comparison** may wait for one replica's `durable_lsn` ACK before responding to a client after the primary's local sync and apply. It must define a timeout outcome (`UNAVAILABLE`, with the write possibly present), retain the primary's single-writer role, and report which replica acknowledged. It does not authorize replica promotion, prevent split brain, or provide consensus. Benchmark it against async only after its failure matrix covers replica disconnect before ACK, ACK loss, primary crash after replica ACK, and reconnect. If the project schedule is tight, omit this experiment without weakening core acceptance.
 

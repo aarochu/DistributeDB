@@ -1,8 +1,8 @@
 # ADR-001: Initial language and filesystem profile
 
-**Status:** Proposed for Phase 1; confirm against the actual development calendar before treating the estimate as a commitment.
+**Status:** Accepted for implementation. Physical power-loss behavior on the selected Linux/ext4 hardware remains unverified.
 **Date:** 2026-09-30
-**Scope:** DistributeDB phases 1–7; file and wire bytes remain provisional until Phase 2 and protocol golden tests pass.
+**Scope:** DistributeDB phases 1–8. WAL, snapshot, `CURRENT`, and client-protocol v1 layouts have byte-level tests; replication frames have round-trip tests but no golden byte vectors.
 
 ## Context
 

@@ -1,42 +1,45 @@
 # Development setup and repository policy
 
-**Current state:** This repository contains planning documents only. There is no server, client, benchmark harness, or build command yet.
+**Current state:** The repository contains a Rust primary, replica, client, benchmark harness, tests, and the project documents. The database is under development and is not production ready. See the [README](../README.md) for current commands and the [SOW conformance audit](SOW-Conformance.md) for tested scope.
 
-## Requirements now
+## Requirements
 
-- Git for reviewing changes.
-- A Markdown editor or viewer for the SOW, technical design, ADR, and README.
-- A GitHub account only if contributing through pull requests.
+- Rust 1.92 or newer with Cargo. The current crate uses the Rust standard library only, so the build and tests can run offline after the toolchain is installed.
+- Git for source control and review.
+- A 64-bit Linux host with a local ext4 filesystem for the initial durability profile. Windows development can run many unit tests, but it is not a validated durability profile; see [ADR-001](ADR-001-Language-and-Filesystem.md).
+- Docker with Compose only for the optional local three-node demonstration.
 
-The documentation check in `.github/workflows/docs-ci.yml` runs on GitHub-hosted Ubuntu for pushes, pull requests, and manual dispatch. It checks that the required documents are present and nonempty and that tracked changes have no whitespace errors. A green result means **documentation checks passed**; it does not imply a database build or test passed.
+From the repository root:
 
-## Proposed implementation environment
+```sh
+cargo fmt --all -- --check
+cargo clippy --offline --all-targets -- -D warnings
+cargo test --offline --all-targets
+cargo build --offline
+```
 
-[ADR-001](ADR-001-Language-and-Filesystem.md) proposes stable Rust for the first implementation and 64-bit Linux on a local ext4 filesystem for durability validation. This is an added design decision, not a language or filesystem mandate from the SOW. The exact toolchain version and any dependencies should be pinned when Phase 1 code is added. Phase 1's local map can be developed without filesystem-specific features; Phase 2 must test the selected sync and rename behavior through both the real and simulated file layers.
-
-The design's 10–12 week effort estimate assumes about 30 focused hours per week from one engineer already familiar with the language. Confirm the available calendar before treating it as a schedule. If time is constrained, retain the core failure tests and defer optional replica reads, advanced indexing, and speculative performance work.
+Use a separate data directory for each node. The [README](../README.md#run-the-current-server) has the primary, client, and replica commands; [the Docker guide](docker-cluster.md) has the three-node demonstration. The demo listeners are unauthenticated and should remain on loopback or an isolated local test network.
 
 ## Repository layout
 
-```text
-README.md
-LICENSE
-.gitignore
-.github/workflows/docs-ci.yml
-docs/SOW.md
-docs/Technical-Design.md
-docs/ADR-001-Language-and-Filesystem.md
-docs/Development-Setup.md
-```
+| Path | Purpose |
+| --- | --- |
+| `src/` | Storage engines, WAL, protocol, server, replication, CLI, and benchmark binaries. |
+| `tests/` | Integration, crash, recovery, networking, and replication checks. |
+| `benchmarks/` | Workload scripts and checked-in result artifacts with their environment notes. |
+| `scripts/` | Local demonstration and seeded failure-trial runners. |
+| `docs/` | SOW, technical design, ADR, operating guides, and evidence audit. |
+| `.github/workflows/` | Documentation, Rust, Docker, failure, and benchmark CI workflows. |
+| `compose.yaml` | Local three-node container configuration. |
 
-The SOW proposes future `src/`, `client/`, `tests/`, `benchmarks/results/`, `scripts/`, and `docker/` areas. These will be added when they contain real work. Keep published benchmark results tracked; the `.gitignore` excludes local runtime data, not `benchmarks/results/`.
+The `.gitignore` excludes local build output and runtime data. Published benchmark results remain tracked so claims can be inspected with their measurement context.
 
-## CI/CD policy
+## CI and release policy
 
-**CI now:** documentation presence and whitespace checks. Build, unit, integration, crash, and benchmark jobs will be added alongside their implementations, so a passing workflow cannot be mistaken for passing database tests.
+Pull requests run documentation and Rust format, lint, and test checks. Source changes also trigger the applicable Docker cluster, process-failure, and performance comparison workflows. Passing CI supports those test scenarios; it does not establish physical power-loss durability or production suitability. The [failure-testing guide](failure-testing.md) distinguishes process termination, simulated power loss, and hardware power loss.
 
-**CD now:** no deployment or release workflow. The SOW defines a local three-node demonstration and Docker-based setup as future deliverables, but no deployable database artifact exists. A release workflow should be introduced only after an executable, versioning policy, and release checks exist. Do not publish packages or attach benchmark claims automatically from documentation-only commits.
+There is no deployment or release workflow. A local Docker demonstration is an integration exercise, not a published service or package. Release automation requires a separate versioning and release policy.
 
-## Contributions
+## Contribution policy
 
-Keep requirements traceable to the SOW and label new technical choices in the design or an ADR. Commit messages should describe the change and its verification.
+Keep requirements traceable to the [SOW](SOW.md), and document new design choices in the [technical design](Technical-Design.md) or an ADR. State the workload, platform, and limits behind benchmark or durability claims. Commit messages should describe the change and its verification.
