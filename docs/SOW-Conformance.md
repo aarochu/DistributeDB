@@ -21,8 +21,11 @@ SOW leaves behavior open.
 
 ## SOW scope boundaries
 
-- SOW §11 permits asynchronous replication first. Synchronous or semi-synchronous
-  acknowledgment is not a core acceptance condition and is not implemented.
+- SOW §11 permits asynchronous replication first, which remains the default.
+  `--sync-replicas N` adds semi-synchronous acknowledgment: `OK` waits for
+  *N* replica ACKs, and a timeout answers `UNAVAILABLE` as an unknown outcome
+  (`tests/sync_replication.rs`). It is not a commit protocol and gives no
+  failover.
 - SOW §15 makes transactions optional. `BEGIN`/`COMMIT`/`ROLLBACK` are
   implemented per connection: a commit is one WAL group, so it is atomic on
   recovery and to other readers (`tests/transactions.rs`). Isolation is read
