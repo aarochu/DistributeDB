@@ -304,7 +304,7 @@ where
                 known => {
                     let snapshot = if known.is_none() {
                         match guard.replication_snapshot() {
-                            Ok(Some(snapshot)) if snapshot.bytes.len() <= MAX_SNAPSHOT_BYTES => {
+                            Ok(Some(snapshot)) if snapshot.byte_len() <= MAX_SNAPSHOT_BYTES => {
                                 Ok(Some(snapshot))
                             }
                             _ => Err((
@@ -335,6 +335,18 @@ where
             return Err(protocol::Error::Invalid(diagnostic));
         }
     };
+    if let Some(snapshot) = &snapshot {
+        if snapshot.verify().is_err() {
+            send_error(
+                &mut stream,
+                protocol::ERROR_REBOOTSTRAP_REQUIRED,
+                "published snapshot failed verification",
+            );
+            return Err(protocol::Error::Invalid(
+                "published snapshot failed verification",
+            ));
+        }
+    }
     if !stats.connect(replica_id, cursor) {
         send_error(
             &mut stream,
@@ -360,7 +372,6 @@ where
         },
     )?;
     if let Some(snapshot) = snapshot {
-        let bytes = snapshot.bytes;
         let snapshot_lsn = snapshot.lsn;
         let snapshot_hash = snapshot.record_hash;
         let snapshot_crc64 = snapshot.crc64;
@@ -369,17 +380,21 @@ where
             &Message::SnapshotOffer {
                 snapshot_lsn,
                 record_hash: snapshot_hash,
-                snapshot_bytes: bytes.len() as u64,
+                snapshot_bytes: snapshot.byte_len() as u64,
                 snapshot_crc64,
             },
         )?;
-        for (index, chunk) in bytes.chunks(SNAPSHOT_CHUNK_BYTES).enumerate() {
+        for offset in (0..snapshot.byte_len()).step_by(SNAPSHOT_CHUNK_BYTES) {
+            let chunk_len = (snapshot.byte_len() - offset).min(SNAPSHOT_CHUNK_BYTES);
+            let chunk = snapshot
+                .chunk(offset, chunk_len)
+                .map_err(|_| protocol::Error::Invalid("snapshot source failed during transfer"))?;
             write_message(
                 &mut stream,
                 &Message::SnapshotChunk {
                     snapshot_lsn,
-                    offset: (index * SNAPSHOT_CHUNK_BYTES) as u64,
-                    bytes: chunk.to_vec(),
+                    offset: offset as u64,
+                    bytes: chunk,
                 },
             )?;
         }

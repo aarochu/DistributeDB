@@ -1200,12 +1200,68 @@ impl<F: FileSystem> PendingGroup<F> {
     }
 }
 
-/// Verified snapshot bytes and the history boundary offered to a replica.
-pub struct ReplicationSnapshot {
-    pub bytes: Vec<u8>,
+/// Snapshot image and history boundary offered to a replica. A published map
+/// snapshot stays file-backed; an LSM table image is encoded in memory.
+pub struct ReplicationSnapshot<F: FileSystem> {
+    source: ReplicationSnapshotSource<F>,
     pub lsn: u64,
     pub record_hash: u64,
     pub crc64: u64,
+}
+
+enum ReplicationSnapshotSource<F: FileSystem> {
+    Bytes(Vec<u8>),
+    File { fs: F, path: PathBuf, len: usize },
+}
+
+impl<F: FileSystem> ReplicationSnapshot<F> {
+    pub fn byte_len(&self) -> usize {
+        match &self.source {
+            ReplicationSnapshotSource::Bytes(bytes) => bytes.len(),
+            ReplicationSnapshotSource::File { len, .. } => *len,
+        }
+    }
+
+    pub fn chunk(&self, offset: usize, len: usize) -> WalResult<Vec<u8>> {
+        let end = offset
+            .checked_add(len)
+            .ok_or_else(|| WalError::Corruption("snapshot chunk offset overflow".into()))?;
+        if end > self.byte_len() {
+            return Err(WalError::Corruption("snapshot chunk exceeds image".into()));
+        }
+        match &self.source {
+            ReplicationSnapshotSource::Bytes(bytes) => Ok(bytes[offset..end].to_vec()),
+            ReplicationSnapshotSource::File { fs, path, .. } => {
+                Ok(fs.read_at(path, offset as u64, len)?)
+            }
+        }
+    }
+
+    /// Recheck an immutable published file after releasing the database read
+    /// lock, before its CRC is offered on the wire. The receiver also verifies
+    /// its complete image before switching CURRENT.
+    pub fn verify(&self) -> WalResult<()> {
+        let ReplicationSnapshotSource::File { fs, path, len } = &self.source else {
+            return Ok(());
+        };
+        let mut crc = Crc64Ecma::new();
+        for offset in (0..len - 8).step_by(256 * 1024) {
+            let chunk_len = (len - 8 - offset).min(256 * 1024);
+            crc.update(&fs.read_at(path, offset as u64, chunk_len)?);
+        }
+        if crc.finalize() != self.crc64 {
+            return Err(WalError::Corruption(
+                "replication snapshot checksum mismatch".into(),
+            ));
+        }
+        match fs.read_at(path, *len as u64, 1) {
+            Ok(_) => Err(WalError::Corruption(
+                "replication snapshot has trailing bytes".into(),
+            )),
+            Err(FsError::Io(error)) if error.kind() == std::io::ErrorKind::UnexpectedEof => Ok(()),
+            Err(error) => Err(error.into()),
+        }
+    }
 }
 
 /// A replica's incomplete snapshot transfer. Only one receiver uses a data
@@ -2206,7 +2262,7 @@ impl<F: FileSystem + Clone> Db<F> {
 
     /// Clone the verified active snapshot for a replica that cannot verify a
     /// reclaimed WAL prefix. The transfer layer bounds the offered size.
-    pub fn replication_snapshot(&self) -> WalResult<Option<ReplicationSnapshot>> {
+    pub fn replication_snapshot(&self) -> WalResult<Option<ReplicationSnapshot<F>>> {
         if let Engine::Lsm(tree) = &self.engine {
             // The installed tables hold exactly the state at their flush
             // boundary, which is at or after the history base, so the records
@@ -2219,7 +2275,7 @@ impl<F: FileSystem + Clone> Db<F> {
             let bytes = snapshot::encode(self.wal.identity.cluster_id, lsn, record_hash, &pairs);
             let crc64 = u64::from_le_bytes(bytes[bytes.len() - 8..].try_into().unwrap());
             return Ok(Some(ReplicationSnapshot {
-                bytes,
+                source: ReplicationSnapshotSource::Bytes(bytes),
                 lsn,
                 record_hash,
                 crc64,
@@ -2228,22 +2284,35 @@ impl<F: FileSystem + Clone> Db<F> {
         if self.snapshot_lsn == 0 {
             return Ok(None);
         }
-        let bytes = self
+        let path = self.wal.paths.snapshot(self.snapshot_lsn);
+        let header_bytes = self
             .wal
             .fs
-            .read(&self.wal.paths.snapshot(self.snapshot_lsn))?;
-        let decoded = snapshot::decode(&bytes, Some(self.wal.identity.cluster_id))
-            .map_err(|error| WalError::Corruption(format!("replication snapshot: {error}")))?;
-        if decoded.header.snapshot_lsn != self.snapshot_lsn
-            || decoded.header.record_hash_at_lsn != self.snapshot_hash
+            .read_at(&path, 0, snapshot::SNAPSHOT_HEADER_LEN)?;
+        let header =
+            snapshot::SnapshotHeader::decode(&header_bytes, Some(self.wal.identity.cluster_id))
+                .map_err(|error| WalError::Corruption(format!("replication snapshot: {error}")))?;
+        if header.snapshot_lsn != self.snapshot_lsn
+            || header.record_hash_at_lsn != self.snapshot_hash
         {
             return Err(WalError::Corruption(
                 "replication snapshot boundary differs from active WAL".into(),
             ));
         }
-        let crc = u64::from_le_bytes(bytes[bytes.len() - 8..].try_into().unwrap());
+        let len = usize::try_from(header.payload_len)
+            .ok()
+            .and_then(|payload| {
+                payload.checked_add(snapshot::SNAPSHOT_HEADER_LEN + snapshot::SNAPSHOT_CRC64_LEN)
+            })
+            .ok_or_else(|| WalError::Corruption("replication snapshot length overflow".into()))?;
+        let trailer = self.wal.fs.read_at(&path, (len - 8) as u64, 8)?;
+        let crc = u64::from_le_bytes(trailer.try_into().unwrap());
         Ok(Some(ReplicationSnapshot {
-            bytes,
+            source: ReplicationSnapshotSource::File {
+                fs: self.wal.fs.clone(),
+                path,
+                len,
+            },
             lsn: self.snapshot_lsn,
             record_hash: self.snapshot_hash,
             crc64: crc,
@@ -3582,6 +3651,40 @@ mod tests {
             Err(WalError::Corruption(_))
         ));
         assert!(!fs.exists(&path));
+    }
+
+    #[test]
+    fn published_snapshot_is_streamed_from_its_file() {
+        let fs = sim();
+        let mut db = Db::open(fs.clone(), &root(), DurabilityMode::Fsync).unwrap();
+        db.set(b"a".to_vec(), b"first".to_vec()).unwrap();
+        db.set(b"b".to_vec(), b"second".to_vec()).unwrap();
+        let lsn = db.publish_snapshot().unwrap();
+        let image = db.replication_snapshot().unwrap().unwrap();
+        assert!(matches!(
+            &image.source,
+            ReplicationSnapshotSource::File { .. }
+        ));
+        assert_eq!(image.lsn, lsn);
+        image.verify().unwrap();
+        let path = db.wal.paths.snapshot(lsn);
+        let expected = fs.read(&path).unwrap();
+        let mut sent = Vec::new();
+        for offset in (0..image.byte_len()).step_by(7) {
+            sent.extend(
+                image
+                    .chunk(offset, (image.byte_len() - offset).min(7))
+                    .unwrap(),
+            );
+        }
+        assert_eq!(sent, expected);
+        assert!(image.chunk(image.byte_len(), 1).is_err());
+
+        let mut corrupt = expected;
+        corrupt[72] ^= 1;
+        fs.truncate(&path, 0).unwrap();
+        fs.append(&path, &corrupt).unwrap();
+        assert!(matches!(image.verify(), Err(WalError::Corruption(_))));
     }
 
     #[test]
