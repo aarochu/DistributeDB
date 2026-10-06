@@ -277,7 +277,22 @@ impl FileSystem for RealFs {
     fn sync_dir(&self, path: &Path) -> FsResult<()> {
         // On Linux, open the directory as a File and sync_all to flush its
         // directory entries (§6.2, Linux fsync(2)).
+        #[cfg(not(windows))]
         let dir = std::fs::File::open(path)?;
+        // Windows opens a directory only with FILE_FLAG_BACKUP_SEMANTICS, and
+        // flushes it only through a handle with write access. Windows is not
+        // a validated durability profile (ADR-001); this keeps the same code
+        // path working for local development.
+        #[cfg(windows)]
+        let dir = {
+            use std::os::windows::fs::OpenOptionsExt;
+            const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+            std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+                .open(path)?
+        };
         dir.sync_all()?;
         Ok(())
     }
