@@ -50,6 +50,12 @@ pub enum Command {
     Ping,
     /// `STATS` — operational statistics.
     Stats,
+    /// `BEGIN` — open a transaction (SOW §15).
+    Begin,
+    /// `COMMIT` — apply the open transaction atomically.
+    Commit,
+    /// `ROLLBACK` — discard the open transaction.
+    Rollback,
 }
 
 /// Error returned when a command line cannot be parsed or violates a limit.
@@ -153,6 +159,9 @@ pub fn parse(line: &str) -> Result<Command, ParseError> {
         "SCAN" => parse_scan(rest),
         "PING" => parse_no_args("PING", rest).map(|()| Command::Ping),
         "STATS" => parse_no_args("STATS", rest).map(|()| Command::Stats),
+        "BEGIN" => parse_no_args("BEGIN", rest).map(|()| Command::Begin),
+        "COMMIT" => parse_no_args("COMMIT", rest).map(|()| Command::Commit),
+        "ROLLBACK" => parse_no_args("ROLLBACK", rest).map(|()| Command::Rollback),
         _ => Err(ParseError::UnknownCommand(word.to_string())),
     }
 }
@@ -182,7 +191,7 @@ pub fn parse_hex(line: &str) -> Result<Command, ParseError> {
         "SET" => (2, "2 (key value)"),
         "GET" | "DELETE" | "EXISTS" => (1, "1 (key)"),
         "SCAN" => (3, "3 (start end limit)"),
-        "PING" | "STATS" => (0, "0"),
+        "PING" | "STATS" | "BEGIN" | "COMMIT" | "ROLLBACK" => (0, "0"),
         _ => return Err(ParseError::UnknownCommand(word.to_string())),
     };
     if args.len() != required.0 {
@@ -194,6 +203,9 @@ pub fn parse_hex(line: &str) -> Result<Command, ParseError> {
                 "EXISTS" => "EXISTS",
                 "PING" => "PING",
                 "STATS" => "STATS",
+                "BEGIN" => "BEGIN",
+                "COMMIT" => "COMMIT",
+                "ROLLBACK" => "ROLLBACK",
                 _ => "SCAN",
             },
             expected: required.1,
@@ -251,6 +263,9 @@ pub fn parse_hex(line: &str) -> Result<Command, ParseError> {
         }
         "PING" => Ok(Command::Ping),
         "STATS" => Ok(Command::Stats),
+        "BEGIN" => Ok(Command::Begin),
+        "COMMIT" => Ok(Command::Commit),
+        "ROLLBACK" => Ok(Command::Rollback),
         _ => unreachable!(),
     }
 }

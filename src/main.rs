@@ -376,16 +376,11 @@ fn client_command(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
 /// nothing should be printed (never, currently) so the caller stays uniform.
 fn client_execute(client: &mut Client, command: Command, hex_mode: bool) -> Option<String> {
     let rendered = match command {
-        Command::Set { key, value } => match client.set(key, value) {
-            Ok(Status::Ok) | Ok(Status::OkVolatile) => OK.to_string(),
-            Ok(status) => format!("ERROR: {status:?}"),
-            Err(err) => format!("ERROR: {err}"),
-        },
-        Command::Delete { key } => match client.delete(key) {
-            Ok(Status::Ok) | Ok(Status::OkVolatile) => OK.to_string(),
-            Ok(status) => format!("ERROR: {status:?}"),
-            Err(err) => format!("ERROR: {err}"),
-        },
+        Command::Set { key, value } => render_write(client.set(key, value)),
+        Command::Delete { key } => render_write(client.delete(key)),
+        Command::Begin => render_write(client.begin()),
+        Command::Commit => render_write(client.commit()),
+        Command::Rollback => render_write(client.rollback()),
         Command::Get { key } => match client.get(key) {
             Ok(Some(value)) if hex_mode => encode_hex(&value),
             Ok(Some(value)) => String::from_utf8_lossy(&value).into_owned(),
@@ -411,6 +406,17 @@ fn client_execute(client: &mut Client, command: Command, hex_mode: bool) -> Opti
         },
     };
     Some(rendered)
+}
+
+/// `OK` for a durable write or transaction command, `QUEUED` for a write
+/// inside a transaction, and the status otherwise.
+fn render_write(outcome: Result<Status, distributedb::ClientError>) -> String {
+    match outcome {
+        Ok(Status::Ok) | Ok(Status::OkVolatile) => OK.to_string(),
+        Ok(Status::Queued) => QUEUED.to_string(),
+        Ok(status) => format!("ERROR: {status:?}"),
+        Err(err) => format!("ERROR: {err}"),
+    }
 }
 
 /// Run the REPL loop over generic reader/writer handles.
@@ -499,6 +505,9 @@ fn execute(engine: &mut StorageEngine, command: Command) -> String {
         Command::Ping => PONG.to_string(),
         // The volatile REPL has no server; report what it holds.
         Command::Stats => format!("keys={}", engine.len()),
+        Command::Begin | Command::Commit | Command::Rollback => {
+            "ERROR: transactions need a server; use `client --addr`".to_string()
+        }
     }
 }
 
@@ -551,6 +560,8 @@ fn encode_hex(bytes: &[u8]) -> String {
 const OK: &str = "OK";
 /// Response printed for `PING`.
 const PONG: &str = "PONG";
+/// Response printed for a write queued in an open transaction.
+const QUEUED: &str = "QUEUED";
 /// Response printed for a `GET` on a key that does not exist.
 ///
 /// Distinct from an empty stored value, which renders as an empty string.

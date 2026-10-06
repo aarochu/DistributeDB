@@ -157,6 +157,23 @@ impl Client {
         }
     }
 
+    /// `BEGIN`: open a transaction on this connection. Until `COMMIT`,
+    /// [`Client::set`] and [`Client::delete`] return [`Status::Queued`].
+    pub fn begin(&mut self) -> ClientResult<Status> {
+        Ok(self.round_trip(&Request::Begin)?.status)
+    }
+
+    /// `COMMIT`: apply the open transaction atomically. `OK` means every
+    /// queued write is durable; any other status means none was applied.
+    pub fn commit(&mut self) -> ClientResult<Status> {
+        Ok(self.round_trip(&Request::Commit)?.status)
+    }
+
+    /// `ROLLBACK`: discard the open transaction.
+    pub fn rollback(&mut self) -> ClientResult<Status> {
+        Ok(self.round_trip(&Request::Rollback)?.status)
+    }
+
     /// `PING`. Succeeds when the server answers `PONG`.
     pub fn ping(&mut self) -> ClientResult<()> {
         let resp = self.round_trip(&Request::Ping)?;

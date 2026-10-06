@@ -57,6 +57,12 @@ pub const KIND_STATS: u8 = 5;
 pub const KIND_SCAN: u8 = 6;
 /// `PING`: liveness check; the reply is `PONG`.
 pub const KIND_PING: u8 = 7;
+/// `BEGIN`: open a transaction on this connection.
+pub const KIND_BEGIN: u8 = 8;
+/// `COMMIT`: durably apply the open transaction as one group.
+pub const KIND_COMMIT: u8 = 9;
+/// `ROLLBACK`: discard the open transaction.
+pub const KIND_ROLLBACK: u8 = 10;
 /// Largest `SCAN OK` data the server sends: a response body is
 /// `version:u8 | kind:u8 | status:u16 | data_len:u32 | data`.
 pub const MAX_SCAN_DATA_LEN: usize = MAX_BODY_LEN - 8;
@@ -78,6 +84,12 @@ pub enum RequestKind {
     Scan,
     /// `PING` (liveness check).
     Ping,
+    /// `BEGIN` (open a transaction).
+    Begin,
+    /// `COMMIT` (apply the open transaction).
+    Commit,
+    /// `ROLLBACK` (discard the open transaction).
+    Rollback,
 }
 
 impl RequestKind {
@@ -91,6 +103,9 @@ impl RequestKind {
             RequestKind::Stats => KIND_STATS,
             RequestKind::Scan => KIND_SCAN,
             RequestKind::Ping => KIND_PING,
+            RequestKind::Begin => KIND_BEGIN,
+            RequestKind::Commit => KIND_COMMIT,
+            RequestKind::Rollback => KIND_ROLLBACK,
         }
     }
 
@@ -104,6 +119,9 @@ impl RequestKind {
             KIND_STATS => Ok(RequestKind::Stats),
             KIND_SCAN => Ok(RequestKind::Scan),
             KIND_PING => Ok(RequestKind::Ping),
+            KIND_BEGIN => Ok(RequestKind::Begin),
+            KIND_COMMIT => Ok(RequestKind::Commit),
+            KIND_ROLLBACK => Ok(RequestKind::Rollback),
             other => Err(ProtocolError::UnknownKind(other)),
         }
     }
@@ -130,6 +148,9 @@ pub enum Status {
     ResourceExhausted,
     /// `8` — success without durable sync (benchmark `os` mode).
     OkVolatile,
+    /// `9` — a `SET` or `DELETE` was added to the open transaction; it takes
+    /// effect only at `COMMIT`.
+    Queued,
 }
 
 impl Status {
@@ -145,6 +166,7 @@ impl Status {
             Status::UnsupportedVersion => 6,
             Status::ResourceExhausted => 7,
             Status::OkVolatile => 8,
+            Status::Queued => 9,
         }
     }
 
@@ -160,6 +182,7 @@ impl Status {
             6 => Ok(Status::UnsupportedVersion),
             7 => Ok(Status::ResourceExhausted),
             8 => Ok(Status::OkVolatile),
+            9 => Ok(Status::Queued),
             other => Err(ProtocolError::InvalidStatus(other)),
         }
     }
@@ -204,6 +227,12 @@ pub enum Request {
     },
     /// `PING` — liveness check; answered without touching the database.
     Ping,
+    /// `BEGIN` — open a transaction on this connection.
+    Begin,
+    /// `COMMIT` — apply the open transaction atomically.
+    Commit,
+    /// `ROLLBACK` — discard the open transaction.
+    Rollback,
 }
 
 impl Request {
@@ -217,6 +246,9 @@ impl Request {
             Request::Stats => RequestKind::Stats,
             Request::Scan { .. } => RequestKind::Scan,
             Request::Ping => RequestKind::Ping,
+            Request::Begin => RequestKind::Begin,
+            Request::Commit => RequestKind::Commit,
+            Request::Rollback => RequestKind::Rollback,
         }
     }
 
@@ -237,7 +269,11 @@ impl Request {
                 body.extend_from_slice(&(key.len() as u32).to_le_bytes());
                 body.extend_from_slice(key);
             }
-            Request::Stats | Request::Ping => {}
+            Request::Stats
+            | Request::Ping
+            | Request::Begin
+            | Request::Commit
+            | Request::Rollback => {}
             Request::Scan { start, end, limit } => {
                 let end = end.as_deref().unwrap_or_default();
                 body.extend_from_slice(&(start.len() as u32).to_le_bytes());
@@ -574,13 +610,20 @@ pub fn decode_request_body(body: &[u8]) -> Result<Request, ProtocolError> {
                 _ => unreachable!("kind is Get/Delete/Exists in this arm"),
             }
         }
-        RequestKind::Stats | RequestKind::Ping => {
+        RequestKind::Stats
+        | RequestKind::Ping
+        | RequestKind::Begin
+        | RequestKind::Commit
+        | RequestKind::Rollback => {
             if !payload.is_empty() {
                 return Err(ProtocolError::TrailingBytes);
             }
             Ok(match kind {
                 RequestKind::Stats => Request::Stats,
-                _ => Request::Ping,
+                RequestKind::Ping => Request::Ping,
+                RequestKind::Begin => Request::Begin,
+                RequestKind::Commit => Request::Commit,
+                _ => Request::Rollback,
             })
         }
         RequestKind::Scan => {
@@ -1198,6 +1241,9 @@ mod tests {
             RequestKind::Stats,
             RequestKind::Scan,
             RequestKind::Ping,
+            RequestKind::Begin,
+            RequestKind::Commit,
+            RequestKind::Rollback,
         ] {
             assert_eq!(RequestKind::from_u8(kind.as_u8()).unwrap(), kind);
         }
@@ -1215,6 +1261,7 @@ mod tests {
             Status::UnsupportedVersion,
             Status::ResourceExhausted,
             Status::OkVolatile,
+            Status::Queued,
         ] {
             assert_eq!(Status::from_u16(status.as_u16()).unwrap(), status);
         }

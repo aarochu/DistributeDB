@@ -81,7 +81,7 @@
 //! This is a loopback-only, unauthenticated demo server: it binds `127.0.0.1`
 //! and performs no authentication or encryption (out of scope for Phase 3).
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::io::Write;
 use std::net::{Shutdown, TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -92,8 +92,8 @@ use std::time::{Duration, Instant};
 
 use crate::fileio::FileSystem;
 use crate::protocol::{
-    self, Request, Response, Status, KIND_DELETE, KIND_EXISTS, KIND_GET, KIND_PING, KIND_SCAN,
-    KIND_SET, KIND_STATS, PROTOCOL_VERSION,
+    self, Request, Response, Status, KIND_BEGIN, KIND_COMMIT, KIND_DELETE, KIND_EXISTS, KIND_GET,
+    KIND_PING, KIND_ROLLBACK, KIND_SCAN, KIND_SET, KIND_STATS, PROTOCOL_VERSION,
 };
 use crate::replication::{PeerProgress, ReplicationStats};
 use crate::storage::{GetResult, Mutation};
@@ -190,7 +190,10 @@ type WriteOutcome = Result<u64, Status>;
 /// A submitted write awaiting sequencing: the mutation plus a one-shot sender
 /// for the sequencer to return the outcome.
 struct WriteJob {
-    mutation: Mutation,
+    /// One mutation, or a committed transaction's mutations. A job is never
+    /// split across groups, so a transaction is durable and visible as a
+    /// whole.
+    mutations: Vec<Mutation>,
     /// Encoded length used to enforce the 8 MiB per-group byte cap.
     encoded_len: usize,
     respond: Sender<WriteOutcome>,
@@ -254,18 +257,21 @@ impl WriteQueue {
 fn drain_group(jobs: &mut VecDeque<WriteJob>) -> Vec<WriteJob> {
     let mut batch: Vec<WriteJob> = Vec::new();
     let mut bytes = 0usize;
+    let mut records = 0usize;
     while let Some(front) = jobs.front() {
         if !batch.is_empty() {
             // Stop before exceeding either bound; leave the rest for the next
             // group. The footer overhead is small and bounded; reserving a
             // little headroom keeps us safely under MAX_GROUP_BYTES.
-            if batch.len() >= MAX_GROUP_RECORDS || bytes + front.encoded_len + 64 > MAX_GROUP_BYTES
+            if records + front.mutations.len() > MAX_GROUP_RECORDS
+                || bytes + front.encoded_len + 64 > MAX_GROUP_BYTES
             {
                 break;
             }
         }
         let job = jobs.pop_front().expect("front exists");
         bytes += job.encoded_len;
+        records += job.mutations.len();
         batch.push(job);
     }
     batch
@@ -631,6 +637,8 @@ where
     let _ = stream.set_nodelay(true);
     let mut reader = stream.try_clone().expect("clone stream for reader");
     let mut writer = stream;
+    // A transaction lives only as long as its connection.
+    let mut session = Session::default();
 
     loop {
         if shared.shutdown.load(Ordering::SeqCst) {
@@ -644,12 +652,12 @@ where
                     .requests_total
                     .fetch_add(1, Ordering::Relaxed);
                 let started = Instant::now();
-                let (response, keep_open) = dispatch(&body, shared);
+                let (response, keep_open) = dispatch(&body, shared, &mut session);
                 match response.kind {
                     KIND_GET | KIND_EXISTS | KIND_SCAN => {
                         shared.metrics.read_latency.record(started.elapsed())
                     }
-                    KIND_SET | KIND_DELETE => {
+                    KIND_SET | KIND_DELETE | KIND_COMMIT => {
                         shared.metrics.write_latency.record(started.elapsed())
                     }
                     _ => {}
@@ -678,7 +686,7 @@ where
 /// Dispatch one decoded frame body to a [`Response`]. Returns `(response,
 /// keep_open)`; `keep_open` is `false` for a fatal condition (bad version)
 /// after which the connection must close (§4.1).
-fn dispatch<F>(body: &[u8], shared: &Arc<Shared<F>>) -> (Response, bool)
+fn dispatch<F>(body: &[u8], shared: &Arc<Shared<F>>, session: &mut Session) -> (Response, bool)
 where
     F: FileSystem + Clone + Send + Sync + 'static,
 {
@@ -696,6 +704,13 @@ where
     match request {
         Request::Get { key } => {
             shared.metrics.reads_total.fetch_add(1, Ordering::Relaxed);
+            // Inside a transaction, its own pending writes come first.
+            if let Some(pending) = session.pending(&key) {
+                return match pending {
+                    Some(value) => (Response::new(KIND_GET, Status::Ok, value.clone()), true),
+                    None => (Response::new(KIND_GET, Status::NotFound, Vec::new()), true),
+                };
+            }
             let waiting = Instant::now();
             let db = shared.db.read().expect("db read lock poisoned");
             shared.metrics.read_lock_wait.record(waiting.elapsed());
@@ -709,6 +724,10 @@ where
         }
         Request::Exists { key } => {
             shared.metrics.reads_total.fetch_add(1, Ordering::Relaxed);
+            if let Some(pending) = session.pending(&key) {
+                let exists = u8::from(pending.is_some());
+                return (Response::new(KIND_EXISTS, Status::Ok, vec![exists]), true);
+            }
             let waiting = Instant::now();
             let db = shared.db.read().expect("db read lock poisoned");
             shared.metrics.read_lock_wait.record(waiting.elapsed());
@@ -722,6 +741,10 @@ where
         }
         Request::Scan { start, end, limit } => {
             shared.metrics.reads_total.fetch_add(1, Ordering::Relaxed);
+            if session.tx.is_some() {
+                let message = b"SCAN is not supported inside a transaction".to_vec();
+                return (Response::new(KIND_SCAN, Status::BadRequest, message), true);
+            }
             let waiting = Instant::now();
             let db = shared.db.read().expect("db read lock poisoned");
             shared.metrics.read_lock_wait.record(waiting.elapsed());
@@ -756,18 +779,139 @@ where
             shared.metrics.writes_total.fetch_add(1, Ordering::Relaxed);
             let encoded_len = crate::command::SET_FIXED_OVERHEAD + key.len() + value.len();
             let mutation = Mutation::Set { key, value };
-            (submit_write(shared, mutation, encoded_len, KIND_SET), true)
+            (
+                write(shared, session, mutation, encoded_len, KIND_SET),
+                true,
+            )
         }
         Request::Delete { key } => {
             shared.metrics.writes_total.fetch_add(1, Ordering::Relaxed);
             let encoded_len = crate::command::SET_FIXED_OVERHEAD + key.len();
             let mutation = Mutation::Delete { key };
             (
-                submit_write(shared, mutation, encoded_len, KIND_DELETE),
+                write(shared, session, mutation, encoded_len, KIND_DELETE),
                 true,
             )
         }
+        Request::Begin => (begin(shared, session), true),
+        Request::Commit => (commit(shared, session), true),
+        Request::Rollback => {
+            let status = if session.tx.take().is_some() {
+                Status::Ok
+            } else {
+                Status::BadRequest
+            };
+            (Response::new(KIND_ROLLBACK, status, Vec::new()), true)
+        }
     }
+}
+
+/// Per-connection state: the open transaction, if any (SOW §15).
+#[derive(Default)]
+struct Session {
+    tx: Option<Transaction>,
+}
+
+/// Writes buffered between `BEGIN` and `COMMIT`. They reach the WAL as one
+/// sequencer job, so they share one group: durable together, applied together
+/// under the write lock, and recovered all or nothing.
+#[derive(Default)]
+struct Transaction {
+    mutations: Vec<Mutation>,
+    encoded_len: usize,
+    /// Newest pending value per key (`None` for a delete), for reads inside
+    /// the transaction.
+    overlay: HashMap<Vec<u8>, Option<Vec<u8>>>,
+    /// Set when the transaction outgrew one group. Later writes are refused,
+    /// and `COMMIT` writes nothing.
+    aborted: bool,
+}
+
+impl Session {
+    /// The open transaction's pending state for `key`, if it wrote one.
+    fn pending(&self, key: &[u8]) -> Option<&Option<Vec<u8>>> {
+        self.tx.as_ref().and_then(|tx| tx.overlay.get(key))
+    }
+}
+
+/// `BEGIN`: open a transaction unless one is open or this node is a replica.
+fn begin<F>(shared: &Arc<Shared<F>>, session: &mut Session) -> Response
+where
+    F: FileSystem + Clone + Send + Sync + 'static,
+{
+    if session.tx.is_some() {
+        let message = b"a transaction is already open".to_vec();
+        return Response::new(KIND_BEGIN, Status::BadRequest, message);
+    }
+    let role_is_replica = shared
+        .db
+        .read()
+        .expect("db read lock poisoned")
+        .identity()
+        .role
+        == "replica";
+    if role_is_replica {
+        return Response::new(KIND_BEGIN, Status::NotPrimary, Vec::new());
+    }
+    session.tx = Some(Transaction::default());
+    Response::new(KIND_BEGIN, Status::Ok, Vec::new())
+}
+
+/// A `SET` or `DELETE`: committed now outside a transaction, or queued inside
+/// one. A transaction is capped at one group's records and bytes; a write
+/// past the cap aborts it.
+fn write<F>(
+    shared: &Arc<Shared<F>>,
+    session: &mut Session,
+    mutation: Mutation,
+    encoded_len: usize,
+    kind: u8,
+) -> Response
+where
+    F: FileSystem + Clone + Send + Sync + 'static,
+{
+    let Some(tx) = session.tx.as_mut() else {
+        return submit_write(shared, vec![mutation], encoded_len, kind);
+    };
+    if tx.aborted {
+        let message = b"transaction aborted; send ROLLBACK".to_vec();
+        return Response::new(kind, Status::BadRequest, message);
+    }
+    if tx.mutations.len() >= MAX_GROUP_RECORDS
+        || tx.encoded_len + encoded_len + 64 > MAX_GROUP_BYTES
+    {
+        tx.aborted = true;
+        let message = b"transaction exceeds one WAL group; it is aborted".to_vec();
+        return Response::new(kind, Status::ResourceExhausted, message);
+    }
+    let (key, value) = match &mutation {
+        Mutation::Set { key, value } => (key.clone(), Some(value.clone())),
+        Mutation::Delete { key } => (key.clone(), None),
+    };
+    tx.overlay.insert(key, value);
+    tx.encoded_len += encoded_len;
+    tx.mutations.push(mutation);
+    Response::new(kind, Status::Queued, Vec::new())
+}
+
+/// `COMMIT`: submit the open transaction as one sequencer job. The response
+/// is the group's outcome, as for a single write.
+fn commit<F>(shared: &Arc<Shared<F>>, session: &mut Session) -> Response
+where
+    F: FileSystem + Clone + Send + Sync + 'static,
+{
+    let Some(tx) = session.tx.take() else {
+        let message = b"no transaction is open".to_vec();
+        return Response::new(KIND_COMMIT, Status::BadRequest, message);
+    };
+    if tx.aborted {
+        let message = b"transaction was aborted; nothing was written".to_vec();
+        return Response::new(KIND_COMMIT, Status::BadRequest, message);
+    }
+    if tx.mutations.is_empty() {
+        return Response::new(KIND_COMMIT, Status::Ok, Vec::new());
+    }
+    submit_write(shared, tx.mutations, tx.encoded_len, KIND_COMMIT)
 }
 
 /// A read the storage engine could not complete, such as an LSM table that
@@ -819,7 +963,7 @@ fn wal_error_to_status(err: &crate::wal::WalError) -> Status {
 /// via [`wal_error_to_status`]).
 fn submit_write<F>(
     shared: &Arc<Shared<F>>,
-    mutation: Mutation,
+    mutations: Vec<Mutation>,
     encoded_len: usize,
     kind: u8,
 ) -> Response
@@ -828,7 +972,7 @@ where
 {
     let (tx, rx): (Sender<WriteOutcome>, Receiver<WriteOutcome>) = mpsc::channel();
     let job = WriteJob {
-        mutation,
+        mutations,
         encoded_len,
         respond: tx,
     };
@@ -905,7 +1049,10 @@ where
         }
 
         // Apply the whole batch as one durable group commit (one fsync).
-        let muts: Vec<Mutation> = batch.iter().map(|j| j.mutation.clone()).collect();
+        let muts: Vec<Mutation> = batch
+            .iter()
+            .flat_map(|job| job.mutations.iter().cloned())
+            .collect();
         // Append under the write lock, sync with no database lock held, then
         // apply under the write lock. Readers keep using the pre-group map
         // during the sync, which is correct because none of these writes has
@@ -945,8 +1092,11 @@ where
 
         match result {
             Ok(lsns) => {
-                for (job, lsn) in batch.into_iter().zip(lsns) {
-                    let _ = job.respond.send(Ok(lsn));
+                // Each job's mutations hold consecutive LSNs; report its last.
+                let mut lsns = lsns.into_iter();
+                for job in batch {
+                    let last = lsns.by_ref().take(job.mutations.len()).last();
+                    let _ = job.respond.send(last.ok_or(Status::InternalError));
                 }
             }
             Err(e) => {
@@ -1214,7 +1364,7 @@ mod tests {
     fn job(encoded_len: usize) -> WriteJob {
         let (tx, _rx) = mpsc::channel();
         WriteJob {
-            mutation: Mutation::Delete { key: b"k".to_vec() },
+            mutations: vec![Mutation::Delete { key: b"k".to_vec() }],
             encoded_len,
             respond: tx,
         }
