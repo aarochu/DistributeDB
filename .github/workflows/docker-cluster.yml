@@ -13,6 +13,7 @@ on:
       - "src/bin/**"
       - "src/server/**"
       - "src/replication/**"
+      - "web/**"
       - ".github/workflows/docker-cluster.yml"
   workflow_dispatch:
 
