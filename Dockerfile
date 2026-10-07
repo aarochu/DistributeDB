@@ -2,6 +2,8 @@ FROM rust:1.92-slim-bookworm AS build
 WORKDIR /source
 COPY Cargo.toml Cargo.lock ./
 COPY src ./src
+# The dashboard bridge embeds the page at compile time.
+COPY web ./web
 RUN cargo build --offline --release --bins
 
 FROM debian:bookworm-slim
