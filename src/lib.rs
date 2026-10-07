@@ -28,7 +28,9 @@
 
 pub mod checksum;
 pub mod client;
+pub mod cluster;
 pub mod command;
+pub mod dashboard;
 pub mod fileio;
 pub mod lsm;
 pub mod protocol;

@@ -11,6 +11,7 @@
 | `snapshot_lsn` | LSN of the snapshot used as the recovery base (0 if none). |
 | `connected_clients` | Open client connections, including the one issuing `STATS`. |
 | `role`, `durability` | `primary` or `replica`, and `fsync` or the benchmark-only `os` mode. |
+| `node_id` | This node's 32-hex-digit identity, matching the `<id>` in a primary's `replica_<id>_*` fields. |
 | `wal_entries` | WAL records after the snapshot boundary: the records a restart would replay. |
 | `read_latency_p50_us`, `_p95_us`, `_p99_us` | Server-side service time of `GET` and `EXISTS`, in microseconds. |
 | `write_latency_p50_us`, `_p95_us`, `_p99_us` | Server-side service time of `SET` and `DELETE`, including sequencer queueing and the group commit. |

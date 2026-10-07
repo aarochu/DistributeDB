@@ -1,0 +1,194 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>DistributeDB</title>
+<link rel="stylesheet" href="/style.css">
+</head>
+<body>
+<header class="bar">
+  <a class="brand" href="#top">DISTRIBUTEDB</a>
+  <nav class="nav">
+    <a href="#cluster">Cluster</a>
+    <a href="#replication">Replication</a>
+    <a href="#storage">Storage</a>
+    <a href="#explorer">Explorer</a>
+    <a href="#lab">Lab</a>
+  </nav>
+  <div class="bar-status">
+    <span class="mono" id="bar-nodes">— NODES</span>
+    <span class="state" id="bar-health">LOADING</span>
+    <span class="meta mono" id="bar-age"></span>
+  </div>
+</header>
+
+<main id="top">
+  <div class="banner" id="banner" hidden></div>
+
+  <section class="opening">
+    <div class="identity">
+      <h1>DISTRIBUTEDB</h1>
+      <p class="lede">Single-primary replicated key-value store</p>
+      <p class="meta">Rust / std-only</p>
+      <dl class="kv" id="identity">
+        <dt>state</dt><dd class="mono">LOADING</dd>
+      </dl>
+    </div>
+    <figure class="model">
+      <canvas id="topology" aria-label="Write path model: sequencer, write-ahead log, and replicas"></canvas>
+      <div class="model-labels" id="topology-labels"></div>
+      <figcaption class="meta">Write path model. Writes enter the sequencer, extend the log, then travel to replicas. Activity follows <span class="mono">current_lsn</span>; positions are not to scale.</figcaption>
+    </figure>
+  </section>
+
+  <section class="section" id="cluster">
+    <div class="section-head">
+      <h2>Cluster</h2>
+      <p class="desc">One primary; replicas apply its durable log. Replica state is the primary's view of each replica's acknowledged position.</p>
+    </div>
+    <div class="tree" id="tree"><p class="placeholder">LOADING</p></div>
+  </section>
+
+  <div class="strip" id="summary" aria-label="System summary"></div>
+
+  <section class="section" id="replication">
+    <div class="section-head">
+      <h2>Replication</h2>
+      <p class="desc">Primary durable position against replica applied positions.</p>
+    </div>
+    <div class="split split-wide">
+      <div>
+        <table class="grid" id="repl-table"><tbody><tr><td class="placeholder">LOADING</td></tr></tbody></table>
+        <div id="sync-block"></div>
+      </div>
+      <div class="chart-wrap">
+        <canvas class="chart" id="chart-repl" height="260"></canvas>
+        <p class="placeholder chart-empty" id="chart-repl-empty">COLLECTING SAMPLES</p>
+      </div>
+    </div>
+  </section>
+
+  <section class="section" id="traffic">
+    <div class="split">
+      <div>
+        <div class="section-head">
+          <h2>Throughput</h2>
+          <p class="desc">Primary request rate from differences in <span class="mono">reads_total</span> and <span class="mono">writes_total</span> between polls. Reads include this dashboard's one <span class="mono">STATS</span> request per poll.</p>
+        </div>
+        <dl class="kv kv-row" id="rates"></dl>
+        <div class="chart-wrap">
+          <canvas class="chart" id="chart-ops" height="150"></canvas>
+          <p class="placeholder chart-empty" id="chart-ops-empty">COLLECTING SAMPLES</p>
+        </div>
+      </div>
+      <div>
+        <div class="section-head">
+          <h2>Latency</h2>
+          <p class="desc">Server-side service time on the primary, from decoded request to encoded response. Writes include queueing and the group commit.</p>
+        </div>
+        <table class="grid matrix" id="latency"></table>
+      </div>
+    </div>
+  </section>
+
+  <section class="section" id="durability">
+    <div class="section-head">
+      <h2>Durability + WAL</h2>
+      <p class="desc">Positions in the primary's log. Entries up to <span class="mono">durable_lsn</span> are synced and acknowledged; entries past it are in a group commit awaiting sync.</p>
+    </div>
+    <div id="wal-error"></div>
+    <div class="split split-instrument">
+      <dl class="kv" id="wal-metrics"></dl>
+      <div class="instrument" id="wal-instrument"></div>
+    </div>
+  </section>
+
+  <section class="section" id="storage">
+    <div class="section-head">
+      <h2>Storage engine</h2>
+      <p class="desc" id="storage-desc">Memtable, level-0 tables, and the sorted level below them.</p>
+    </div>
+    <div id="storage-body"><p class="placeholder">LOADING</p></div>
+  </section>
+
+  <section class="section" id="locks">
+    <div class="section-head">
+      <h2>Lock contention</h2>
+      <p class="desc">Time a read waited for the database read lock, and time the sequencer held the write lock for one group commit.</p>
+    </div>
+    <div class="split">
+      <table class="grid matrix" id="lock-table"></table>
+      <div class="chart-wrap">
+        <canvas class="chart" id="chart-locks" height="130"></canvas>
+        <p class="placeholder chart-empty" id="chart-locks-empty">COLLECTING SAMPLES</p>
+      </div>
+    </div>
+  </section>
+
+  <section class="section" id="recovery">
+    <div class="section-head">
+      <h2>Recovery</h2>
+      <p class="desc">Each node's last start: state loaded from the snapshot, then the WAL tail replayed on top.</p>
+    </div>
+    <div class="split">
+      <div id="recovery-diagram"></div>
+      <table class="grid" id="recovery-table"></table>
+    </div>
+  </section>
+
+  <section class="section" id="explorer">
+    <div class="section-head">
+      <h2>Key Explorer</h2>
+      <p class="desc">Read-only. Replica reads are eventually consistent.</p>
+    </div>
+    <div class="controls">
+      <span class="seg" id="explorer-mode" role="tablist">
+        <button type="button" data-value="get" aria-selected="true">GET / EXISTS</button><button type="button" data-value="scan">SCAN</button>
+      </span>
+      <span class="label">read from</span>
+      <span class="seg" id="explorer-node"></span>
+      <span class="label">input</span>
+      <span class="seg" id="explorer-encoding">
+        <button type="button" data-value="utf8" aria-selected="true">UTF-8</button><button type="button" data-value="hex">HEX</button>
+      </span>
+    </div>
+
+    <form class="query" id="get-form" autocomplete="off">
+      <label class="field wide"><span class="label">key</span><input class="mono" id="get-key" spellcheck="false" placeholder="user:10029"></label>
+      <button type="submit" data-action="get">GET</button>
+      <button type="button" id="exists-button">EXISTS</button>
+    </form>
+    <div id="get-result"></div>
+
+    <form class="query" id="scan-form" autocomplete="off" hidden>
+      <label class="field"><span class="label">start key</span><input class="mono" id="scan-start" spellcheck="false" placeholder="(first key)"></label>
+      <label class="field"><span class="label">end key</span><input class="mono" id="scan-end" spellcheck="false" placeholder="(no bound)"></label>
+      <label class="field narrow"><span class="label">page size</span><input class="mono" id="scan-limit" value="50" inputmode="numeric"></label>
+      <button type="submit">SCAN</button>
+    </form>
+    <div id="scan-result" hidden></div>
+  </section>
+
+  <section class="section write" id="console">
+    <div class="section-head">
+      <h2>Write Console</h2>
+      <p class="desc mono">LOCAL DEVELOPMENT INTERFACE</p>
+    </div>
+    <div id="console-body"><p class="placeholder">LOADING</p></div>
+  </section>
+
+  <section class="section" id="lab">
+    <div class="section-head">
+      <h2>Fault-Tolerance Lab</h2>
+      <p class="desc">Stop a replica under load, restart it, and watch it catch up from the primary's retained WAL. Every value shown is read from the nodes.</p>
+    </div>
+    <div id="lab-body"><p class="placeholder">LOADING</p></div>
+  </section>
+</main>
+
+<div class="tooltip mono" id="tooltip" hidden></div>
+<script src="/topology.js"></script>
+<script src="/app.js"></script>
+</body>
+</html>

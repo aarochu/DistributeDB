@@ -17,6 +17,7 @@
 
 use std::io::Write;
 use std::net::{TcpStream, ToSocketAddrs};
+use std::time::Duration;
 
 use crate::protocol::{self, ProtocolError, Request, Response, Status};
 
@@ -80,6 +81,17 @@ impl Client {
     pub fn connect<A: ToSocketAddrs>(addr: A) -> ClientResult<Self> {
         let stream = TcpStream::connect(addr)?;
         stream.set_nodelay(true).ok();
+        Ok(Client { stream })
+    }
+
+    /// Connect to `addr` within `timeout`, and fail any later read or write
+    /// that blocks longer than `timeout`. For callers, such as a monitor,
+    /// that must not hang on an unresponsive node.
+    pub fn connect_timeout(addr: &std::net::SocketAddr, timeout: Duration) -> ClientResult<Self> {
+        let stream = TcpStream::connect_timeout(addr, timeout)?;
+        stream.set_nodelay(true).ok();
+        stream.set_read_timeout(Some(timeout))?;
+        stream.set_write_timeout(Some(timeout))?;
         Ok(Client { stream })
     }
 

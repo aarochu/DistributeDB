@@ -61,6 +61,12 @@ fn main() {
                 std::process::exit(1);
             }
         }
+        Some("cluster") => {
+            if let Err(err) = cluster_command(&args[2..]) {
+                eprintln!("cluster error: {err}");
+                std::process::exit(1);
+            }
+        }
         Some("snapshot") => {
             if let Err(err) = snapshot_command(&args[2..]) {
                 eprintln!("snapshot error: {err}");
@@ -248,6 +254,181 @@ fn serve_command(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         listener.shutdown();
     }
     println!("shut down");
+    Ok(())
+}
+
+/// Run a local primary and replicas as child processes, optionally with the
+/// dashboard, and take client commands for the primary on stdin.
+fn cluster_command(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    use distributedb::cluster::{Cluster, ClusterConfig};
+    use distributedb::dashboard::{Dashboard, DashboardConfig, NodeControl, NodeTarget};
+    use std::sync::Mutex;
+
+    let replicas = match flag_value(args, "--replicas") {
+        Some(value) => value
+            .parse::<usize>()
+            .map_err(|_| format!("--replicas expects a count, got {value:?}"))?,
+        None => 2,
+    };
+    let base_port = match flag_value(args, "--base-port") {
+        Some(value) => value
+            .parse::<u16>()
+            .map_err(|_| format!("--base-port expects a port, got {value:?}"))?,
+        None => 5555,
+    };
+    let data_dir = flag_value(args, "--data")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::env::temp_dir().join("distributedb-cluster"));
+    let mut storage_args = Vec::new();
+    for name in ["--storage", "--memtable-bytes"] {
+        if let Some(value) = flag_value(args, name) {
+            storage_args.extend([name.to_string(), value]);
+        }
+    }
+    let mut primary_args = Vec::new();
+    for name in ["--sync-replicas", "--sync-timeout-ms"] {
+        if let Some(value) = flag_value(args, name) {
+            primary_args.extend([name.to_string(), value]);
+        }
+    }
+    let dashboard_addr = flag_value(args, "--dashboard-addr").or_else(|| {
+        args.iter()
+            .any(|arg| arg == "--dashboard")
+            .then(|| "127.0.0.1:8090".to_string())
+    });
+
+    let cluster = Arc::new(Mutex::new(Cluster::start(ClusterConfig {
+        exe: std::env::current_exe()?,
+        data_dir: data_dir.clone(),
+        replicas,
+        base_port,
+        storage_args,
+        primary_args,
+    })?));
+    let print_nodes = |cluster: &Cluster| {
+        println!(
+            "{:<12} {:<8} {:<16} {:>7}  log",
+            "node", "role", "client", "pid"
+        );
+        for node in cluster.nodes() {
+            let pid = node
+                .pid
+                .map_or("stopped".to_string(), |pid| pid.to_string());
+            println!(
+                "{:<12} {:<8} {:<16} {:>7}  {}",
+                node.name,
+                node.role.as_str(),
+                node.client_addr.to_string(),
+                pid,
+                node.log_path.display()
+            );
+        }
+    };
+    let primary_addr = {
+        let cluster = cluster.lock().expect("cluster lock poisoned");
+        println!("cluster ID: {}", cluster.cluster_id());
+        println!("data directory: {}", data_dir.display());
+        print_nodes(&cluster);
+        cluster.nodes()[0].client_addr
+    };
+
+    let mut dashboard = match dashboard_addr {
+        Some(addr) => {
+            let bind: std::net::SocketAddr = addr
+                .parse()
+                .map_err(|_| format!("--dashboard-addr expects IP:PORT, got {addr:?}"))?;
+            let nodes = cluster
+                .lock()
+                .expect("cluster lock poisoned")
+                .nodes()
+                .into_iter()
+                .map(|node| NodeTarget {
+                    name: node.name,
+                    addr: node.client_addr,
+                })
+                .collect();
+            let mut config = DashboardConfig::new(bind, nodes);
+            // A launcher cluster is a disposable local one: the page may write
+            // and may stop and restart replicas.
+            config.allow_writes = true;
+            let control: Arc<dyn NodeControl> = cluster.clone();
+            config.control = Some(control);
+            let dashboard = Dashboard::start(config)?;
+            println!("dashboard: http://{}", dashboard.local_addr());
+            Some(dashboard)
+        }
+        None => None,
+    };
+    println!(
+        "commands: nodes | stop NODE | start NODE | shutdown | any client command for the primary"
+    );
+
+    let stdin = io::stdin();
+    let stdout = io::stdout();
+    let mut out = stdout.lock();
+    let mut client: Option<Client> = None;
+    let mut line = String::new();
+    loop {
+        line.clear();
+        match stdin.lock().read_line(&mut line) {
+            Ok(0) | Err(_) => break,
+            Ok(_) => {}
+        }
+        let trimmed = line.trim();
+        let words: Vec<&str> = trimmed.split_whitespace().collect();
+        let reply = match words.as_slice() {
+            [] => continue,
+            ["shutdown"] | ["exit"] | ["quit"] => break,
+            ["nodes"] => {
+                print_nodes(&cluster.lock().expect("cluster lock poisoned"));
+                continue;
+            }
+            ["stop", name] => match cluster
+                .lock()
+                .expect("cluster lock poisoned")
+                .stop_node(name)
+            {
+                Ok(()) => format!("{name} stopped"),
+                Err(error) => format!("ERROR: {error}"),
+            },
+            ["start", name] => match cluster
+                .lock()
+                .expect("cluster lock poisoned")
+                .start_node(name)
+            {
+                Ok(()) => format!("{name} started"),
+                Err(error) => format!("ERROR: {error}"),
+            },
+            _ => match parse(trimmed) {
+                Err(err) => format!("BAD_REQUEST: {err}"),
+                Ok(command) => {
+                    if client.is_none() {
+                        client = Client::connect(primary_addr).ok();
+                    }
+                    match client.as_mut() {
+                        None => "ERROR: primary unavailable".to_string(),
+                        Some(connected) => {
+                            let rendered =
+                                client_execute(connected, command, false).unwrap_or_default();
+                            // Reconnect on the next command after any error;
+                            // the primary may have dropped the connection.
+                            if rendered.starts_with("ERROR: ") {
+                                client = None;
+                            }
+                            rendered
+                        }
+                    }
+                }
+            },
+        };
+        let _ = writeln!(out, "{reply}");
+        let _ = out.flush();
+    }
+    if let Some(ref mut dashboard) = dashboard {
+        dashboard.shutdown();
+    }
+    cluster.lock().expect("cluster lock poisoned").shutdown();
+    println!("cluster stopped");
     Ok(())
 }
 

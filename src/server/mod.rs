@@ -1299,6 +1299,11 @@ where
         lsm: storage.1,
     };
     let mut out = render_stats_lines(&snapshot);
+    let node_id = {
+        let db = shared.db.read().expect("db read lock poisoned");
+        crate::replication::format_id(&db.identity().node_id)
+    };
+    out.push_str(&format!("node_id={node_id}\n"));
     out.push_str(&format!("sync_replicas={}\n", shared.config.sync_replicas));
     let timeouts = shared.metrics.sync_ack_timeouts.load(Ordering::Relaxed);
     out.push_str(&format!("sync_ack_timeouts_total={timeouts}\n"));
