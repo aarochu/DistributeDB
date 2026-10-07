@@ -99,6 +99,16 @@ cargo run -- replica --primary-addr 127.0.0.1:5556 --cluster-id CLUSTER_ID --dat
 
 Use the same command with another directory for a second replica. The replication listener is bound to loopback and has no authentication. Add `--read-addr 127.0.0.1:5557` to a replica command to expose optional eventually consistent reads on that port; writes sent there return `NOT_PRIMARY`.
 
+### Local cluster and dashboard
+
+One command starts a primary and replicas as local processes, wires up the cluster ID, and opens a prompt connected to the primary:
+
+```sh
+cargo run --release -- cluster --replicas 2 --dashboard
+```
+
+The dashboard is then at `http://127.0.0.1:8090`. It shows topology, replication positions and lag, throughput and latency, WAL positions, LSM structure, lock contention, and recovery, all read from each node's `STATS`. It also has a read-only key explorer, a write console with transactions, and a fault-tolerance lab that stops a replica under load, restarts it, and measures its catch-up. At the prompt, `nodes`, `stop replica-02`, `start replica-02`, and `shutdown` control the cluster; any other line is a client command for the primary. `--storage lsm`, `--sync-replicas N`, `--base-port P` (default 5555), and `--data DIR` (reused across runs) are accepted. For a cluster started another way, `cargo run --bin ddb_dashboard -- --nodes 127.0.0.1:5555,127.0.0.1:5557` serves a read-only dashboard; add `--allow-writes` for the write console. The dashboard is a separate std-only HTTP bridge on loopback; the database itself serves no HTTP. See the [design document](docs/frontend-design-doc.md) and [plan](docs/frontend-plan.md).
+
 For a reproducible three-node Docker demo, use [the local cluster guide](docs/docker-cluster.md). It includes startup, replica read checks, catch-up, and restart commands, plus `scripts/demo.sh`, which runs the full SOW §26 demonstration.
 
 ## Roadmap and verification
@@ -113,11 +123,12 @@ For a reproducible three-node Docker demo, use [the local cluster guide](docs/do
 | 6 — Failure recovery | WAL reconnect, explicit snapshot catch-up, recovery-generation garbage collection, and a process kill/restart test implemented. |
 | 7 — Performance engineering | Benchmark harness, published results, lock-contention metrics, and a measured lock-scope change ([analysis](docs/performance.md)) implemented. |
 | 8 — Advanced storage | LSM tree engine (memtable, SSTables, background flush and two-level compaction) selectable with `--storage lsm`, with crash, replication, and server tests and a [comparison with the in-memory engine](docs/lsm.md). |
+| Local tooling | `distributedb cluster` launcher and a monochrome dashboard served by a std-only loopback bridge (`ddb_dashboard`). |
 | Optional SOW features | `SCAN`, `STATS`, `PING`, and binary-safe `--hex` CLI input; per-connection transactions committed as one WAL group (§15); semi-synchronous replication with `--sync-replicas` (§11). |
 
 CI runs formatting, Clippy, Rust tests, and documentation checks. Passing these checks supports the tested scenarios; it does not prove power-loss durability on physical hardware. The workload mixes are 90/10, 50/50, and 10/90 GET/SET; [published results](benchmarks/results/README.md) come from a shared CI runner and are for comparing revisions, not a hardware performance claim.
 
-See the [SOW conformance audit](docs/SOW-Conformance.md), [development setup](docs/Development-Setup.md), [recovery notes](docs/recovery.md), [failure testing](docs/failure-testing.md), [benchmark method](docs/benchmarks.md), [`STATS` fields](docs/observability.md), [performance analysis](docs/performance.md), the [LSM storage engine](docs/lsm.md), and the proposed [local cluster launcher and dashboard](docs/frontend-plan.md) for test and operator details.
+See the [SOW conformance audit](docs/SOW-Conformance.md), [development setup](docs/Development-Setup.md), [recovery notes](docs/recovery.md), [failure testing](docs/failure-testing.md), [benchmark method](docs/benchmarks.md), [`STATS` fields](docs/observability.md), [performance analysis](docs/performance.md), the [LSM storage engine](docs/lsm.md), and the [local cluster launcher and dashboard](docs/frontend-plan.md) for test and operator details.
 
 ## License
 

@@ -1,6 +1,12 @@
 # Local cluster launcher and dashboard plan
 
-Status: proposed. Nothing in this document is implemented yet.
+Status: implemented. `distributedb cluster` (`src/cluster`), the `ddb_dashboard` bridge (`src/dashboard`, `src/bin/ddb_dashboard.rs`), and the page (`web/`) follow [the design document](frontend-design-doc.md). Differences from this plan:
+
+- There is no `--fresh` flag; a new `--data` directory starts an empty cluster, so the launcher never deletes data.
+- A launcher-started dashboard enables the write console and node control without `--allow-writes`, because the cluster is local and disposable. The standalone bridge stays read-only unless started with `--allow-writes`.
+- The write-path model uses WebGL directly rather than Three.js, so the page loads nothing from the network and needs no vendored library.
+- `STATS` gained a `node_id` line so the page can match a replica process to the primary's `replica_<id>_*` fields.
+- Every `POST` must carry `x-ddb-request: 1` and every request a loopback `Host`, so another web page cannot drive the bridge.
 
 The SOW does not require a user interface. Every SOW item is implemented and verified through the CLI, `STATS`, tests, and benchmarks. This plan covers two optional tools for running and demonstrating DistributeDB locally:
 
@@ -29,7 +35,7 @@ Today a local cluster takes four terminals: start the primary, copy its printed 
 - Prints every node's client, replication, and read address, then opens the client prompt connected to the primary.
 - On exit (EOF, `shutdown`, or Ctrl-C), stops replicas and then the primary, and waits for each process.
 - Accepts the relevant `serve` flags and passes them through: `--storage lsm`, `--sync-replicas N`, `--sync-timeout-ms`.
-- Uses `--data DIR` as a parent directory (`DIR/primary`, `DIR/replica-1`, …), so a second run reuses the same cluster, and `--fresh` to start from empty directories.
+- Uses `--data DIR` as a parent directory (`DIR/primary`, `DIR/replica-01`, …), so a second run reuses the same cluster; a new directory starts an empty one.
 - Exposes each replica's eventually consistent read port (`--read-addr`), so replica reads can be tried directly.
 - Supports `stop replica-1` and `start replica-1` at the prompt, so catch-up after downtime can be shown without a second terminal.
 
