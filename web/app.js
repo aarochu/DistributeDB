@@ -422,8 +422,6 @@
     } else {
       rows.push(["primary", stateWord("unavailable", "NODE UNAVAILABLE")]);
     }
-    rows.push(["primary addr", esc(primary.addr)]);
-    rows.push(["replica addrs", replicas.length ? replicas.map((r) => esc(r.addr)).join(", ") : "none"]);
     rows.push(["bridge", `${esc(bridge.addr)} · writes ${bridge.writes ? "enabled" : "disabled"} · ${bridge.control ? "launcher control" : "no node control"}`]);
     $("identity").innerHTML = rows.map(([k, v]) => `<dt>${k}</dt><dd>${v}</dd>`).join("");
   }
@@ -457,7 +455,6 @@
         if (r.state === "synced" || r.state === "lagging") rows.push(["lag", fmtInt(r.lag) + " entries"]);
         else if (p && r.applied !== null) rows.push(["behind", fmtInt(num(p.durable_lsn) - r.applied) + " entries since last ack"]);
         if (r.s) {
-          rows.push(["local lsn", fmtInt(num(r.s.current_lsn))]);
           rows.push(["uptime", fmtUptime(num(r.s.uptime_seconds))]);
           rows.push(["storage", esc(r.s.storage_engine)]);
           rows.push(["durability", esc(r.s.durability)]);
@@ -478,7 +475,6 @@
     const latest = rates[rates.length - 1];
     const cells = [
       ["Ops/s", latest ? fmtRate(latest.reads + latest.writes) : "COLLECTING", ""],
-      ["Read p99", p ? fmtMs(num(p.read_latency_p99_us)) : dash, ""],
       ["Write p99", p ? fmtMs(num(p.write_latency_p99_us)) : dash, ""],
       ["Durable LSN", p ? fmtInt(num(p.durable_lsn)) : dash, ""],
       ["Replicas", p ? `${fmtInt(connected)} / ${replicas.length}` : dash, "connected"],
@@ -578,7 +574,6 @@
     $("wal-metrics").innerHTML = [
       ["current_lsn", fmtInt(current)],
       ["durable_lsn", fmtInt(durable)],
-      ["in flight", fmtInt(current - durable)],
       ["wal_entries", fmtInt(num(p.wal_entries))],
       ["snapshot_lsn", snapshot ? fmtInt(snapshot) : "0 · none"],
       ["wal_syncs_total", fmtInt(num(p.wal_syncs_total))],
@@ -699,10 +694,10 @@
     const nodes = [{ name: primary.name, s: p }].concat(replicas.map((r) => ({ name: r.name, s: r.s })));
     const rows = nodes.map(({ name, s }) =>
       s
-        ? `<tr><td>${esc(name)}</td><td class="num">${fmtMs(num(s.recovery_us))}</td><td class="num">${fmtInt(num(s.recovery_records_replayed))}</td><td class="num">${fmtInt(num(s.snapshot_lsn))}</td><td class="num">${fmtInt(num(s.current_lsn))}</td></tr>`
-        : `<tr><td>${esc(name)}</td><td colspan="4" class="text">node unavailable</td></tr>`
+        ? `<tr><td>${esc(name)}</td><td class="num">${fmtMs(num(s.recovery_us))}</td><td class="num">${fmtInt(num(s.recovery_records_replayed))}</td><td class="num">${fmtInt(num(s.snapshot_lsn))}</td></tr>`
+        : `<tr><td>${esc(name)}</td><td colspan="3" class="text">node unavailable</td></tr>`
     );
-    $("recovery-table").innerHTML = `<thead><tr><th>node</th><th class="num">recovery</th><th class="num">replayed</th><th class="num">snapshot lsn now</th><th class="num">lsn now</th></tr></thead><tbody>${rows.join("")}</tbody>`;
+    $("recovery-table").innerHTML = `<thead><tr><th>node</th><th class="num">recovery</th><th class="num">replayed</th><th class="num">snapshot lsn now</th></tr></thead><tbody>${rows.join("")}</tbody>`;
   }
 
   // --- key explorer -----------------------------------------------------------
@@ -1105,6 +1100,100 @@
     }
   }
 
+  // --- motion -----------------------------------------------------------------
+  // Motion here only carries information: where the reader is, what changed
+  // since the last poll, and when a chart first appears. All of it is off
+  // under prefers-reduced-motion (see style.css).
+  const reducedMotion = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+
+  // A value that changed since the last poll brightens briefly, so a reader
+  // sees what moved without anything changing position. Uptime is skipped:
+  // it changes every second and says nothing.
+  const previousValues = new Map();
+  const TRACKED = ["identity", "tree", "summary", "repl-table", "sync-block", "rates", "latency", "wal-metrics", "storage-body", "lock-table", "recovery-table"];
+  function markChanges(id) {
+    const cells = Array.from($(id).querySelectorAll("dd, td.num, .value"));
+    const now = cells.map((el) => el.textContent);
+    const before = previousValues.get(id);
+    if (before && before.length === now.length) {
+      cells.forEach((el, i) => {
+        const label = el.previousElementSibling;
+        if (now[i] !== before[i] && !(label && label.textContent === "uptime")) el.classList.add("changed");
+      });
+    }
+    previousValues.set(id, now);
+  }
+
+  // The header tracks the section in view with a thin rule under its name.
+  let scheduleSpy = () => {};
+  function attachScrollSpy() {
+    const nav = document.querySelector(".nav");
+    const links = Array.from(nav.querySelectorAll("a"));
+    const targets = links.map((a) => document.querySelector(a.getAttribute("href")));
+    const indicator = document.createElement("span");
+    indicator.className = "nav-indicator";
+    nav.appendChild(indicator);
+    let frame = 0;
+    function update() {
+      frame = 0;
+      let active = -1;
+      targets.forEach((el, i) => {
+        if (el && el.getBoundingClientRect().top <= 120) active = i;
+      });
+      if (window.innerHeight + window.scrollY >= document.documentElement.scrollHeight - 2) active = links.length - 1;
+      links.forEach((a, i) => a.classList.toggle("active", i === active));
+      if (active < 0) {
+        indicator.style.opacity = "0";
+        return;
+      }
+      indicator.style.opacity = "1";
+      indicator.style.width = links[active].offsetWidth + "px";
+      indicator.style.transform = `translateX(${links[active].offsetLeft}px)`;
+    }
+    scheduleSpy = () => {
+      if (!frame) frame = requestAnimationFrame(update);
+    };
+    window.addEventListener("scroll", scheduleSpy, { passive: true });
+    window.addEventListener("resize", scheduleSpy);
+    update();
+  }
+
+  // Charts and instruments draw in once, left to right, the first time they
+  // scroll into view; afterwards they update in place.
+  let checkDrawIn = () => {};
+  function attachDrawIn() {
+    if (reducedMotion) return;
+    const pending = new Set(document.querySelectorAll(".chart-wrap, .instrument, #recovery-diagram"));
+    pending.forEach((el) => el.classList.add("draw-in"));
+    const reveal = (el) => {
+      el.classList.add("drawn");
+      pending.delete(el);
+    };
+    // The observer is the usual trigger. The direct check below covers a
+    // browser or tab state where it does not report, so a chart can never
+    // stay clipped.
+    if ("IntersectionObserver" in window) {
+      const observer = new IntersectionObserver(
+        (entries) => {
+          entries.forEach((entry) => {
+            if (!entry.isIntersecting) return;
+            reveal(entry.target);
+            observer.unobserve(entry.target);
+          });
+        },
+        { threshold: 0.25 }
+      );
+      pending.forEach((el) => observer.observe(el));
+    }
+    checkDrawIn = () => {
+      pending.forEach((el) => {
+        const rect = el.getBoundingClientRect();
+        if (rect.top < window.innerHeight && rect.bottom > 0) reveal(el);
+      });
+    };
+    window.addEventListener("scroll", () => checkDrawIn(), { passive: true });
+  }
+
   // --- main loop --------------------------------------------------------------
   function renderAll() {
     renderHeader();
@@ -1119,6 +1208,9 @@
     renderStorage();
     renderLocks();
     renderRecovery();
+    if (!reducedMotion) TRACKED.forEach(markChanges);
+    scheduleSpy();
+    checkDrawIn();
     const key = `${app.state.nodes.map((n) => n.name).join(",")}|${app.state.bridge.writes}|${app.state.bridge.control}`;
     if (app.builtFor !== key) {
       app.builtFor = key;
@@ -1176,6 +1268,8 @@
   async function start() {
     app.topology = window.Topology ? window.Topology.mount($("topology"), $("topology-labels")) : null;
     ["chart-repl", "chart-ops", "chart-locks"].forEach((id) => attachHover($(id)));
+    attachScrollSpy();
+    attachDrawIn();
     $("get-form").onsubmit = (event) => {
       event.preventDefault();
       runGet("get");
