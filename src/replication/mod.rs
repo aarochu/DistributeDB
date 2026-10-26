@@ -29,7 +29,11 @@ const POLL_INTERVAL: Duration = Duration::from_millis(50);
 const MAX_REPLICAS: usize = 16;
 const MAX_CONNECTIONS: usize = 32;
 const MAX_SNAPSHOT_BYTES: usize = 256 * 1024 * 1024;
-const SNAPSHOT_CHUNK_BYTES: usize = 256 * 1024 - 26;
+/// The largest chunk whose whole SNAPSHOT_CHUNK frame fits
+/// [`protocol::MAX_SNAPSHOT_FRAME`]: the frame adds 26 bytes (4-byte length
+/// prefix, version, kind, 8-byte snapshot LSN, 8-byte offset, 4-byte chunk
+/// length).
+const SNAPSHOT_CHUNK_BYTES: usize = protocol::MAX_SNAPSHOT_FRAME - 26;
 
 pub fn format_id(id: &[u8; 16]) -> String {
     id.iter().map(|byte| format!("{byte:02x}")).collect()
