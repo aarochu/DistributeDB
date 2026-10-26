@@ -32,6 +32,8 @@ const TOPOLOGY_JS: &str = include_str!("../../web/topology.js");
 pub const REQUEST_HEADER: &str = "x-ddb-request";
 /// Largest accepted request head plus body.
 const MAX_REQUEST_BYTES: usize = 1 << 20;
+/// Largest accepted request head (request line and headers).
+const MAX_HEAD_BYTES: usize = 64 * 1024;
 /// Largest transaction the write console sends, matching one WAL group.
 const MAX_TRANSACTION_OPS: usize = 64;
 /// How long a proxied command may take; covers a synchronous-replication wait.
@@ -317,7 +319,7 @@ pub fn read_request<R: Read>(reader: &mut R) -> io::Result<HttpRequest> {
         if let Some(end) = buffer.windows(4).position(|window| window == b"\r\n\r\n") {
             break end;
         }
-        if buffer.len() > MAX_REQUEST_BYTES {
+        if buffer.len() > MAX_HEAD_BYTES {
             return Err(invalid("request head too large"));
         }
         let read = reader.read(&mut chunk)?;
@@ -326,6 +328,9 @@ pub fn read_request<R: Read>(reader: &mut R) -> io::Result<HttpRequest> {
         }
         buffer.extend_from_slice(&chunk[..read]);
     };
+    if head_end > MAX_HEAD_BYTES {
+        return Err(invalid("request head too large"));
+    }
     let head =
         std::str::from_utf8(&buffer[..head_end]).map_err(|_| invalid("head is not UTF-8"))?;
     let mut lines = head.split("\r\n");
@@ -895,6 +900,10 @@ mod tests {
         let huge = format!("POST / HTTP/1.1\r\nContent-Length: {MAX_REQUEST_BYTES}\r\n\r\n");
         assert!(read_request(&mut huge.as_bytes()).is_err());
         assert!(read_request(&mut &b"GET / HTTP/1.1\r\nHost: x"[..]).is_err());
+        // The head has its own limit, well below the whole-request limit.
+        let header = |len| format!("GET / HTTP/1.1\r\nX-Long: {}\r\n\r\n", "a".repeat(len));
+        assert!(read_request(&mut header(MAX_HEAD_BYTES).as_bytes()).is_err());
+        assert!(read_request(&mut header(1024).as_bytes()).is_ok());
     }
 
     #[test]
